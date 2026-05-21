@@ -1,0 +1,115 @@
+{
+  "config_version": 1,
+  "server": {
+    "bind": "127.0.0.1:8080",
+    "allow_lan": false,
+    "cors_allowed_origins": []
+  },
+  "gateway_auth": {
+    "gateway_key": ""
+  },
+  "dashboard": {
+    "admin_password": "",
+    "session_ttl_seconds": 28800
+  },
+  "oauth_sources": [
+    {
+      "id": "oauth_openai_personal",
+      "platform": "openai",
+      "type": "token_bundle",
+      "label": "Personal OpenAI OAuth source",
+      "tier": "advanced",
+      "tags": ["code"],
+      "enabled": true,
+      "credentials": {
+        "refresh_token": "replace-with-token-bundle"
+      },
+      "refresh_state": {
+        "status": "unknown"
+      },
+      "quota_policy": "advanced_daily"
+    }
+  ],
+  "subscription_sources": [
+    {
+      "id": "sub_personal_tokens",
+      "kind": "line_tokens",
+      "label": "Personal pasted tokens",
+      "tier": "simple",
+      "tags": ["document"],
+      "enabled": true,
+      "inline_bundle": "paste one token per line through the Dashboard import preview"
+    }
+  ],
+  "accounts": [
+    {
+      "id": "acct_example_simple",
+      "source_id": "sub_personal_tokens",
+      "type": "openai_api_key",
+      "label": "Example simple-tier account",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "tier": "simple",
+      "tags": ["document"],
+      "credential": "replace-with-api-token",
+      "proxy_ref": "",
+      "quota_policy": "simple_daily",
+      "enabled": false
+    }
+  ],
+  "proxies": [
+    {
+      "id": "proxy_local_socks",
+      "url": "socks5h://127.0.0.1:1080"
+    }
+  ],
+  "quota": {
+    "warn_threshold": 0.8,
+    "switch_threshold": 0.95,
+    "policies": [
+      {
+        "id": "simple_daily",
+        "daily_limit_tokens": 200000,
+        "source": "local_estimate"
+      },
+      {
+        "id": "advanced_daily",
+        "daily_limit_tokens": 1000000,
+        "source": "local_estimate"
+      }
+    ]
+  },
+  "routing": {
+    "default_task_type": "default",
+    "prefer_tiers": ["simple", "advanced"],
+    "fallback_tiers": ["advanced", "simple"],
+    "rules": [
+      {
+        "task_type": "document",
+        "model_patterns": ["gpt-4o-mini*"],
+        "tags": ["document"],
+        "prefer_tiers": ["simple"],
+        "fallback_tiers": ["advanced"]
+      },
+      {
+        "task_type": "code",
+        "model_patterns": ["gpt-4.1*", "o3*"],
+        "tags": ["code"],
+        "prefer_tiers": ["advanced"],
+        "fallback_tiers": ["simple"]
+      }
+    ]
+  },
+  "probe": {
+    "timeout_seconds": 15,
+    "model": "gpt-4o-mini",
+    "save_policy": "save_disabled_on_error"
+  },
+  "metrics": {
+    "recent_errors_limit": 100
+  },
+  "upstreamcompat": {
+    "enabled": true,
+    "manifest_path": "internal/upstreamcompat/SYNC_MANIFEST.md"
+  }
+}
