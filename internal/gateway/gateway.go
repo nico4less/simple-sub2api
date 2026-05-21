@@ -110,7 +110,10 @@ func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, acco
 		return
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 && h.Pool != nil {
-		h.Pool.AddUsage(accountID, usageTokens(body))
+		_, _, crossedQuotaSwitch := h.Pool.AddUsage(accountID, usageTokens(body))
+		if crossedQuotaSwitch && h.Metrics != nil {
+			h.Metrics.RecordQuotaSwitch(accountID)
+		}
 	}
 	h.recordRequest(accountID, resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
 	_, _ = w.Write(body)

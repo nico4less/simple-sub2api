@@ -88,8 +88,37 @@ func (m *Manager) QuotaSnapshot() []quota.AccountQuota {
 	return m.monitor.Snapshot(accounts)
 }
 
-func (m *Manager) AddUsage(accountID string, tokens int64) {
+func (m *Manager) AddUsage(accountID string, tokens int64) (quota.AccountQuota, quota.AccountQuota, bool) {
+	if tokens <= 0 {
+		return quota.AccountQuota{}, quota.AccountQuota{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	account, ok := m.accounts[accountID]
+	if !ok {
+		return quota.AccountQuota{}, quota.AccountQuota{}, false
+	}
+	before := m.monitor.State(account)
 	m.monitor.AddUsage(accountID, tokens)
+	after := m.monitor.State(account)
+	for i := range m.snapshot.Accounts {
+		if m.snapshot.Accounts[i].AccountID != accountID {
+			continue
+		}
+		m.snapshot.Accounts[i].Quota = after
+		if after.Status == quota.StatusExhausted && m.snapshot.Accounts[i].Status == "healthy" {
+			m.snapshot.Accounts[i].Status = "quota"
+		}
+		break
+	}
+	return before, after, crossedSwitchThreshold(before, after)
+}
+
+func crossedSwitchThreshold(before quota.AccountQuota, after quota.AccountQuota) bool {
+	if !after.SwitchBlocked && after.Status != quota.StatusExhausted {
+		return false
+	}
+	return !before.SwitchBlocked && before.Status != quota.StatusExhausted
 }
 
 func (m *Manager) Cooldown(accountID string, until time.Time) {

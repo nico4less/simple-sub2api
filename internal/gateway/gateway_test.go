@@ -179,6 +179,77 @@ func TestQueueFGatewayRecordsMetrics(t *testing.T) {
 	}
 }
 
+func TestQueueFGatewayRecordsRuntimeQuotaSwitch(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[],"usage":{"total_tokens":960}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	resp := doGatewayRequest(t, srv.URL+"/v1/chat/completions", store.GatewayKey(), body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gateway status = %d", resp.StatusCode)
+	}
+	second := doGatewayRequest(t, srv.URL+"/v1/chat/completions", store.GatewayKey(), body)
+	_ = second.Body.Close()
+	if second.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second request should be quota-blocked, status = %d", second.StatusCode)
+	}
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+	metricsReq, err := http.NewRequest(http.MethodGet, srv.URL+"/api/admin/metrics", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	metricsReq.AddCookie(cookie)
+	metricsResp, err := http.DefaultClient.Do(metricsReq)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer metricsResp.Body.Close()
+	var snapshot struct {
+		QuotaSwitchCounts map[string]uint64 `json:"quota_switch_counts"`
+	}
+	if err := json.NewDecoder(metricsResp.Body).Decode(&snapshot); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	if snapshot.QuotaSwitchCounts["acct_1"] != 1 {
+		t.Fatalf("quota switch metrics = %#v", snapshot.QuotaSwitchCounts)
+	}
+
+	stateReq, err := http.NewRequest(http.MethodGet, srv.URL+"/api/admin/dashboard/state", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	stateReq.AddCookie(cookie)
+	stateResp, err := http.DefaultClient.Do(stateReq)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer stateResp.Body.Close()
+	var state struct {
+		Metrics struct {
+			QuotaSwitchCounts map[string]uint64 `json:"quota_switch_counts"`
+		} `json:"metrics"`
+	}
+	if err := json.NewDecoder(stateResp.Body).Decode(&state); err != nil {
+		t.Fatalf("decode dashboard state: %v", err)
+	}
+	if state.Metrics.QuotaSwitchCounts["acct_1"] != 1 {
+		t.Fatalf("dashboard metrics quota switch = %#v", state.Metrics.QuotaSwitchCounts)
+	}
+}
+
 func gatewayServer(t *testing.T, upstreamURL string) (*httptest.Server, *config.Store) {
 	t.Helper()
 	cfg := config.DefaultConfig()
