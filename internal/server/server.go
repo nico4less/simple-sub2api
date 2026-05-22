@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 	"time"
 
@@ -24,25 +26,35 @@ import (
 )
 
 type Server struct {
-	store    *config.Store
-	logger   *slog.Logger
-	sessions *dashboard.SessionManager
-	pool     *accountpool.Manager
-	metrics  *metrics.Recorder
+	store          *config.Store
+	logger         *slog.Logger
+	sessions       *dashboard.SessionManager
+	pool           *accountpool.Manager
+	metrics        *metrics.Recorder
+	debugDashboard bool
+}
+
+type Options struct {
+	DebugDashboard bool
 }
 
 func New(store *config.Store, logger *slog.Logger) *Server {
+	return NewWithOptions(store, logger, Options{})
+}
+
+func NewWithOptions(store *config.Store, logger *slog.Logger, options Options) *Server {
 	cfg := store.Snapshot()
 	pool, err := accountpool.NewManager(cfg)
 	if err != nil && logger != nil {
 		logger.Error("account pool init failed", "error", err)
 	}
 	return &Server{
-		store:    store,
-		logger:   logger,
-		sessions: dashboard.NewSessionManager(time.Duration(cfg.Dashboard.SessionTTLSeconds) * time.Second),
-		pool:     pool,
-		metrics:  metrics.NewRecorder(cfg.Metrics.RecentErrorsLimit),
+		store:          store,
+		logger:         logger,
+		sessions:       dashboard.NewSessionManager(time.Duration(cfg.Dashboard.SessionTTLSeconds) * time.Second),
+		pool:           pool,
+		metrics:        metrics.NewRecorder(cfg.Metrics.RecentErrorsLimit),
+		debugDashboard: options.DebugDashboard,
 	}
 }
 
@@ -50,17 +62,32 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/version", s.version)
+	mux.HandleFunc("/assets/", s.dashboardAsset)
 	mux.HandleFunc("/", s.dashboardIndex)
+	mux.HandleFunc("/login", s.dashboardIndex)
 	mux.HandleFunc("/dashboard", s.dashboardIndex)
+	mux.HandleFunc("/keys", s.dashboardIndex)
+	mux.HandleFunc("/admin/groups", s.dashboardIndex)
+	mux.HandleFunc("/admin/accounts", s.dashboardIndex)
+	mux.HandleFunc("/admin/proxies", s.dashboardIndex)
 	mux.Handle("/v1/", gatewayauth.Authorizer{Provider: s.store}.Middleware(http.HandlerFunc(s.v1Gateway)))
 	mux.HandleFunc("/api/admin/login", s.login)
-	mux.Handle("/api/admin/logout", s.adminOnly(http.HandlerFunc(s.logout)))
+	mux.HandleFunc("/api/admin/logout", s.logout)
 	mux.Handle("/api/admin/me", s.adminOnly(http.HandlerFunc(s.me)))
 	mux.Handle("/api/admin/dashboard/state", s.adminOnly(http.HandlerFunc(s.dashboardState)))
+	mux.Handle("/api/admin/dashboard/recent-usage", s.adminOnly(http.HandlerFunc(s.recentUsage)))
 	mux.Handle("/api/admin/gateway-key", s.adminOnly(http.HandlerFunc(s.revealGatewayKey)))
 	mux.Handle("/api/admin/gateway-key/rotate", s.adminOnly(http.HandlerFunc(s.rotateGatewayKey)))
+	mux.Handle("/api/keys", s.adminOnly(http.HandlerFunc(s.keys)))
+	mux.Handle("/api/keys/", s.adminOnly(http.HandlerFunc(s.keyByID)))
 	mux.Handle("/api/admin/config", s.adminOnly(http.HandlerFunc(s.configState)))
 	mux.Handle("/api/admin/config/save", s.adminOnly(http.HandlerFunc(s.configSave)))
+	mux.Handle("/api/admin/groups", s.adminOnly(http.HandlerFunc(s.groups)))
+	mux.Handle("/api/admin/groups/", s.adminOnly(http.HandlerFunc(s.groupByID)))
+	mux.Handle("/api/admin/accounts", s.adminOnly(http.HandlerFunc(s.accounts)))
+	mux.Handle("/api/admin/accounts/import/preview", s.adminOnly(http.HandlerFunc(s.importPreview)))
+	mux.Handle("/api/admin/accounts/import/apply", s.adminOnly(http.HandlerFunc(s.importApply)))
+	mux.Handle("/api/admin/accounts/export", s.adminOnly(http.HandlerFunc(s.accountsExport)))
 	mux.Handle("/api/admin/accounts/", s.adminOnly(http.HandlerFunc(s.accountByID)))
 	mux.Handle("/api/admin/oauth-sources", s.adminOnly(http.HandlerFunc(s.oauthSources)))
 	mux.Handle("/api/admin/oauth-sources/", s.adminOnly(http.HandlerFunc(s.oauthSourceByID)))
@@ -77,6 +104,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/admin/account-check", s.adminOnly(http.HandlerFunc(s.accountCheck)))
 	mux.Handle("/api/admin/account-pool", s.adminOnly(http.HandlerFunc(s.accountPool)))
 	mux.Handle("/api/admin/metrics", s.adminOnly(http.HandlerFunc(s.metricsSnapshot)))
+	mux.Handle("/api/admin/metrics/recent-usage", s.adminOnly(http.HandlerFunc(s.recentUsage)))
+	mux.Handle("/api/admin/debug/snapshot", s.adminOnly(http.HandlerFunc(s.debugSnapshot)))
 	return s.cors(mux)
 }
 
@@ -93,7 +122,7 @@ func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" && r.URL.Path != "/dashboard" {
+	if !isDashboardRoute(r.URL.Path) {
 		http.NotFound(w, r)
 		return
 	}
@@ -101,6 +130,27 @@ func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	authenticated := s.sessions.Authenticate(r)
+	if r.URL.Path == "/" {
+		redirectTarget := "/login"
+		if authenticated {
+			redirectTarget = "/dashboard"
+		}
+		http.Redirect(w, r, redirectTarget, http.StatusFound)
+		return
+	}
+	if r.URL.Path == "/login" && authenticated {
+		http.Redirect(w, r, "/dashboard", http.StatusFound)
+		return
+	}
+	if r.URL.Path != "/login" && !authenticated {
+		http.Redirect(w, r, "/login", http.StatusFound)
+		return
+	}
+	s.serveDashboardIndex(w, r)
+}
+
+func (s *Server) serveDashboardIndex(w http.ResponseWriter, r *http.Request) {
 	data, err := fs.ReadFile(dashboard.StaticFS, "static/index.html")
 	if err != nil {
 		http.Error(w, "dashboard asset unavailable", http.StatusInternalServerError)
@@ -110,6 +160,40 @@ func (s *Server) dashboardIndex(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(data)
+	}
+}
+
+func (s *Server) dashboardAsset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	assetPath := path.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+	if !strings.HasPrefix(assetPath, "assets/") || strings.Contains(assetPath, "..") {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := fs.ReadFile(dashboard.StaticFS, "static/"+assetPath)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if contentType := mime.TypeByExtension(path.Ext(assetPath)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
+}
+
+func isDashboardRoute(path string) bool {
+	switch path {
+	case "/", "/login", "/dashboard", "/keys", "/admin/groups", "/admin/accounts", "/admin/proxies":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -175,13 +259,66 @@ func (s *Server) dashboardState(w http.ResponseWriter, r *http.Request) {
 		"account_pool": pool,
 		"quota_state":  quotaState,
 		"metrics":      s.metrics.Snapshot(),
-		"gateway":      map[string]any{"key_configured": s.store.GatewayKey() != ""},
+		"recent_usage": s.recentUsageItems(12),
+		"gateway":      map[string]any{"key_configured": s.store.GatewayKey() != "", "keys_count": len(cfg.GatewayKeys)},
+	})
+}
+
+func (s *Server) debugSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.debugDashboard {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "status": "disabled"})
+		return
+	}
+	cfg := s.store.Snapshot()
+	accountStatusCounts := map[string]int{}
+	if s.pool != nil {
+		for _, account := range s.pool.Snapshot().Accounts {
+			accountStatusCounts[account.Status]++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":      true,
+		"status":       "enabled",
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"version":      map[string]any{"version": version.Version, "commit": version.Commit, "date": version.Date},
+		"runtime": map[string]any{
+			"debug_dashboard":        true,
+			"gateway_key_configured": s.store.GatewayKey() != "",
+			"account_pool_ready":     s.pool != nil,
+		},
+		"config_summary": map[string]any{
+			"config_version":        cfg.ConfigVersion,
+			"accounts":              len(cfg.Accounts),
+			"enabled_accounts":      countEnabledAccounts(cfg.Accounts),
+			"oauth_sources":         len(cfg.OAuthSources),
+			"subscription_sources":  len(cfg.SubscriptionSources),
+			"proxies":               len(cfg.Proxies),
+			"quota_policies":        len(cfg.Quota.Policies),
+			"routing_rules":         len(cfg.Routing.Rules),
+			"account_status_counts": accountStatusCounts,
+		},
+		"policy_flags": map[string]any{
+			"allow_lan":                   cfg.Server.AllowLAN,
+			"cors_enabled":                len(cfg.Server.CORSAllowedOrigins) > 0,
+			"upstreamcompat_enabled":      cfg.UpstreamCompat.Enabled,
+			"probe_save_policy":           cfg.Probe.SavePolicy,
+			"metrics_recent_errors_limit": cfg.Metrics.RecentErrorsLimit,
+		},
+		"debug_events": []any{},
 	})
 }
 
 func (s *Server) revealGatewayKey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.store.Snapshot().GatewayKeys != nil {
+		http.Error(w, "gateway key material is hashed and cannot be revealed; use /api/keys rotate to obtain a fresh value", http.StatusGone)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"gateway_key": s.store.GatewayKey()})
@@ -198,6 +335,255 @@ func (s *Server) rotateGatewayKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"gateway_key": key})
+}
+
+func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.keysResponse())
+	case http.MethodPost:
+		var req keyMutationRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		plaintext := strings.TrimSpace(req.Key)
+		if plaintext == "" {
+			var err error
+			plaintext, err = config.GenerateGatewayKey()
+			if err != nil {
+				http.Error(w, "gateway key generation failed", http.StatusInternalServerError)
+				return
+			}
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		key := req.GatewayKey
+		if strings.TrimSpace(key.ID) == "" {
+			key.ID = gatewayKeyIDFromName(key.Name, now)
+		}
+		if strings.TrimSpace(key.Name) == "" {
+			key.Name = "Gateway Key"
+		}
+		if strings.TrimSpace(key.Status) == "" {
+			key.Status = "enabled"
+		}
+		if strings.TrimSpace(key.RoutingPolicy.Mode) == "" {
+			key.RoutingPolicy.Mode = "all_enabled"
+		}
+		key.KeyHash = config.HashGatewayKey(plaintext)
+		key.Preview = config.KeyPreview(plaintext)
+		key.CreatedAt = now
+		key.UpdatedAt = now
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			cfg.GatewayKeys = upsertGatewayKey(cfg.GatewayKeys, key)
+			return nil
+		})
+		if err != nil {
+			s.writeUpdateResult(w, updated, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"config_version": updated.ConfigVersion, "key": redactedGatewayKey(key), "key_value": plaintext})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) keyByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/keys/"), "/")
+	parts := strings.Split(path, "/")
+	id := parts[0]
+	if id == "" {
+		http.Error(w, "key id required", http.StatusBadRequest)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "rotate" {
+		s.rotateKeyByID(w, r, id)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "reveal" {
+		http.Error(w, "stored key material is hashed and cannot be revealed; rotate to obtain a fresh value", http.StatusGone)
+		return
+	}
+	if len(parts) != 1 {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var req keyMutationRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.GatewayKey.ID == "" {
+			req.GatewayKey.ID = id
+		}
+		if req.GatewayKey.ID != id {
+			http.Error(w, "key id mismatch", http.StatusBadRequest)
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			for _, current := range cfg.GatewayKeys {
+				if current.ID != id {
+					continue
+				}
+				candidate := req.GatewayKey
+				candidate.KeyHash = current.KeyHash
+				candidate.Preview = current.Preview
+				candidate.CreatedAt = current.CreatedAt
+				candidate.LastUsedAt = current.LastUsedAt
+				candidate.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+				if strings.TrimSpace(candidate.RoutingPolicy.Mode) == "" {
+					candidate.RoutingPolicy.Mode = "all_enabled"
+				}
+				cfg.GatewayKeys = upsertGatewayKey(cfg.GatewayKeys, candidate)
+				return nil
+			}
+			return errors.New("gateway key not found")
+		})
+		s.writeUpdateResult(w, updated, err)
+	case http.MethodDelete:
+		var req versionedRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			if !gatewayKeyExists(cfg.GatewayKeys, id) {
+				return errors.New("gateway key not found")
+			}
+			cfg.GatewayKeys = deleteGatewayKey(cfg.GatewayKeys, id)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) groups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.groupsResponse())
+	case http.MethodPost:
+		var req groupMutationRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		group := req.Group
+		if strings.TrimSpace(group.ID) == "" {
+			group.ID = groupIDFromName(group.Name, now)
+		}
+		if strings.TrimSpace(group.Status) == "" {
+			group.Status = "active"
+		}
+		if strings.TrimSpace(group.Platform) == "" {
+			group.Platform = "mixed"
+		}
+		group.Tags = ensureString(group.Tags, group.ID)
+		group.CreatedAt = now
+		group.UpdatedAt = now
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			groupIDs := groupIDsForAccount(group.AccountIDs, cfg.Groups)
+			group.Tags = mergeUnique(group.Tags, groupIDs)
+			cfg.Groups = upsertGroup(cfg.Groups, group)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) groupByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/admin/groups/"), "/")
+	if id == "" {
+		http.Error(w, "group id required", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var req groupMutationRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Group.ID) == "" {
+			req.Group.ID = id
+		}
+		if req.Group.ID != id {
+			http.Error(w, "group id mismatch", http.StatusBadRequest)
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			for _, current := range cfg.Groups {
+				if current.ID != id {
+					continue
+				}
+				candidate := req.Group
+				candidate.CreatedAt = current.CreatedAt
+				candidate.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+				candidate.Tags = ensureString(candidate.Tags, candidate.ID)
+				groupIDs := groupIDsForAccount(candidate.AccountIDs, cfg.Groups)
+				candidate.Tags = mergeUnique(candidate.Tags, groupIDs)
+				cfg.Groups = upsertGroup(cfg.Groups, candidate)
+				return nil
+			}
+			return errors.New("group not found")
+		})
+		s.writeUpdateResult(w, updated, err)
+	case http.MethodDelete:
+		var req versionedRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			if !groupExists(cfg.Groups, id) {
+				return errors.New("group not found")
+			}
+			cfg.Groups = deleteGroup(cfg.Groups, id)
+			removeGroupFromGatewayPolicies(cfg.GatewayKeys, id)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) rotateKeyByID(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req versionedRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	plaintext, err := config.GenerateGatewayKey()
+	if err != nil {
+		http.Error(w, "gateway key generation failed", http.StatusInternalServerError)
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	var rotated config.GatewayKey
+	updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+		for _, current := range cfg.GatewayKeys {
+			if current.ID != id {
+				continue
+			}
+			rotated = current
+			rotated.KeyHash = config.HashGatewayKey(plaintext)
+			rotated.Preview = config.KeyPreview(plaintext)
+			rotated.UpdatedAt = now
+			rotated.LastUsedAt = ""
+			cfg.GatewayKeys = upsertGatewayKey(cfg.GatewayKeys, rotated)
+			return nil
+		}
+		return errors.New("gateway key not found")
+	})
+	if err != nil {
+		s.writeUpdateResult(w, updated, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"config_version": updated.ConfigVersion, "key": redactedGatewayKey(rotated), "key_value": plaintext})
 }
 
 func (s *Server) configState(w http.ResponseWriter, r *http.Request) {
@@ -229,6 +615,25 @@ func (s *Server) configSave(w http.ResponseWriter, r *http.Request) {
 	s.writeUpdateResult(w, updated, err)
 }
 
+func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.accountsResponse())
+	case http.MethodPost:
+		var req accountMutationRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			cfg.Accounts = upsertAccount(cfg.Accounts, req.Account)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) accountByID(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/accounts/")
 	if strings.TrimSpace(path) == "" {
@@ -237,23 +642,61 @@ func (s *Server) accountByID(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	id := parts[0]
-	if len(parts) == 2 && parts[1] == "refresh" {
+	if len(parts) == 2 && (parts[1] == "refresh" || parts[1] == "test") {
 		s.accountRefresh(w, r, id)
 		return
 	}
-	if len(parts) != 1 || r.Method != http.MethodDelete {
+	if len(parts) != 1 {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req versionedRequest
-	if !decodeJSON(w, r, &req) {
-		return
+	switch r.Method {
+	case http.MethodGet:
+		for _, account := range config.Redacted(s.store.Snapshot()).Accounts {
+			if account.ID == id {
+				writeJSON(w, http.StatusOK, account)
+				return
+			}
+		}
+		http.Error(w, "account not found", http.StatusNotFound)
+	case http.MethodPut:
+		var req accountMutationRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Account.ID) == "" {
+			req.Account.ID = id
+		}
+		if req.Account.ID != id {
+			http.Error(w, "account id mismatch", http.StatusBadRequest)
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			preserveRedactedAccountSecret(&req.Account, cfg.Accounts)
+			if !accountExists(cfg.Accounts, id) {
+				return errors.New("account not found")
+			}
+			cfg.Accounts = upsertAccount(cfg.Accounts, req.Account)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
+	case http.MethodDelete:
+		var req versionedRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			if !accountExists(cfg.Accounts, id) {
+				return errors.New("account not found")
+			}
+			cfg.Accounts = deleteAccount(cfg.Accounts, id)
+			removeAccountFromGatewayPolicies(cfg.GatewayKeys, id)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
-	updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
-		cfg.Accounts = deleteAccount(cfg.Accounts, id)
-		return nil
-	})
-	s.writeUpdateResult(w, updated, err)
 }
 
 func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id string) {
@@ -498,6 +941,14 @@ func (s *Server) importApply(w http.ResponseWriter, r *http.Request) {
 	s.writeUpdateResult(w, updated, err)
 }
 
+func (s *Server) accountsExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, config.Redacted(s.store.Snapshot()))
+}
+
 func (s *Server) proxies(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -526,8 +977,30 @@ func (s *Server) proxyByID(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy id required", http.StatusBadRequest)
 		return
 	}
-	if r.Method != http.MethodDelete {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPut {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Method == http.MethodPut {
+		var req struct {
+			ConfigVersion int                `json:"config_version"`
+			Proxy         config.ProxyConfig `json:"proxy"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.Proxy.ID == "" {
+			req.Proxy.ID = id
+		}
+		if req.Proxy.ID != id {
+			http.Error(w, "proxy id mismatch", http.StatusBadRequest)
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			cfg.Proxies = upsertProxy(cfg.Proxies, req.Proxy)
+			return nil
+		})
+		s.writeUpdateResult(w, updated, err)
 		return
 	}
 	var req versionedRequest
@@ -662,6 +1135,61 @@ func (s *Server) metricsSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.metrics.Snapshot())
 }
 
+func (s *Server) recentUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"limit":        12,
+		"top_usage":    s.recentUsageItems(12),
+	})
+}
+
+func (s *Server) recentUsageItems(limit int) []recentUsageItem {
+	if limit <= 0 {
+		limit = 12
+	}
+	cfg := s.store.Snapshot()
+	accountLabels := make(map[string]string, len(cfg.Accounts))
+	for _, account := range cfg.Accounts {
+		accountLabels[account.ID] = account.Label
+	}
+	keyLabels := make(map[string]string, len(cfg.GatewayKeys))
+	keyPreviews := make(map[string]string, len(cfg.GatewayKeys))
+	for _, key := range cfg.GatewayKeys {
+		keyLabels[key.ID] = key.Name
+		keyPreviews[key.ID] = key.Preview
+	}
+	aggregates := s.metrics.TopUsage(limit)
+	items := make([]recentUsageItem, 0, len(aggregates))
+	for index, aggregate := range aggregates {
+		preview := aggregate.GatewayKeyRef
+		if preview == "" {
+			preview = keyPreviews[aggregate.GatewayKeyID]
+		}
+		successRate := float64(0)
+		if aggregate.Requests > 0 {
+			successRate = float64(aggregate.Successes) / float64(aggregate.Requests)
+		}
+		items = append(items, recentUsageItem{
+			Rank:              index + 1,
+			AccountID:         aggregate.AccountID,
+			AccountLabel:      accountLabels[aggregate.AccountID],
+			GatewayKeyID:      aggregate.GatewayKeyID,
+			GatewayKeyPreview: preview,
+			GatewayKeyLabel:   keyLabels[aggregate.GatewayKeyID],
+			Requests:          aggregate.Requests,
+			Successes:         aggregate.Successes,
+			Errors:            aggregate.Errors,
+			SuccessRate:       successRate,
+			LastUsedAt:        aggregate.LastUsedAt,
+		})
+	}
+	return items
+}
+
 func (s *Server) adminOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.sessions.Authenticate(r) {
@@ -742,9 +1270,152 @@ type versionedRequest struct {
 	ConfigVersion int `json:"config_version"`
 }
 
+type accountMutationRequest struct {
+	ConfigVersion int            `json:"config_version"`
+	Account       config.Account `json:"account"`
+}
+
+type groupMutationRequest struct {
+	ConfigVersion int          `json:"config_version"`
+	Group         config.Group `json:"group"`
+}
+
 type sourceMutationRequest[T any] struct {
 	ConfigVersion int `json:"config_version"`
 	Source        T   `json:"source"`
+}
+
+type keyMutationRequest struct {
+	ConfigVersion int               `json:"config_version"`
+	GatewayKey    config.GatewayKey `json:"key"`
+	Key           string            `json:"key_value,omitempty"`
+}
+
+type recentUsageItem struct {
+	Rank              int     `json:"rank"`
+	AccountID         string  `json:"account_id"`
+	AccountLabel      string  `json:"account_label,omitempty"`
+	GatewayKeyID      string  `json:"gateway_key_id,omitempty"`
+	GatewayKeyPreview string  `json:"gateway_key_preview,omitempty"`
+	GatewayKeyLabel   string  `json:"gateway_key_label,omitempty"`
+	Requests          uint64  `json:"requests"`
+	Successes         uint64  `json:"successes"`
+	Errors            uint64  `json:"errors"`
+	SuccessRate       float64 `json:"success_rate"`
+	LastUsedAt        string  `json:"last_used_at,omitempty"`
+}
+
+type keysResponse struct {
+	ConfigVersion int                 `json:"config_version"`
+	Keys          []config.GatewayKey `json:"keys"`
+	Accounts      []config.Account    `json:"accounts"`
+	Groups        []config.Group      `json:"groups"`
+}
+
+type groupsResponse struct {
+	ConfigVersion int              `json:"config_version"`
+	Groups        []groupSummary   `json:"groups"`
+	Accounts      []config.Account `json:"accounts"`
+}
+
+type groupSummary struct {
+	Config       config.Group `json:"config"`
+	AccountCount int          `json:"account_count"`
+}
+
+type accountSummary struct {
+	Config        config.Account       `json:"config"`
+	RuntimeStatus string               `json:"runtime_status"`
+	Health        *accountcheck.Result `json:"health,omitempty"`
+	Quota         map[string]any       `json:"quota,omitempty"`
+	Metrics       map[string]uint64    `json:"metrics,omitempty"`
+	Source        string               `json:"source,omitempty"`
+	References    map[string]string    `json:"references,omitempty"`
+}
+
+type accountsResponse struct {
+	ConfigVersion int                  `json:"config_version"`
+	Accounts      []accountSummary     `json:"accounts"`
+	Proxies       []config.ProxyConfig `json:"proxies"`
+	Groups        []config.Group       `json:"groups"`
+	QuotaPolicies []config.QuotaPolicy `json:"quota_policies"`
+	Sources       []string             `json:"sources"`
+}
+
+func (s *Server) accountsResponse() accountsResponse {
+	cfg := s.store.Snapshot()
+	redacted := config.Redacted(cfg)
+	poolByID := map[string]accountpool.AccountState{}
+	if s.pool != nil {
+		for _, state := range s.pool.Snapshot().Accounts {
+			poolByID[state.AccountID] = state
+		}
+	}
+	quotaByID := map[string]map[string]any{}
+	if s.pool != nil {
+		for _, quotaState := range s.pool.QuotaSnapshot() {
+			quotaByID[quotaState.AccountID] = map[string]any{
+				"account_id":          quotaState.AccountID,
+				"status":              quotaState.Status,
+				"policy_id":           quotaState.PolicyID,
+				"daily_used_tokens":   quotaState.DailyUsed,
+				"weekly_used_tokens":  quotaState.WeeklyUsed,
+				"daily_limit_tokens":  quotaState.DailyLimit,
+				"weekly_limit_tokens": quotaState.WeeklyLimit,
+				"usage_ratio":         quotaState.UsageRatio,
+				"switch_blocked":      quotaState.SwitchBlocked,
+				"error":               quotaState.Error,
+			}
+		}
+	}
+	metricSnapshot := s.metrics.Snapshot()
+	summaries := make([]accountSummary, 0, len(redacted.Accounts))
+	for _, account := range redacted.Accounts {
+		summary := accountSummary{Config: account, RuntimeStatus: "unknown"}
+		if state, ok := poolByID[account.ID]; ok {
+			health := state.Check
+			summary.RuntimeStatus = state.Status
+			summary.Health = &health
+		}
+		if quotaState, ok := quotaByID[account.ID]; ok {
+			summary.Quota = quotaState
+		}
+		summary.Metrics = map[string]uint64{
+			"hits":   metricSnapshot.PerAccountHits[account.ID],
+			"errors": metricSnapshot.PerAccountErrors[account.ID],
+		}
+		if account.SourceID != "" {
+			summary.Source = account.SourceID
+		}
+		summary.References = map[string]string{"proxy_ref": account.ProxyRef, "quota_policy": account.QuotaPolicy}
+		summaries = append(summaries, summary)
+	}
+	sources := make([]string, 0, len(cfg.OAuthSources)+len(cfg.SubscriptionSources))
+	for _, source := range cfg.OAuthSources {
+		sources = append(sources, source.ID)
+	}
+	for _, source := range cfg.SubscriptionSources {
+		sources = append(sources, source.ID)
+	}
+	return accountsResponse{ConfigVersion: redacted.ConfigVersion, Accounts: summaries, Proxies: redacted.Proxies, Groups: redacted.Groups, QuotaPolicies: redacted.Quota.Policies, Sources: sources}
+}
+
+func (s *Server) keysResponse() keysResponse {
+	cfg := config.Redacted(s.store.Snapshot())
+	keys := make([]config.GatewayKey, 0, len(cfg.GatewayKeys))
+	for _, key := range cfg.GatewayKeys {
+		keys = append(keys, redactedGatewayKey(key))
+	}
+	return keysResponse{ConfigVersion: cfg.ConfigVersion, Keys: keys, Accounts: cfg.Accounts, Groups: cfg.Groups}
+}
+
+func (s *Server) groupsResponse() groupsResponse {
+	cfg := config.Redacted(s.store.Snapshot())
+	summaries := make([]groupSummary, 0, len(cfg.Groups))
+	for _, group := range cfg.Groups {
+		summaries = append(summaries, groupSummary{Config: group, AccountCount: len(group.AccountIDs)})
+	}
+	return groupsResponse{ConfigVersion: cfg.ConfigVersion, Groups: summaries, Accounts: cfg.Accounts}
 }
 
 func (s *Server) writeUpdateResult(w http.ResponseWriter, cfg config.Config, err error) {
@@ -819,6 +1490,203 @@ func deleteAccount(accounts []config.Account, id string) []config.Account {
 		}
 	}
 	return out
+}
+
+func removeAccountFromGatewayPolicies(keys []config.GatewayKey, id string) {
+	for i := range keys {
+		keys[i].RoutingPolicy.AccountIDs = removeString(keys[i].RoutingPolicy.AccountIDs, id)
+	}
+}
+
+func removeGroupFromGatewayPolicies(keys []config.GatewayKey, id string) {
+	for i := range keys {
+		keys[i].RoutingPolicy.GroupIDs = removeString(keys[i].RoutingPolicy.GroupIDs, id)
+	}
+}
+
+func removeString(values []string, value string) []string {
+	out := make([]string, 0, len(values))
+	for _, candidate := range values {
+		if candidate != value {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func upsertGatewayKey(keys []config.GatewayKey, key config.GatewayKey) []config.GatewayKey {
+	out := append([]config.GatewayKey(nil), keys...)
+	for i := range out {
+		if out[i].ID == key.ID {
+			out[i] = key
+			return out
+		}
+	}
+	return append(out, key)
+}
+
+func deleteGatewayKey(keys []config.GatewayKey, id string) []config.GatewayKey {
+	out := make([]config.GatewayKey, 0, len(keys))
+	for _, key := range keys {
+		if key.ID != id {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+func gatewayKeyExists(keys []config.GatewayKey, id string) bool {
+	for _, key := range keys {
+		if key.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func upsertGroup(groups []config.Group, group config.Group) []config.Group {
+	out := append([]config.Group(nil), groups...)
+	for i := range out {
+		if out[i].ID == group.ID {
+			out[i] = group
+			return out
+		}
+	}
+	return append(out, group)
+}
+
+func deleteGroup(groups []config.Group, id string) []config.Group {
+	out := make([]config.Group, 0, len(groups))
+	for _, group := range groups {
+		if group.ID != id {
+			out = append(out, group)
+		}
+	}
+	return out
+}
+
+func groupExists(groups []config.Group, id string) bool {
+	for _, group := range groups {
+		if group.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func redactedGatewayKey(key config.GatewayKey) config.GatewayKey {
+	key.KeyHash = "configured"
+	return key
+}
+
+func gatewayKeyIDFromName(name string, now string) string {
+	return idFromName(name, now, "gateway_key")
+}
+
+func groupIDFromName(name string, now string) string {
+	return idFromName(name, now, "group")
+}
+
+func idFromName(name string, now string, fallback string) string {
+	base := strings.ToLower(strings.TrimSpace(name))
+	if base == "" {
+		base = fallback
+	}
+	var b strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
+		}
+		if r == '_' || r == '-' || r == '.' || r == ' ' {
+			b.WriteByte('_')
+		}
+	}
+	base = strings.Trim(b.String(), "_-. ")
+	if len(base) < 2 {
+		base = fallback
+	}
+	if len(base) > 40 {
+		base = base[:40]
+	}
+	suffix := strings.NewReplacer("-", "", ":", "", "T", "", "Z", "").Replace(now)
+	if len(suffix) > 14 {
+		suffix = suffix[:14]
+	}
+	return base + "_" + suffix
+}
+
+func ensureString(values []string, value string) []string {
+	for _, candidate := range values {
+		if candidate == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func mergeUnique(values []string, extra []string) []string {
+	out := append([]string(nil), values...)
+	for _, value := range extra {
+		out = ensureString(out, value)
+	}
+	return out
+}
+
+func groupIDsForAccount(accountIDs []string, groups []config.Group) []string {
+	out := []string{}
+	for _, accountID := range accountIDs {
+		for _, group := range groups {
+			for _, candidate := range group.AccountIDs {
+				if candidate == accountID {
+					out = ensureString(out, group.ID)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func upsertAccount(accounts []config.Account, account config.Account) []config.Account {
+	out := append([]config.Account(nil), accounts...)
+	for i := range out {
+		if out[i].ID == account.ID {
+			out[i] = account
+			return out
+		}
+	}
+	return append(out, account)
+}
+
+func accountExists(accounts []config.Account, id string) bool {
+	for _, account := range accounts {
+		if account.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func preserveRedactedAccountSecret(candidate *config.Account, current []config.Account) {
+	if !isMasked(candidate.Credential) {
+		return
+	}
+	for _, account := range current {
+		if account.ID == candidate.ID {
+			candidate.Credential = account.Credential
+			return
+		}
+	}
+}
+
+func countEnabledAccounts(accounts []config.Account) int {
+	count := 0
+	for _, account := range accounts {
+		if account.Enabled {
+			count++
+		}
+	}
+	return count
 }
 
 func preserveRedactedSecrets(candidate *config.Config, current config.Config) {

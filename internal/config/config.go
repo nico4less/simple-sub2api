@@ -2,7 +2,10 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +31,8 @@ type Config struct {
 	ConfigVersion       int                  `json:"config_version"`
 	Server              ServerConfig         `json:"server"`
 	GatewayAuth         GatewayAuthConfig    `json:"gateway_auth"`
+	GatewayKeys         []GatewayKey         `json:"gateway_keys"`
+	Groups              []Group              `json:"groups"`
 	Dashboard           DashboardConfig      `json:"dashboard"`
 	OAuthSources        []OAuthSource        `json:"oauth_sources"`
 	SubscriptionSources []SubscriptionSource `json:"subscription_sources"`
@@ -48,6 +53,44 @@ type ServerConfig struct {
 
 type GatewayAuthConfig struct {
 	GatewayKey string `json:"gateway_key"`
+}
+
+type GatewayKey struct {
+	ID            string           `json:"id"`
+	Name          string           `json:"name"`
+	KeyHash       string           `json:"key_hash"`
+	Preview       string           `json:"preview"`
+	Status        string           `json:"status"`
+	RoutingPolicy KeyRoutingPolicy `json:"routing_policy"`
+	CreatedAt     string           `json:"created_at"`
+	UpdatedAt     string           `json:"updated_at"`
+	LastUsedAt    string           `json:"last_used_at,omitempty"`
+	Note          string           `json:"note,omitempty"`
+}
+
+type KeyRoutingPolicy struct {
+	Mode       string   `json:"mode"`
+	GroupIDs   []string `json:"group_ids,omitempty"`
+	Tiers      []string `json:"tiers,omitempty"`
+	Tags       []string `json:"tags,omitempty"`
+	AccountIDs []string `json:"account_ids,omitempty"`
+}
+
+type Group struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Platform    string   `json:"platform"`
+	Description string   `json:"description,omitempty"`
+	Status      string   `json:"status"`
+	Tags        []string `json:"tags,omitempty"`
+	AccountIDs  []string `json:"account_ids,omitempty"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
+type GatewayKeyMatch struct {
+	Key GatewayKey
+	OK  bool
 }
 
 type DashboardConfig struct {
@@ -88,18 +131,19 @@ type SubscriptionSource struct {
 }
 
 type Account struct {
-	ID          string   `json:"id"`
-	SourceID    string   `json:"source_id,omitempty"`
-	Type        string   `json:"type"`
-	Label       string   `json:"label"`
-	BaseURL     string   `json:"base_url,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Tier        string   `json:"tier"`
-	Tags        []string `json:"tags"`
-	Credential  string   `json:"credential,omitempty"`
-	ProxyRef    string   `json:"proxy_ref,omitempty"`
-	QuotaPolicy string   `json:"quota_policy,omitempty"`
-	Enabled     bool     `json:"enabled"`
+	ID          string         `json:"id"`
+	SourceID    string         `json:"source_id,omitempty"`
+	Type        string         `json:"type"`
+	Label       string         `json:"label"`
+	BaseURL     string         `json:"base_url,omitempty"`
+	Model       string         `json:"model,omitempty"`
+	Tier        string         `json:"tier"`
+	Tags        []string       `json:"tags"`
+	Credential  string         `json:"credential,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+	ProxyRef    string         `json:"proxy_ref,omitempty"`
+	QuotaPolicy string         `json:"quota_policy,omitempty"`
+	Enabled     bool           `json:"enabled"`
 }
 
 type ProxyConfig struct {
@@ -180,6 +224,9 @@ func DefaultConfig() Config {
 			CORSAllowedOrigins: nil,
 		},
 		Dashboard: DashboardConfig{SessionTTLSeconds: 8 * 60 * 60},
+		Groups: []Group{
+			{ID: "default1x0", Name: "default1x0", Platform: "mixed", Description: "Default local routing group", Status: "active", CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"},
+		},
 		Quota: QuotaConfig{
 			WarnThreshold:   0.80,
 			SwitchThreshold: 0.95,
@@ -258,6 +305,8 @@ func (s *Store) Snapshot() Config {
 	cfg.Server.CORSAllowedOrigins = append([]string(nil), s.cfg.Server.CORSAllowedOrigins...)
 	cfg.OAuthSources = cloneOAuthSources(s.cfg.OAuthSources)
 	cfg.SubscriptionSources = cloneSubscriptionSources(s.cfg.SubscriptionSources)
+	cfg.GatewayKeys = cloneGatewayKeys(s.cfg.GatewayKeys)
+	cfg.Groups = cloneGroups(s.cfg.Groups)
 	cfg.Accounts = cloneAccounts(s.cfg.Accounts)
 	cfg.Proxies = append([]ProxyConfig(nil), s.cfg.Proxies...)
 	cfg.Quota.Policies = append([]QuotaPolicy(nil), s.cfg.Quota.Policies...)
@@ -271,6 +320,42 @@ func (s *Store) GatewayKey() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cfg.GatewayAuth.GatewayKey
+}
+
+func (s *Store) Path() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.path
+}
+
+func (s *Store) MatchGatewayKey(value string) GatewayKeyMatch {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return MatchGatewayKey(s.cfg, value)
+}
+
+func (s *Store) TouchGatewayKeyLastUsed(id string, usedAt string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	if err := s.reloadLocked(); err != nil {
+		return err
+	}
+	candidate := cloneConfig(s.cfg)
+	for i := range candidate.GatewayKeys {
+		if candidate.GatewayKeys[i].ID != id {
+			continue
+		}
+		candidate.GatewayKeys[i].LastUsedAt = usedAt
+		if err := s.saveConfigLocked(candidate); err != nil {
+			return err
+		}
+		s.cfg = candidate
+		return nil
+	}
+	return nil
 }
 
 func (s *Store) ApplyOverrides(overrides RuntimeOverrides) error {
@@ -312,6 +397,10 @@ func (s *Store) RotateGatewayKey() (string, error) {
 	}
 	candidate := s.cfg
 	candidate.GatewayAuth.GatewayKey = key
+	if len(candidate.GatewayKeys) > 0 {
+		candidate.GatewayKeys[0].KeyHash = HashGatewayKey(key)
+		candidate.GatewayKeys[0].Preview = KeyPreview(key)
+	}
 	candidate.ConfigVersion = s.cfg.ConfigVersion + 1
 	if err := Validate(candidate); err != nil {
 		return "", err
@@ -330,6 +419,9 @@ func (s *Store) Update(expectedVersion int, mutate func(*Config) error) (Config,
 func (s *Store) UpdateValidated(expectedVersion int, mutate func(*Config) error, validateCandidate func(Config) error) (Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reloadLocked(); err != nil {
+		return Config{}, err
+	}
 	if expectedVersion != s.cfg.ConfigVersion {
 		return Config{}, ErrConfigVersionConflict
 	}
@@ -373,6 +465,21 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 		}
 		cfg.GatewayAuth.GatewayKey = key
 	}
+	now := "1970-01-01T00:00:00Z"
+	if cfg.GatewayKeys == nil && strings.TrimSpace(cfg.GatewayAuth.GatewayKey) != "" {
+		cfg.GatewayKeys = []GatewayKey{{
+			ID:        "default",
+			Name:      "Default Gateway Key",
+			KeyHash:   HashGatewayKey(cfg.GatewayAuth.GatewayKey),
+			Preview:   KeyPreview(cfg.GatewayAuth.GatewayKey),
+			Status:    "enabled",
+			CreatedAt: now,
+			UpdatedAt: now,
+			RoutingPolicy: KeyRoutingPolicy{
+				Mode: "all_enabled",
+			},
+		}}
+	}
 	if cfg.Quota.WarnThreshold == 0 {
 		cfg.Quota.WarnThreshold = 0.80
 	}
@@ -381,6 +488,9 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 	}
 	if strings.TrimSpace(cfg.Routing.DefaultTaskType) == "" {
 		cfg.Routing.DefaultTaskType = "default"
+	}
+	if cfg.Groups == nil {
+		cfg.Groups = DefaultConfig().Groups
 	}
 	if cfg.Probe.TimeoutSeconds <= 0 {
 		cfg.Probe.TimeoutSeconds = 15
@@ -450,6 +560,12 @@ func Validate(cfg Config) error {
 	if err := validateSubscriptionSources(cfg.SubscriptionSources); err != nil {
 		return err
 	}
+	if err := validateGatewayKeys(cfg.GatewayKeys, cfg); err != nil {
+		return err
+	}
+	if err := validateGroups(cfg.Groups, cfg); err != nil {
+		return err
+	}
 	if err := validateProxies(cfg.Proxies); err != nil {
 		return err
 	}
@@ -488,6 +604,7 @@ func DecodeStrict(r io.Reader, cfg *Config) error {
 
 func Redacted(cfg Config) Config {
 	cfg.GatewayAuth.GatewayKey = maskSecret(cfg.GatewayAuth.GatewayKey)
+	cfg.GatewayKeys = cloneGatewayKeys(cfg.GatewayKeys)
 	if cfg.Dashboard.AdminPassword != "" {
 		cfg.Dashboard.AdminPassword = "configured"
 	}
@@ -569,6 +686,95 @@ func validateSubscriptionSources(sources []SubscriptionSource) error {
 		}
 		if source.Kind == "inline_bundle" && strings.TrimSpace(source.InlineBundle) == "" {
 			return fmt.Errorf("subscription source %q inline_bundle is required", source.ID)
+		}
+	}
+	return nil
+}
+
+func validateGatewayKeys(keys []GatewayKey, cfg Config) error {
+	seen := map[string]bool{}
+	accountIDs := map[string]bool{}
+	for _, account := range cfg.Accounts {
+		accountIDs[account.ID] = true
+	}
+	groupIDs := map[string]bool{}
+	for _, group := range cfg.Groups {
+		groupIDs[group.ID] = true
+	}
+	for _, key := range keys {
+		if err := validateID("gateway_keys.id", key.ID); err != nil {
+			return err
+		}
+		if seen[key.ID] {
+			return fmt.Errorf("duplicate gateway key id %q", key.ID)
+		}
+		seen[key.ID] = true
+		if strings.TrimSpace(key.Name) == "" {
+			return fmt.Errorf("gateway key %q name is required", key.ID)
+		}
+		if key.Status != "enabled" && key.Status != "disabled" {
+			return fmt.Errorf("gateway key %q status must be enabled or disabled", key.ID)
+		}
+		if !strings.HasPrefix(key.KeyHash, "sha256:") || len(key.KeyHash) != len("sha256:")+64 {
+			return fmt.Errorf("gateway key %q key_hash must use sha256 hex format", key.ID)
+		}
+		if strings.TrimSpace(key.Preview) == "" {
+			return fmt.Errorf("gateway key %q preview is required", key.ID)
+		}
+		if strings.TrimSpace(key.CreatedAt) == "" || strings.TrimSpace(key.UpdatedAt) == "" {
+			return fmt.Errorf("gateway key %q timestamps are required", key.ID)
+		}
+		policy := key.RoutingPolicy
+		if policy.Mode == "" {
+			policy.Mode = "all_enabled"
+		}
+		if !oneOf(policy.Mode, "all_enabled", "tier_preference", "tags", "account_ids", "groups") {
+			return fmt.Errorf("gateway key %q routing_policy.mode is invalid", key.ID)
+		}
+		for _, groupID := range policy.GroupIDs {
+			if !groupIDs[groupID] {
+				return fmt.Errorf("gateway key %q references unknown group %q", key.ID, groupID)
+			}
+		}
+		for _, accountID := range policy.AccountIDs {
+			if !accountIDs[accountID] {
+				return fmt.Errorf("gateway key %q references unknown account %q", key.ID, accountID)
+			}
+		}
+	}
+	return nil
+}
+
+func validateGroups(groups []Group, cfg Config) error {
+	seen := map[string]bool{}
+	accountIDs := map[string]bool{}
+	for _, account := range cfg.Accounts {
+		accountIDs[account.ID] = true
+	}
+	for _, group := range groups {
+		if err := validateID("groups.id", group.ID); err != nil {
+			return err
+		}
+		if seen[group.ID] {
+			return fmt.Errorf("duplicate group id %q", group.ID)
+		}
+		seen[group.ID] = true
+		if strings.TrimSpace(group.Name) == "" {
+			return fmt.Errorf("group %q name is required", group.ID)
+		}
+		if !oneOf(group.Platform, "mixed", "openai", "anthropic", "gemini", "antigravity") {
+			return fmt.Errorf("group %q platform is invalid", group.ID)
+		}
+		if group.Status != "active" && group.Status != "disabled" {
+			return fmt.Errorf("group %q status must be active or disabled", group.ID)
+		}
+		if strings.TrimSpace(group.CreatedAt) == "" || strings.TrimSpace(group.UpdatedAt) == "" {
+			return fmt.Errorf("group %q timestamps are required", group.ID)
+		}
+		for _, accountID := range group.AccountIDs {
+			if !accountIDs[accountID] {
+				return fmt.Errorf("group %q references unknown account %q", group.ID, accountID)
+			}
 		}
 	}
 	return nil
@@ -722,6 +928,8 @@ func cloneConfig(cfg Config) Config {
 	cfg.Server.CORSAllowedOrigins = append([]string(nil), cfg.Server.CORSAllowedOrigins...)
 	cfg.OAuthSources = cloneOAuthSources(cfg.OAuthSources)
 	cfg.SubscriptionSources = cloneSubscriptionSources(cfg.SubscriptionSources)
+	cfg.GatewayKeys = cloneGatewayKeys(cfg.GatewayKeys)
+	cfg.Groups = cloneGroups(cfg.Groups)
 	cfg.Accounts = cloneAccounts(cfg.Accounts)
 	cfg.Proxies = append([]ProxyConfig(nil), cfg.Proxies...)
 	cfg.Quota.Policies = append([]QuotaPolicy(nil), cfg.Quota.Policies...)
@@ -755,6 +963,55 @@ func cloneAccounts(accounts []Account) []Account {
 	copy(out, accounts)
 	for i := range out {
 		out[i].Tags = append([]string(nil), accounts[i].Tags...)
+		out[i].Metadata = cloneAnyMap(accounts[i].Metadata)
+	}
+	return out
+}
+
+func cloneGroups(groups []Group) []Group {
+	out := make([]Group, len(groups))
+	copy(out, groups)
+	for i := range out {
+		out[i].Tags = append([]string(nil), groups[i].Tags...)
+		out[i].AccountIDs = append([]string(nil), groups[i].AccountIDs...)
+	}
+	return out
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = cloneAny(value)
+	}
+	return out
+}
+
+func cloneAny(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneAnyMap(typed)
+	case []any:
+		out := make([]any, len(typed))
+		for i := range typed {
+			out[i] = cloneAny(typed[i])
+		}
+		return out
+	default:
+		return typed
+	}
+}
+
+func cloneGatewayKeys(keys []GatewayKey) []GatewayKey {
+	out := make([]GatewayKey, len(keys))
+	copy(out, keys)
+	for i := range out {
+		out[i].RoutingPolicy.GroupIDs = append([]string(nil), keys[i].RoutingPolicy.GroupIDs...)
+		out[i].RoutingPolicy.Tiers = append([]string(nil), keys[i].RoutingPolicy.Tiers...)
+		out[i].RoutingPolicy.Tags = append([]string(nil), keys[i].RoutingPolicy.Tags...)
+		out[i].RoutingPolicy.AccountIDs = append([]string(nil), keys[i].RoutingPolicy.AccountIDs...)
 	}
 	return out
 }
@@ -827,8 +1084,80 @@ func GenerateGatewayKey() (string, error) {
 	return "s2a_" + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+func HashGatewayKey(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func KeyPreview(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) <= 12 {
+		return maskSecret(trimmed)
+	}
+	return trimmed[:6] + "..." + trimmed[len(trimmed)-6:]
+}
+
+func MatchGatewayKey(cfg Config, value string) GatewayKeyMatch {
+	hash := HashGatewayKey(value)
+	for _, key := range cfg.GatewayKeys {
+		if len(hash) != len(key.KeyHash) {
+			continue
+		}
+		if subtle.ConstantTimeCompare([]byte(hash), []byte(key.KeyHash)) == 1 {
+			return GatewayKeyMatch{Key: key, OK: key.Status == "enabled"}
+		}
+	}
+	if cfg.GatewayKeys != nil {
+		return GatewayKeyMatch{}
+	}
+	if strings.TrimSpace(cfg.GatewayAuth.GatewayKey) != "" && constantTimeEqual(value, cfg.GatewayAuth.GatewayKey) {
+		return GatewayKeyMatch{Key: GatewayKey{ID: "legacy", Name: "Legacy Gateway Key", Preview: KeyPreview(value), Status: "enabled", RoutingPolicy: KeyRoutingPolicy{Mode: "all_enabled"}}, OK: true}
+	}
+	return GatewayKeyMatch{}
+}
+
+func constantTimeEqual(left string, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if len(left) != len(right) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
 func (s *Store) saveLocked() error {
 	return s.saveConfigLocked(s.cfg)
+}
+
+func (s *Store) reloadLocked() error {
+	if strings.TrimSpace(s.path) == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil
+	}
+	cfg := DefaultConfig()
+	if err := DecodeStrict(strings.NewReader(string(data)), &cfg); err != nil {
+		return err
+	}
+	if err := EnsureDefaultsAndSecrets(&cfg); err != nil {
+		return err
+	}
+	if err := Validate(cfg); err != nil {
+		return err
+	}
+	s.cfg = cfg
+	return nil
 }
 
 func (s *Store) saveConfigLocked(cfg Config) error {
@@ -850,5 +1179,34 @@ func (s *Store) saveConfigLocked(cfg Config) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := syncFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(dir)
+}
+
+func syncFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
+}
+
+func syncDir(dir string) error {
+	if dir == "" {
+		dir = "."
+	}
+	file, err := os.Open(dir)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	return file.Sync()
 }

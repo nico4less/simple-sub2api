@@ -2,7 +2,7 @@ package dashboard
 
 import "embed"
 
-// StaticFS contains the embedded single-page Dashboard shell.
+// StaticFS contains the embedded Vue dashboard build.
 //
-//go:embed static/*
+//go:embed static/* static/assets/*
 var StaticFS embed.FS

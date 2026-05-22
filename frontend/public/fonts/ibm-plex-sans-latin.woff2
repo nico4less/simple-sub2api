@@ -1,0 +1,1629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoinCync — Privacy money that requires no permission.</title>
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon.svg">
+<meta name="description" content="CoinCync is privacy money that requires no permission. Every transaction is shielded. Supply is auditable. No federation, no admin, no governance token.">
+<meta property="og:title" content="CoinCync — Privacy money that requires no permission.">
+<meta property="og:description" content="Privacy money that requires no permission. A proof-of-work cryptocurrency with mandatory privacy at the consensus layer, auditable supply, and constitutional protections.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://coincync.network">
+<meta property="og:image" content="https://coincync.network/assets/og-card.svg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://coincync.network/assets/og-card.svg">
+<link rel="stylesheet" href="/assets/fonts/fonts.css">
+<link rel="preload" as="image" href="banner.svg">
+<script>
+// Restore theme + wallpaper BEFORE body paints to prevent flash.
+// Same localStorage keys as the explorer (cync-theme, cync-wallpaper) so
+// switching themes on coincync.network and explorer.coincync.network feels
+// like one site (when served from the same origin).
+(function(){
+  var t=localStorage.getItem('cync-theme');
+  var DARK=['dark','midnight','forge','vault','mono','contrast'];
+  if(t){
+    document.documentElement.setAttribute('data-theme',t);
+    if(DARK.indexOf(t)!==-1) document.documentElement.classList.add('dark');
+  } else {
+    // No stored theme -> default to "dark" (the brand gold-on-near-black).
+    document.documentElement.setAttribute('data-theme','dark');
+    document.documentElement.classList.add('dark');
+  }
+})();
+</script>
+<style>
+/* ─── THEME SYSTEM ───────────────────────────────────────────────────
+   9 themes ported verbatim from the explorer for a consistent design
+   language across the coincync.network surface. Default = "dark" (the
+   brand aesthetic). Each theme defines all 17 colour tokens the rest
+   of the stylesheet reads, plus a --surface alias so any rule copied
+   from the explorer just works. Fonts are theme-independent.
+   ──────────────────────────────────────────────────────────────────── */
+[data-theme="paper"]{--bg:#F5F3EE;--s1:#FEFDFB;--s2:#EEEBE4;--s3:#E6E3DB;--b:#D8D4CA;--b2:#C9C4B8;--t:#111110;--t2:#4A4844;--t3:#8A857D;--t4:#A8A39A;--t4-a:#9A948A;--ac:#9E7A3E;--ac2:#D4A059;--ac-dim:#F5EFE3;--green:#7EB87C;--red:#C45C4F;--blue:#6B8CCE;--surface:#FEFDFB;--terminal-bg:#1A1814}
+[data-theme="dark"]{--bg:#0A0A09;--s1:#141412;--s2:#1A1A17;--s3:#222220;--b:#25241F;--b2:#34332C;--t:#F5F0E8;--t2:#B8B4AC;--t3:#8A857D;--t4:#5D5953;--t4-a:#7A756C;--ac:#9E7A3E;--ac2:#D4A059;--ac-dim:#1F1A10;--green:#7EB87C;--red:#C45C4F;--blue:#6B8CCE;--surface:#141412;--terminal-bg:#050504}
+[data-theme="brass"]{--bg:#D4A059;--s1:#C89548;--s2:#C08E42;--s3:#B8863B;--b:#A07630;--b2:#8A6428;--t:#1A1510;--t2:#2A2118;--t3:#4A3828;--t4:#5A4630;--t4-a:#503D28;--ac:#3A3328;--ac2:#1A1510;--ac-dim:rgba(58,51,40,0.10);--green:#2D6A2E;--red:#8B2020;--blue:#1F3A6B;--surface:#C89548;--terminal-bg:#3A3328}
+[data-theme="cream"]{--bg:#F5F0E6;--s1:#FAF7F0;--s2:#EDE8DC;--s3:#E5DFD2;--b:#D8D0C0;--b2:#C9C0AE;--t:#3A3328;--t2:#5A5040;--t3:#8A7D6D;--t4:#9E9080;--t4-a:#94877A;--ac:#3A3328;--ac2:#5A4A30;--ac-dim:rgba(58,51,40,0.06);--green:#4A8A48;--red:#B03030;--blue:#3A5C9E;--surface:#FAF7F0;--terminal-bg:#3A3328}
+[data-theme="midnight"]{--bg:#08090E;--s1:#0E1018;--s2:#141620;--s3:#1A1C28;--b:#1E2030;--b2:#2A2D40;--t:#E8E4F0;--t2:#A0A0B8;--t3:#6A6A80;--t4:#4A4A60;--t4-a:#5A5A70;--ac:#9E7A3E;--ac2:#D4A059;--ac-dim:#1A1510;--green:#7EB87C;--red:#C45C4F;--blue:#6B8CCE;--surface:#0E1018;--terminal-bg:#04050A}
+[data-theme="forge"]{--bg:#121010;--s1:#1A1616;--s2:#201C1C;--s3:#282222;--b:#302828;--b2:#3F3535;--t:#F0E8E0;--t2:#B8A898;--t3:#887868;--t4:#605045;--t4-a:#705E50;--ac:#B85C30;--ac2:#E07840;--ac-dim:#201510;--green:#7EB87C;--red:#D04040;--blue:#5A7AC0;--surface:#1A1616;--terminal-bg:#0A0808}
+[data-theme="vault"]{--bg:#0A0C0A;--s1:#10140F;--s2:#161A15;--s3:#1C201B;--b:#222820;--b2:#2D352B;--t:#E0E8DC;--t2:#A8B0A0;--t3:#708068;--t4:#506050;--t4-a:#5E6E5E;--ac:#7A8A40;--ac2:#A0B060;--ac-dim:#141A10;--green:#7EB87C;--red:#C45C4F;--blue:#6B8CCE;--surface:#10140F;--terminal-bg:#04060A}
+[data-theme="mono"]{--bg:#0A0A09;--s1:#131312;--s2:#1A1A18;--s3:#212120;--b:#282826;--b2:#34342F;--t:#F5F0E8;--t2:#B0ADA6;--t3:#787570;--t4:#56544F;--t4-a:#65625C;--ac:#A8A498;--ac2:#F5F0E8;--ac-dim:rgba(245,240,232,0.05);--green:#A8A498;--red:#C45C4F;--blue:#A8A498;--surface:#131312;--terminal-bg:#050504}
+[data-theme="contrast"]{--bg:#000000;--s1:#0A0A0A;--s2:#141414;--s3:#1E1E1E;--b:#333333;--b2:#444444;--t:#FFFFFF;--t2:#CCCCCC;--t3:#888888;--t4:#666666;--t4-a:#777777;--ac:#D4A059;--ac2:#FFB840;--ac-dim:rgba(212,160,89,0.10);--green:#50E850;--red:#FF4040;--blue:#5AB8FF;--surface:#0A0A0A;--terminal-bg:#000000}
+:root,[data-theme]{--display:'Fraunces',Georgia,serif;--body:'IBM Plex Sans',system-ui,sans-serif;--mono:'JetBrains Mono',monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--t);font-family:var(--body);font-weight:300;line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+::selection{background:color-mix(in srgb,var(--ac2) 30%,transparent);color:var(--t)}
+
+/* FOCUS */
+a:focus-visible,button:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.nav-cta:focus-visible{outline-offset:4px}
+
+/* REVEAL ANIMATIONS */
+.reveal{opacity:0;transform:translateY(24px);transition:opacity .6s ease,transform .6s ease}
+.reveal.visible{opacity:1;transform:translateY(0)}
+.reveal-stagger>*{opacity:0;transform:translateY(16px);transition:opacity .5s ease,transform .5s ease}
+.reveal-stagger.visible>*{opacity:1;transform:translateY(0)}
+.reveal-stagger.visible>*:nth-child(1){transition-delay:0s}
+.reveal-stagger.visible>*:nth-child(2){transition-delay:.1s}
+.reveal-stagger.visible>*:nth-child(3){transition-delay:.2s}
+.reveal-stagger.visible>*:nth-child(4){transition-delay:.3s}
+
+/* NAV */
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(20px);border-bottom:1px solid color-mix(in srgb,var(--b) 60%,transparent);padding:0 48px;height:64px;display:flex;align-items:center;justify-content:space-between;transition:background .25s,border-color .25s,color .25s}
+.nav-logo{font-family:var(--display);font-size:20px;font-weight:400;color:var(--t);text-decoration:none;letter-spacing:-.02em}
+.nav-logo em{color:var(--ac);font-style:italic;font-weight:500}
+.nav-links{display:flex;gap:32px;align-items:center}
+.nav-links a{font-size:13px;color:var(--t3);text-decoration:none;font-weight:400;transition:color .15s;letter-spacing:.02em}
+.nav-links a:hover{color:var(--ac)}
+
+/* ─── NAV FLYOUT (.nav-flyout) ──────────────────────────────────────
+   Single flyout in the nav grouping the external "tools" links so the
+   bar at large widths reads less like a phonebook. Shows on hover and
+   on focus-within; closes when the cursor leaves the wrapper or focus
+   moves out. The trigger underline echoes the FlyoutLink reference —
+   scaleX(0)→scaleX(1) on open. */
+.nav-flyout{position:relative;display:inline-flex;align-items:center}
+.nav-flyout-trigger{background:none;border:0;cursor:pointer;padding:0;font-family:var(--body);font-size:13px;color:var(--t3);font-weight:400;letter-spacing:.02em;display:inline-flex;align-items:center;gap:5px;position:relative;transition:color .15s}
+.nav-flyout-trigger::after{content:'';position:absolute;left:0;right:0;bottom:-6px;height:1px;background:var(--ac);transform:scaleX(0);transform-origin:left;transition:transform .25s ease}
+.nav-flyout:hover .nav-flyout-trigger,.nav-flyout:focus-within .nav-flyout-trigger{color:var(--ac)}
+.nav-flyout:hover .nav-flyout-trigger::after,.nav-flyout:focus-within .nav-flyout-trigger::after{transform:scaleX(1)}
+.nav-flyout-trigger .nav-flyout-caret{font-size:10px;line-height:1;transition:transform .25s ease}
+.nav-flyout:hover .nav-flyout-trigger .nav-flyout-caret,.nav-flyout:focus-within .nav-flyout-trigger .nav-flyout-caret{transform:rotate(180deg)}
+.nav-flyout-panel{position:absolute;top:100%;left:50%;transform:translate(-50%,8px);min-width:220px;margin-top:8px;background:var(--surface);border:1px solid var(--b);box-shadow:0 12px 32px rgba(0,0,0,.35);padding:6px;display:flex;flex-direction:column;opacity:0;pointer-events:none;transition:opacity .2s ease,transform .25s ease;z-index:200}
+.nav-flyout:hover .nav-flyout-panel,.nav-flyout:focus-within .nav-flyout-panel{opacity:1;pointer-events:auto;transform:translate(-50%,0)}
+/* Bridge fills the gap between trigger + panel so the cursor doesn't
+   accidentally close the flyout while travelling between them. */
+.nav-flyout-panel::before{content:'';position:absolute;top:-12px;left:0;right:0;height:12px}
+.nav-flyout-panel a{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:9px 14px;font-size:13px;color:var(--t2)!important;text-decoration:none;border-radius:3px;transition:background .15s,color .15s}
+.nav-flyout-panel a:hover{background:var(--s2);color:var(--ac2)!important}
+.nav-flyout-panel a .nav-flyout-hint{font-family:var(--mono);font-size:10px;color:var(--t4);letter-spacing:.06em;text-transform:uppercase;flex-shrink:0;transition:color .15s}
+.nav-flyout-panel a:hover .nav-flyout-hint{color:var(--ac)}
+.nav-cta{background:var(--ac);color:var(--bg);font-size:12px;font-weight:600;padding:8px 20px;border-radius:0;border:none;cursor:pointer;text-decoration:none;letter-spacing:.04em;transition:background .15s}
+.nav-cta:hover{background:var(--ac2)}
+
+/* HAMBURGER NAV */
+.nav-toggle{display:none;background:none;border:none;cursor:pointer;padding:8px;z-index:101}
+.nav-toggle-bar{display:block;width:20px;height:2px;background:var(--t2);margin:4px 0;transition:transform .3s,opacity .3s}
+.nav-toggle.active .nav-toggle-bar:nth-child(1){transform:rotate(45deg) translate(4px,4px)}
+.nav-toggle.active .nav-toggle-bar:nth-child(2){opacity:0}
+.nav-toggle.active .nav-toggle-bar:nth-child(3){transform:rotate(-45deg) translate(4px,-4px)}
+
+/* HERO */
+.hero{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:120px 32px 80px;position:relative;background:var(--bg)}
+.hero-banner{position:absolute;inset:0;z-index:0;overflow:hidden}
+.hero-banner img,.hero-banner object{width:100%;height:100%;object-fit:cover;opacity:.4}
+.hero-banner::after{content:'';position:absolute;inset:0;background:linear-gradient(to bottom,color-mix(in srgb,var(--bg) 30%,transparent) 0%,color-mix(in srgb,var(--bg) 10%,transparent) 40%,color-mix(in srgb,var(--bg) 70%,transparent) 80%,var(--bg) 100%)}
+.hero>*{position:relative;z-index:1}
+.hero-badge{font-family:var(--mono);font-size:11px;color:var(--ac);letter-spacing:.2em;text-transform:uppercase;margin-bottom:32px;display:flex;align-items:center;gap:10px}
+.hero-badge .dot{width:6px;height:6px;background:var(--ac);border-radius:50%;box-shadow:0 0 12px color-mix(in srgb,var(--ac2) 60%,transparent);animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.hero h1{font-family:var(--display);font-weight:200;font-size:clamp(48px,8vw,96px);line-height:.95;letter-spacing:-.04em;margin-bottom:28px;max-width:900px;font-variation-settings:"opsz" 144}
+.hero h1 em{font-style:italic;font-weight:400;color:var(--ac)}
+/* BubbleText effect on the italic "yours" word — each letter is its
+   own inline-block so cursor proximity can bloom them individually
+   (font-weight + glow + lift). The whole word stays readable as plain
+   text for screen readers because the spans are inline children. */
+.hero h1 em.bubble{display:inline-block}
+.hero h1 em.bubble .bubble-letter{display:inline-block;font-weight:400;color:var(--ac);transition:font-weight .35s,color .35s,text-shadow .4s,transform .35s cubic-bezier(.5,1.6,.4,1)}
+.hero h1 em.bubble .bubble-letter:hover{font-weight:700;color:var(--ac2);text-shadow:0 0 18px color-mix(in srgb,var(--ac2) 55%,transparent),0 0 36px color-mix(in srgb,var(--ac2) 25%,transparent);transform:translateY(-3px) scale(1.10)}
+.hero-sub{font-family:var(--display);font-style:italic;font-weight:300;font-size:clamp(18px,2.5vw,24px);color:var(--t3);max-width:600px;line-height:1.5;margin-bottom:48px}
+.hero-actions{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
+.btn-primary{background:var(--ac);color:var(--bg);font-size:14px;font-weight:600;padding:14px 36px;border:none;cursor:pointer;text-decoration:none;letter-spacing:.03em;transition:all .15s}
+.btn-primary:hover{background:var(--ac2);transform:translateY(-1px)}
+.btn-ghost{background:none;color:var(--t2);font-size:14px;font-weight:400;padding:14px 36px;border:1px solid var(--b);cursor:pointer;text-decoration:none;letter-spacing:.03em;transition:all .15s}
+.btn-ghost:hover{border-color:var(--ac);color:var(--ac)}
+.hero-stats{display:flex;gap:48px;margin-top:80px;flex-wrap:wrap;justify-content:center}
+
+/* ─── LAUNCH COUNTDOWN (.lc-*) ──────────────────────────────────────
+   Counts down to public testnet launch (2026-05-09 00:00:00 UTC).
+   After the deadline passes, the JS swaps the wrapper to a "launched"
+   pill instead of leaving zeros sitting around. Class names are
+   prefixed lc- (launch-countdown) to not collide with the existing
+   mainnet-genesis countdown's .cd-* classes further down the page. */
+.lc-wrap{margin-top:48px;display:flex;flex-direction:column;align-items:center;gap:14px;max-width:640px;width:100%}
+.lc-heading{font-family:var(--mono);font-size:11px;color:var(--ac);letter-spacing:.18em;text-transform:uppercase;display:flex;align-items:center;gap:10px}
+.lc-heading::before,.lc-heading::after{content:'';display:block;width:36px;height:1px;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--ac) 70%,transparent),transparent)}
+.lc-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0;width:100%;max-width:480px;border:1px solid var(--b);background:color-mix(in srgb,var(--s1) 85%,transparent)}
+.lc-cell{position:relative;height:100px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;border-right:1px solid var(--b);overflow:hidden}
+.lc-cell:last-child{border-right:none}
+.lc-val{font-family:var(--display);font-weight:400;font-size:42px;line-height:1;color:var(--t);font-variant-numeric:tabular-nums;display:inline-block;will-change:transform,opacity}
+.lc-unit{font-family:var(--mono);font-size:10px;color:var(--t3);letter-spacing:.14em;text-transform:lowercase}
+.lc-val.lc-out{animation:lc-out .35s forwards ease-in}
+.lc-val.lc-in{animation:lc-in .35s forwards ease-out}
+@keyframes lc-out{0%{transform:translateY(0);opacity:1}100%{transform:translateY(-50%);opacity:0}}
+@keyframes lc-in{0%{transform:translateY(50%);opacity:0}100%{transform:translateY(0);opacity:1}}
+.lc-launched{display:none;font-family:var(--display);font-style:italic;font-size:18px;color:var(--ac);padding:14px 28px;border:1px solid color-mix(in srgb,var(--ac) 40%,transparent);background:color-mix(in srgb,var(--ac) 8%,transparent);border-radius:100px}
+.lc-wrap.is-launched .lc-grid,.lc-wrap.is-launched .lc-heading{display:none}
+.lc-wrap.is-launched .lc-launched{display:inline-block}
+.lc-wrap.is-hidden{display:none}
+@media(max-width:520px){.lc-grid{max-width:100%}.lc-cell{height:80px}.lc-val{font-size:32px}.lc-heading::before,.lc-heading::after{width:18px}}
+
+/* ─── BUILT-ON PRIMITIVES GRID (.builtin-*) ─────────────────────────
+   Asymmetric 2/4/3 grid (mirrors the original ClipPathLinks layout)
+   crediting the named cryptographic + serialization primitives the
+   chain depends on. Each cell is a link; resting state shows the
+   primitive name in mono, hover slides up an inverted panel with a
+   one-line description. */
+.builtin-grid{margin:0 auto;max-width:880px;border:1px solid var(--b);background:var(--s1)}
+.builtin-row{display:grid;border-bottom:1px solid var(--b)}
+.builtin-row:last-child{border-bottom:none}
+.builtin-row.cols-2{grid-template-columns:repeat(2,1fr)}
+.builtin-row.cols-3{grid-template-columns:repeat(3,1fr)}
+.builtin-row.cols-4{grid-template-columns:repeat(4,1fr)}
+.builtin-cell{position:relative;height:120px;display:flex;align-items:center;justify-content:center;border-right:1px solid var(--b);overflow:hidden;cursor:pointer;color:var(--t2);text-decoration:none;transition:color .25s,background .25s}
+.builtin-cell:last-child{border-right:none}
+.builtin-cell:hover{color:var(--ac2);background:color-mix(in srgb,var(--ac2) 4%,transparent)}
+.builtin-name{font-family:var(--mono);font-size:14px;letter-spacing:.08em;text-transform:uppercase;font-weight:500;transition:transform .35s ease,opacity .25s}
+.builtin-cell:hover .builtin-name{transform:translateY(-130%);opacity:.4}
+.builtin-overlay{position:absolute;inset:0;background:var(--ac);color:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px 18px;text-align:center;transform:translateY(100%);transition:transform .4s cubic-bezier(.5,1.4,.4,1);font-family:var(--mono);font-size:11px;letter-spacing:.04em;line-height:1.45;pointer-events:none}
+.builtin-cell:hover .builtin-overlay{transform:translateY(0)}
+.builtin-overlay-name{font-size:13px;font-weight:600;letter-spacing:.08em;margin-bottom:6px;text-transform:uppercase}
+.builtin-overlay-desc{opacity:.85;max-width:240px}
+@media(max-width:700px){.builtin-row.cols-4{grid-template-columns:repeat(2,1fr)}.builtin-row.cols-4 .builtin-cell:nth-child(2){border-right:none}.builtin-row.cols-3{grid-template-columns:1fr}.builtin-row.cols-3 .builtin-cell{border-right:none;border-bottom:1px solid var(--b)}.builtin-row.cols-3 .builtin-cell:last-child{border-bottom:none}.builtin-cell{height:88px}}
+
+/* ─── MARK ROLODEX ──────────────────────────────────────────────────
+   Cycles the four existing brand-mark variants (gold-dark, cream-dark,
+   ink-brass, ink-cream) above the Constitution articles in §06. Every
+   ~3 s the card flips around its X axis, swapping the visible mark.
+   Tiny visual accent — meant to read as "the seal of the Constitution
+   in its different forms," not as a feature. */
+.mark-rolodex{display:flex;justify-content:center;margin-bottom:48px}
+.mark-card{position:relative;width:140px;height:140px;perspective:600px;cursor:default}
+.mark-card-face{position:absolute;inset:0;backface-visibility:hidden;display:flex;align-items:center;justify-content:center;background:var(--s1);border:1px solid var(--b);transition:transform .9s cubic-bezier(.5,1.2,.5,1),opacity .45s}
+.mark-card-face img{width:80%;height:80%;object-fit:contain;display:block}
+.mark-card-face.is-front{transform:rotateY(0)}
+.mark-card-face.is-back{transform:rotateY(180deg)}
+.mark-card.flipping .mark-card-face.is-front{transform:rotateY(-180deg)}
+.mark-card.flipping .mark-card-face.is-back{transform:rotateY(0)}
+.hero-stat{text-align:center}
+.hero-stat .val{font-family:var(--display);font-size:32px;font-weight:400;color:var(--t);margin-bottom:4px}
+.hero-stat .label{font-family:var(--mono);font-size:10px;color:var(--t4);letter-spacing:.15em;text-transform:uppercase}
+
+/* SECTIONS */
+section{padding:120px 48px;max-width:1200px;margin:0 auto}
+.section-header{margin-bottom:64px}
+.section-num{font-family:var(--mono);font-size:12px;color:var(--ac);letter-spacing:.15em;margin-bottom:12px}
+.section-title{font-family:var(--display);font-weight:300;font-size:clamp(32px,5vw,56px);line-height:1.05;letter-spacing:-.03em;margin-bottom:16px;max-width:700px}
+.section-title em{font-style:italic;font-weight:400;color:var(--ac)}
+.section-desc{font-size:18px;color:var(--t3);max-width:600px;line-height:1.6;font-weight:300}
+
+/* MANIFESTO */
+.manifesto{border-top:1px solid var(--b);border-bottom:1px solid var(--b);padding:80px 48px;text-align:center;background:var(--s1);position:relative}
+.manifesto::before,.manifesto::after{content:'';position:absolute;left:50%;transform:translateX(-50%);width:120px;height:2px;background:linear-gradient(90deg,transparent,var(--ac),transparent)}
+.manifesto::before{top:0}
+.manifesto::after{bottom:0}
+.manifesto blockquote{font-family:var(--display);font-style:italic;font-weight:300;font-size:clamp(20px,3vw,28px);color:var(--t2);line-height:1.6;max-width:700px;margin:0 auto 24px;border-left:2px solid var(--ac-dim);padding-left:24px;text-align:left}
+.manifesto cite{font-family:var(--mono);font-size:11px;color:var(--t4);letter-spacing:.15em;text-transform:uppercase;font-style:normal}
+
+/* THREE PILLARS */
+.pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--b);border:1px solid var(--b)}
+.pillar{background:var(--s1);padding:48px 36px}
+.pillar-num{font-family:var(--mono);font-size:11px;color:var(--ac);letter-spacing:.15em;margin-bottom:20px}
+.pillar h3{font-family:var(--display);font-size:22px;font-weight:400;margin-bottom:12px;letter-spacing:-.01em}
+.pillar p{font-size:14px;color:var(--t3);line-height:1.7}
+
+/* PRIVACY LAYERS */
+.layers{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.layer-card{position:relative;background:var(--s1);border:1px solid var(--b);padding:36px;transition:border-color .35s,transform .35s,background .35s;overflow:hidden;isolation:isolate}
+.layer-card:hover{border-color:color-mix(in srgb,var(--ac2) 30%,transparent);transform:translateY(-3px)}
+/* Big faded glyph in the bottom-right corner that responds to hover. The
+   SVG itself lives in the card markup (.layer-glyph); these rules just
+   position + animate it. The gradient ::before is a vertical wash that
+   slides up from below, drawing the eye toward the card without harming
+   text contrast. */
+.layer-card .layer-glyph{position:absolute;right:-22px;bottom:-22px;width:160px;height:160px;color:var(--ac);opacity:.06;pointer-events:none;transition:opacity .45s,transform .45s cubic-bezier(.4,1.4,.6,1);z-index:0}
+.layer-card:hover .layer-glyph{opacity:.13;color:var(--ac2);transform:rotate(8deg) scale(1.12)}
+.layer-card::before{content:'';position:absolute;inset:0;background:linear-gradient(to top,color-mix(in srgb,var(--ac2) 14%,transparent) 0%,transparent 65%);opacity:0;transition:opacity .45s ease;pointer-events:none;z-index:0}
+.layer-card:hover::before{opacity:1}
+.layer-card>*:not(.layer-glyph){position:relative;z-index:1}
+.layer-num{font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.15em;margin-bottom:12px;text-transform:uppercase;transition:color .35s}
+.layer-card:hover .layer-num{color:var(--ac2)}
+.layer-card h3{font-family:var(--display);font-size:20px;font-weight:400;margin-bottom:8px;transition:color .35s}
+.layer-card p{font-size:13px;color:var(--t3);line-height:1.6;margin-bottom:16px;transition:color .35s}
+.layer-card:hover p{color:var(--t2)}
+.layer-features{list-style:none;display:flex;flex-direction:column;gap:6px}
+.layer-features li{font-size:12px;color:var(--t3);display:flex;align-items:baseline;gap:8px;transition:color .35s}
+.layer-card:hover .layer-features li{color:var(--t2)}
+.layer-features li::before{content:"\203A";color:var(--ac);font-weight:600;font-size:14px;flex-shrink:0;transition:color .35s}
+.layer-card:hover .layer-features li::before{color:var(--ac2)}
+
+/* COMPARISON */
+.compare-table{width:100%;border-collapse:collapse;border:1px solid var(--b)}
+.compare-table th{padding:14px 20px;font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--t4);text-align:left;border-bottom:1px solid var(--b)}
+.compare-table th:first-child{color:var(--t3)}
+.compare-table td{padding:12px 20px;font-size:13px;border-bottom:1px solid var(--b);color:var(--t3);font-weight:300}
+.compare-table td:nth-child(2){color:var(--ac);font-weight:500}
+.compare-table tr:hover td{background:color-mix(in srgb,var(--ac2) 4%,transparent)}
+
+/* LEDGER */
+.ledger{border:1px solid var(--b);background:var(--s1)}
+.ledger-row{display:grid;grid-template-columns:1fr auto;padding:20px 28px;border-bottom:1px solid var(--b);align-items:baseline}
+.ledger-row:last-child{border-bottom:none}
+.ledger-label{font-family:var(--mono);font-size:11px;color:var(--t3);text-transform:uppercase;letter-spacing:.12em}
+.ledger-value{font-family:var(--mono);font-size:18px;font-weight:500;color:var(--t);text-align:right}
+.ledger-value .unit{font-size:10px;color:var(--t4);margin-left:6px;letter-spacing:.08em}
+
+/* CTA SECTION */
+.cta-section{text-align:center;padding:120px 48px;background:var(--s1);border-top:1px solid var(--b);position:relative}
+.cta-section::before{content:'';position:absolute;top:0;left:50%;transform:translateX(-50%);width:200px;height:2px;background:linear-gradient(90deg,transparent,var(--ac),transparent)}
+.cta-section h2{font-family:var(--display);font-size:clamp(28px,4vw,48px);font-weight:300;letter-spacing:-.02em;margin-bottom:16px}
+.cta-section h2 em{font-style:italic;font-weight:400;color:var(--ac)}
+.cta-section p{font-size:16px;color:var(--t3);max-width:500px;margin:0 auto 40px;font-weight:300}
+.cta-buttons{display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
+
+/* LINK GRID */
+.link-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--b);border:1px solid var(--b);margin-top:48px}
+.link-card{background:var(--s1);padding:32px 28px;text-decoration:none;transition:background .15s}
+.link-card:hover{background:var(--s2)}
+.link-card .link-title{font-family:var(--display);font-size:16px;font-weight:400;color:var(--t);margin-bottom:6px}
+.link-card .link-desc{font-size:12px;color:var(--t4);line-height:1.5}
+.link-card .link-arrow{font-size:14px;color:var(--ac);margin-top:12px;display:block}
+
+/* ROADMAP */
+.roadmap{position:relative;padding-left:32px;border-left:2px solid var(--b)}
+.roadmap-item{position:relative;margin-bottom:40px}
+.roadmap-item:last-child{margin-bottom:0}
+.roadmap-item::before{content:'';position:absolute;left:-38px;top:6px;width:10px;height:10px;border-radius:50%;border:2px solid var(--b);background:var(--bg)}
+.roadmap-item.completed::before{background:var(--ac);border-color:var(--ac)}
+.roadmap-item.current::before{background:var(--bg);border-color:var(--ac);box-shadow:0 0 8px color-mix(in srgb,var(--ac2) 40%,transparent)}
+.roadmap-phase{font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.15em;text-transform:uppercase;margin-bottom:4px}
+.roadmap-title{font-family:var(--display);font-size:18px;font-weight:400;margin-bottom:6px}
+.roadmap-desc{font-size:13px;color:var(--t3);line-height:1.6}
+.roadmap-tag{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.08em;padding:3px 10px;margin-top:8px;border:1px solid var(--b);color:var(--t4)}
+.roadmap-tag.done{color:var(--green);border-color:color-mix(in srgb,var(--green) 30%,transparent)}
+.roadmap-tag.active{color:var(--ac);border-color:var(--ac-dim)}
+
+/* COMPARE CARDS (mobile only) */
+.compare-cards{display:none}
+.compare-card{background:var(--s1);border:1px solid var(--b);padding:20px}
+.compare-card-feature{font-family:var(--display);font-size:16px;font-weight:400;margin-bottom:12px;color:var(--t)}
+.compare-card-row{display:flex;justify-content:space-between;padding:6px 0;font-size:13px;border-bottom:1px solid var(--b)}
+.compare-card-row:last-child{border-bottom:none}
+.compare-card-coin{color:var(--t4-a)}
+.compare-card-value{color:var(--t3)}
+.compare-card-value.highlight{color:var(--ac);font-weight:500}
+.compare-card-value.negative{color:var(--red)}
+
+/* TX FLOW DIAGRAM */
+.tx-flow{max-width:800px;margin:0 auto}
+.tx-flow svg{width:100%;height:auto}
+
+/* EMISSION CURVE */
+.curve-wrap{max-width:700px;margin:0 auto;background:var(--s1);border:1px solid var(--b);padding:28px 32px 20px}
+.curve-wrap svg{width:100%;height:auto}
+.curve-label{font-family:var(--mono);font-size:9px;fill:var(--t4);letter-spacing:.08em}
+.curve-line{fill:none;stroke:var(--ac);stroke-width:2}
+.curve-tail{fill:none;stroke:var(--ac);stroke-width:1.5;stroke-dasharray:4 3}
+.curve-fill{fill:url(#curve-grad);opacity:.15}
+.curve-axis{stroke:var(--b);stroke-width:1}
+.curve-grid{stroke:var(--b);stroke-width:.5;opacity:.5}
+
+/* COUNTDOWN */
+.countdown{display:flex;gap:24px;justify-content:center;flex-wrap:wrap;margin-top:32px}
+.cd-unit{text-align:center}
+.cd-val{font-family:var(--display);font-size:clamp(28px,4vw,48px);font-weight:400;color:var(--t);line-height:1}
+.cd-label{font-family:var(--mono);font-size:9px;color:var(--t4);letter-spacing:.15em;text-transform:uppercase;margin-top:6px}
+
+/* FEE BURN */
+.fee-visual{display:flex;align-items:center;gap:24px;max-width:600px;margin:24px auto 0;flex-wrap:wrap;justify-content:center}
+.fee-bar{flex:1;min-width:200px;height:32px;background:var(--s2);border:1px solid var(--b);display:flex;overflow:hidden}
+.fee-burn{background:var(--ac);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--bg);font-weight:600}
+.fee-miner{background:var(--s3);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--t3);font-weight:500;flex:1}
+
+/* CONSTITUTION */
+.const-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.const-card{background:var(--s1);border:1px solid var(--b);padding:28px;transition:border-color .2s}
+.const-card:hover{border-color:color-mix(in srgb,var(--ac2) 30%,transparent)}
+.const-art{font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.15em;text-transform:uppercase;margin-bottom:10px}
+.const-quote{font-family:var(--display);font-style:italic;font-size:15px;color:var(--t2);line-height:1.6}
+
+/* QUICK START */
+.terminal{background:var(--terminal-bg);border:1px solid var(--b);padding:0;font-family:var(--mono);font-size:12px;max-width:700px}
+.terminal-bar{background:var(--s1);padding:8px 14px;border-bottom:1px solid var(--b);display:flex;align-items:center;gap:6px}
+.terminal-dot{width:8px;height:8px;border-radius:50%}
+.terminal-body{padding:20px;line-height:2;color:var(--t2);overflow-x:auto}
+.terminal-body .prompt{color:var(--ac)}
+.terminal-body .comment{color:var(--t4)}
+.terminal-body .output{color:var(--t3);opacity:.7}
+
+/* SECURITY */
+.bounty-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.bounty-card{background:var(--s1);border:1px solid var(--b);padding:20px;text-align:center}
+.bounty-tier{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px}
+.bounty-range{font-family:var(--display);font-size:20px;font-weight:400;color:var(--t);margin-bottom:6px}
+.bounty-desc{font-size:11px;color:var(--t3);line-height:1.5}
+
+/* FAQ */
+.faq-list{max-width:800px}
+.faq-item{border-bottom:1px solid var(--b)}
+.faq-q{padding:20px 0;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-family:var(--display);font-size:17px;font-weight:400;color:var(--t);transition:color .15s}
+.faq-q:hover{color:var(--ac)}
+.faq-q::after{content:'+';font-family:var(--mono);font-size:18px;color:var(--t4);transition:transform .2s}
+.faq-item.open .faq-q::after{transform:rotate(45deg);color:var(--ac)}
+.faq-a{max-height:0;overflow:hidden;transition:max-height .3s ease}
+.faq-item.open .faq-a{max-height:400px}
+.faq-a-inner{padding:0 0 20px;font-size:14px;color:var(--t3);line-height:1.7}
+
+/* STATS LIVE */
+.stat-live{position:relative}
+.stat-live .live-indicator{position:absolute;top:4px;right:4px;width:5px;height:5px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+
+/* FAUCET BANNER */
+.faucet-banner{background:linear-gradient(135deg,var(--ac-dim),transparent);border:1px solid var(--b);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:24px;flex-wrap:wrap}
+.faucet-banner p{font-size:13px;color:var(--t2)}
+.faucet-banner a{font-size:12px;color:var(--ac);font-family:var(--mono);text-decoration:none;border:1px solid var(--ac-dim);padding:6px 16px;transition:all .15s;flex-shrink:0}
+.faucet-banner a:hover{background:var(--ac);color:var(--bg)}
+
+/* FOOTER */
+footer{border-top:1px solid var(--b);padding:48px}
+.footer-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:40px;text-align:left;max-width:1200px;margin:0 auto 40px}
+.footer-col h4{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--ac);margin-bottom:16px}
+.footer-col a{display:block;font-size:13px;color:var(--t4);text-decoration:none;padding:4px 0;transition:color .15s}
+.footer-col a:hover{color:var(--ac)}
+.footer-bottom{text-align:center;border-top:1px solid var(--b);padding-top:32px}
+.footer-logo{font-family:var(--display);font-size:16px;font-weight:400;color:var(--t3);margin-bottom:8px}
+.footer-logo em{color:var(--ac);font-style:italic}
+.footer-credit{margin-top:24px}
+.footer-credit .lab{font-family:var(--mono);font-size:10px;color:var(--t4);letter-spacing:.15em;text-transform:uppercase}
+.footer-credit .lab-name{font-size:13px;color:var(--t3);font-weight:500;margin-top:3px}
+.footer-credit .lab-desc{font-family:var(--display);font-style:italic;font-size:11px;color:var(--t4);margin-top:2px}
+
+/* RESPONSIVE */
+@media(max-width:768px){
+  nav{padding:0 20px;height:56px}
+  .nav-toggle{display:block}
+  .nav-links{display:none;position:fixed;top:56px;left:0;right:0;background:color-mix(in srgb,var(--bg) 97%,transparent);backdrop-filter:blur(20px);flex-direction:column;padding:24px 20px;gap:0;border-bottom:1px solid var(--b)}
+  .nav-links.open{display:flex}
+  .nav-links a{padding:14px 0;font-size:15px;border-bottom:1px solid var(--b);color:var(--t2)}
+  .nav-links a:last-child{border-bottom:none}
+  .nav-cta{margin-top:12px;text-align:center;padding:14px 20px}
+  .hero{padding:100px 20px 60px}
+  section{padding:80px 20px}
+  .pillars{grid-template-columns:1fr}
+  .layers{grid-template-columns:1fr}
+  .link-grid{grid-template-columns:1fr 1fr}
+  .hero-stats{gap:24px}
+  .manifesto{padding:60px 20px}
+  .manifesto blockquote{padding-left:16px}
+  .compare-table{display:none}
+  .compare-cards{display:flex;flex-direction:column;gap:16px}
+  .footer-grid{grid-template-columns:1fr 1fr;gap:32px 20px}
+  .roadmap{padding-left:20px}
+  .roadmap-item::before{left:-26px}
+  .const-grid{grid-template-columns:1fr}
+  .bounty-grid{grid-template-columns:1fr 1fr}
+  .countdown{gap:16px}
+  .fee-visual{flex-direction:column}
+}
+@media(max-width:480px){
+  .link-grid{grid-template-columns:1fr}
+  .hero-actions{flex-direction:column;width:100%}
+  .btn-primary,.btn-ghost{width:100%;text-align:center}
+  .footer-grid{grid-template-columns:1fr}
+  .compare-cards{gap:12px}
+  .bounty-grid{grid-template-columns:1fr}
+  .theme-picker{display:none}
+}
+
+/* ─── THEME + WALLPAPER PICKER ──────────────────────────────────────
+   Fancy pill in the nav. The circular thumb on the left of the pill
+   shows a per-theme icon (moon for Dark, sun for Brass, quill for
+   Paper, etc. — see THEME_ICONS in JS). When a wallpaper is active,
+   that same thumb's background becomes a tiny crop of the wallpaper
+   SVG, so one glance tells you both the active theme AND wallpaper.
+   Click anywhere on the pill opens the dropdown with the full menu. */
+.theme-picker{position:relative;display:inline-flex;flex-shrink:0;margin-right:14px}
+.theme-btn{position:relative;padding:3px 14px 3px 3px;border:1px solid var(--b);border-radius:100px;font-size:11px;font-weight:500;color:var(--t2);cursor:pointer;background:linear-gradient(135deg,var(--s2),var(--s3));font-family:var(--mono);display:flex;align-items:center;gap:8px;letter-spacing:.04em;height:32px;min-width:112px;overflow:hidden;transition:border-color .18s,color .18s,box-shadow .25s,transform .2s ease-out}
+.theme-btn:hover{border-color:var(--ac2);color:var(--ac2);transform:scale(1.03);box-shadow:0 0 14px color-mix(in srgb,var(--ac2) 25%,transparent)}
+.theme-btn:active{transform:scale(.98)}
+.theme-thumb{width:24px;height:24px;border-radius:50%;background:var(--ac-dim);background-size:cover;background-position:center;border:1px solid color-mix(in srgb,var(--ac2) 40%,transparent);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ac2) 15%,transparent),0 0 6px color-mix(in srgb,var(--ac2) 30%,transparent);transition:transform .35s cubic-bezier(0.5,1.5,0.6,1),background .35s,box-shadow .35s;will-change:transform}
+.theme-btn:hover .theme-thumb{transform:rotate(-12deg) scale(1.08)}
+.theme-thumb svg{width:14px;height:14px;color:var(--ac2);filter:drop-shadow(0 0 2px color-mix(in srgb,var(--ac2) 60%,transparent));transition:opacity .2s,transform .35s ease-in-out}
+.theme-thumb.with-wp svg{opacity:.92;filter:drop-shadow(0 0 3px var(--bg)) drop-shadow(0 0 1px var(--bg))}
+.theme-thumb.with-wp{background-color:transparent}
+/* Switching motion: when JS adds the .swap class to the thumb, it rotates
+   180° + scales down + fades out the icon. JS swaps the SVG content
+   mid-animation, then removes .swap, so the thumb springs back with the
+   new icon visible. ~400ms total — fast enough to feel responsive,
+   slow enough to read as a transition. */
+@keyframes theme-icon-fade{0%,100%{opacity:1}50%{opacity:0}}
+.theme-thumb.swap{animation:theme-icon-spin .42s cubic-bezier(.5,1.6,.4,1)}
+.theme-thumb.swap svg{animation:theme-icon-fade .42s ease-in-out}
+@keyframes theme-icon-spin{
+  0%  {transform:rotate(0deg) scale(1)}
+  45% {transform:rotate(160deg) scale(.78)}
+  100%{transform:rotate(360deg) scale(1)}
+}
+.theme-btn:hover .theme-thumb.swap{animation:theme-icon-spin .42s cubic-bezier(.5,1.6,.4,1)}
+.theme-label{transition:opacity .15s}
+.theme-label.swap{opacity:0}
+.theme-menu{display:none;position:absolute;top:calc(100% + 8px);right:0;background:var(--surface);border:1px solid var(--b);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.4);min-width:260px;max-height:70vh;overflow-y:auto;z-index:300;padding:6px;scrollbar-width:thin}
+.theme-picker.open .theme-menu{display:block}
+.theme-opt{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:4px;font-size:12px;font-weight:400;color:var(--t2);cursor:pointer;border:none;background:none;font-family:var(--body);width:100%;text-align:left;transition:background .15s}
+.theme-opt:hover{background:var(--s2);color:var(--t)}
+.theme-opt.active{color:var(--ac2);font-weight:500}
+.theme-opt .t-swatch{width:18px;height:18px;border-radius:3px;border:1px solid color-mix(in srgb,var(--t) 20%,transparent);flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.theme-opt .t-swatch .t-dot{width:6px;height:6px;border-radius:50%}
+.theme-divider{height:1px;background:var(--b);margin:6px 0}
+.theme-section-label{padding:4px 12px 2px;font-size:9px;font-weight:600;color:var(--t3);letter-spacing:.08em;text-transform:uppercase;font-family:var(--mono)}
+.wp-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;padding:4px}
+.wp-thumb{aspect-ratio:16/9;border:1px solid var(--b);border-radius:3px;overflow:hidden;cursor:pointer;background:var(--s2);position:relative;padding:0;transition:border-color .15s}
+.wp-thumb:hover{border-color:var(--ac2)}
+.wp-thumb.active{border-color:var(--ac2);box-shadow:0 0 0 1px var(--ac2)}
+.wp-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.wp-off{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-family:var(--mono);font-size:9px;font-weight:600;color:var(--t3);letter-spacing:.05em}
+
+/* Wallpaper application: sits behind everything via fixed bg-attachment;
+   theme-coloured overlay ::after dims it so foreground text always wins
+   the contrast contest. Nav + footer get a translucent surface tint
+   matching the active theme. */
+body.has-wallpaper{background-size:cover;background-position:center;background-repeat:no-repeat;background-attachment:fixed}
+body.has-wallpaper::after{content:'';position:fixed;inset:0;background:var(--bg);opacity:.65;pointer-events:none;z-index:-1}
+body.has-wallpaper .hero,body.has-wallpaper .hero-banner::after{background:transparent}
+body.has-wallpaper nav{background:color-mix(in srgb,var(--surface) 80%,transparent);backdrop-filter:blur(12px)}
+body.has-wallpaper footer{background:color-mix(in srgb,var(--bg) 85%,transparent)}
+.dark body.has-wallpaper::after,html[data-theme="dark"] body.has-wallpaper::after,html[data-theme="midnight"] body.has-wallpaper::after,html[data-theme="forge"] body.has-wallpaper::after,html[data-theme="vault"] body.has-wallpaper::after,html[data-theme="mono"] body.has-wallpaper::after,html[data-theme="contrast"] body.has-wallpaper::after{opacity:.7}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a href="/" class="nav-logo" aria-label="CoinCync home"><svg viewBox="0 0 200 200" width="28" height="28" aria-label="CoinCync logo" role="img" style="vertical-align:middle;margin-right:10px"><circle cx="100" cy="100" r="78" fill="none" stroke="var(--ac2)" stroke-width="14"/><path d="M 168 100 A 68 68 0 1 0 100 168" fill="none" stroke="var(--bg)" stroke-width="22"/><line x1="162" y1="100" x2="178" y2="100" stroke="var(--bg)" stroke-width="22"/><circle cx="68" cy="100" r="8" fill="var(--ac2)"/><circle cx="132" cy="100" r="8" fill="var(--ac2)"/></svg>Coin<em>Cync</em></a>
+  <button class="nav-toggle" aria-label="Toggle navigation menu" aria-expanded="false"><span class="nav-toggle-bar"></span><span class="nav-toggle-bar"></span><span class="nav-toggle-bar"></span></button>
+  <div class="nav-links">
+    <a href="#privacy">Privacy</a>
+    <a href="#economics">Economics</a>
+    <a href="#roadmap">Roadmap</a>
+    <div class="nav-flyout">
+      <button class="nav-flyout-trigger" type="button" aria-haspopup="menu" aria-expanded="false">
+        Tools
+        <span class="nav-flyout-caret" aria-hidden="true">&#9662;</span>
+      </button>
+      <div class="nav-flyout-panel" role="menu">
+        <a href="https://explorer.coincync.network" target="_blank" rel="noopener" role="menuitem">Explorer<span class="nav-flyout-hint">Live chain</span></a>
+        <a href="https://docs.coincync.network/introduction" role="menuitem">Whitepaper<span class="nav-flyout-hint">Read</span></a>
+        <a href="https://docs.coincync.network/api/json-rpc" role="menuitem">Developers<span class="nav-flyout-hint">JSON-RPC</span></a>
+        <a href="/brand" role="menuitem">Brand<span class="nav-flyout-hint">Marks</span></a>
+      </div>
+    </div>
+    <a href="https://discord.gg/5tYNSCsqzy" target="_blank">Discord</a>
+    <div class="theme-picker" id="theme-picker">
+      <button class="theme-btn" id="theme-btn" type="button" title="Theme &amp; wallpaper" aria-haspopup="menu" aria-expanded="false">
+        <span class="theme-thumb" id="theme-thumb" aria-hidden="true"></span>
+        <span class="theme-label" id="theme-label">Dark</span>
+      </button>
+      <div class="theme-menu" id="theme-menu" role="menu">
+        <button class="theme-opt" data-theme="paper" type="button"><span class="t-swatch" style="background:#F5F3EE"><span class="t-dot" style="background:#D4A059"></span></span>Paper</button>
+        <button class="theme-opt active" data-theme="dark" type="button"><span class="t-swatch" style="background:#0A0A09"><span class="t-dot" style="background:#D4A059"></span></span>Dark</button>
+        <button class="theme-opt" data-theme="brass" type="button"><span class="t-swatch" style="background:#D4A059"><span class="t-dot" style="background:#3A3328"></span></span>Brass</button>
+        <button class="theme-opt" data-theme="cream" type="button"><span class="t-swatch" style="background:#F5F0E6"><span class="t-dot" style="background:#3A3328"></span></span>Cream</button>
+        <button class="theme-opt" data-theme="midnight" type="button"><span class="t-swatch" style="background:#08090E"><span class="t-dot" style="background:#D4A059"></span></span>Midnight</button>
+        <button class="theme-opt" data-theme="forge" type="button"><span class="t-swatch" style="background:#121010"><span class="t-dot" style="background:#E07840"></span></span>Forge</button>
+        <button class="theme-opt" data-theme="vault" type="button"><span class="t-swatch" style="background:#0A0C0A"><span class="t-dot" style="background:#A0B060"></span></span>Vault</button>
+        <button class="theme-opt" data-theme="mono" type="button"><span class="t-swatch" style="background:#0A0A09"><span class="t-dot" style="background:#F5F0E8"></span></span>Mono</button>
+        <button class="theme-opt" data-theme="contrast" type="button"><span class="t-swatch" style="background:#000000"><span class="t-dot" style="background:#FFB840"></span></span>Contrast</button>
+        <div class="theme-divider"></div>
+        <div class="theme-section-label">Wallpaper</div>
+        <div class="wp-grid" id="wp-grid">
+          <button class="wp-thumb active" data-wp="none" type="button" title="None"><div class="wp-off">OFF</div></button>
+          <button class="wp-thumb" data-wp="01-field" type="button" title="Commitment Field"><img src="/assets/wallpapers/wallpaper-01-commitment-field-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="01-mark" type="button" title="Mark"><img src="/assets/wallpapers/wallpaper-01-mark-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="02-proof" type="button" title="The Proof"><img src="/assets/wallpapers/wallpaper-02-proof-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="02-lockup" type="button" title="Lockup"><img src="/assets/wallpapers/wallpaper-02-lockup-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="03-veil" type="button" title="The Veil"><img src="/assets/wallpapers/wallpaper-03-veil-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="03-reversed" type="button" title="Reversed"><img src="/assets/wallpapers/wallpaper-03-reversed-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="04-formula" type="button" title="The Formula"><img src="/assets/wallpapers/wallpaper-04-formula-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="04-mono" type="button" title="Mono Pair"><img src="/assets/wallpapers/wallpaper-04-mono-pair-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="05-library" type="button" title="The Library"><img src="/assets/wallpapers/wallpaper-05-library-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="05-specimen" type="button" title="Specimen"><img src="/assets/wallpapers/wallpaper-05-specimen-sheet-landscape.svg" alt="" loading="lazy"></button>
+          <button class="wp-thumb" data-wp="06-construct" type="button" title="Construction"><img src="/assets/wallpapers/wallpaper-06-construction-landscape.svg" alt="" loading="lazy"></button>
+        </div>
+      </div>
+    </div>
+    <a href="#download" class="nav-cta">Download Wallet</a>
+  </div>
+</nav>
+
+<main>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-banner">
+    <img src="banner.svg" alt="The Reading Room — CoinCync" loading="eager">
+  </div>
+  <div class="hero-badge">
+    <span class="dot"></span>
+    <span>Testnet live &mdash; <span id="live-nodes">9</span> nodes &mdash; block <span id="live-height">&mdash;</span></span>
+  </div>
+  <h1>Your money<br>is <em class="bubble"><span class="bubble-letter">y</span><span class="bubble-letter">o</span><span class="bubble-letter">u</span><span class="bubble-letter">r</span><span class="bubble-letter">s</span></em>.</h1>
+  <p class="hero-sub">A privacy-first cryptocurrency where every transaction is shielded by default, supply is cryptographically auditable, and no permission is required to participate.</p>
+  <p class="hero-thesis" style="font-family:var(--serif);font-style:italic;font-size:clamp(15px,1.5vw,18px);line-height:1.5;color:var(--t2);max-width:680px;margin:0 auto 36px;padding:0 24px;border-left:2px solid var(--ac);text-align:left;padding-left:20px">Privacy money that doesn&rsquo;t depend on permission to participate. CYNC&harr;BTC atomic swaps are a constitutional commitment under Article&nbsp;XV &mdash; they ship in v1.1, after the base chain is live on mainnet and cyncswap has cleared its own dedicated audit. Same staging Monero used: chain first, novel crypto later, each behind its own audit.</p>
+  <div class="hero-actions">
+    <a href="#download" class="btn-primary">Download Wallet</a>
+    <a href="https://explorer.coincync.network" class="btn-ghost" target="_blank">Explore the chain</a>
+  </div>
+  <!-- LAUNCH COUNTDOWN — 2026-05-09 00:00:00 UTC -->
+  <div class="lc-wrap" id="lc-wrap" data-target="2026-05-09T00:00:00Z" aria-live="polite">
+    <div class="lc-heading"><span>Public testnet launches in</span></div>
+    <div class="lc-grid" role="timer">
+      <div class="lc-cell"><span class="lc-val" id="lc-d">--</span><span class="lc-unit">days</span></div>
+      <div class="lc-cell"><span class="lc-val" id="lc-h">--</span><span class="lc-unit">hours</span></div>
+      <div class="lc-cell"><span class="lc-val" id="lc-m">--</span><span class="lc-unit">minutes</span></div>
+      <div class="lc-cell"><span class="lc-val" id="lc-s">--</span><span class="lc-unit">seconds</span></div>
+    </div>
+    <div class="lc-launched">Public testnet is <em>live</em>.</div>
+  </div>
+  <div class="hero-stats">
+    <div class="hero-stat"><div class="val">22</div><div class="label">Privacy features</div></div>
+    <div class="hero-stat"><div class="val">100M</div><div class="label">Supply cap</div></div>
+    <div class="hero-stat"><div class="val">0%</div><div class="label">Dev tax</div></div>
+    <div class="hero-stat"><div class="val">16</div><div class="label">Ring size</div></div>
+    <div class="hero-stat"><div class="val">30%</div><div class="label">Fee burn</div></div>
+  </div>
+</section>
+
+<!-- MANIFESTO -->
+<div class="manifesto reveal">
+  <blockquote>"We built CoinCync on one principle: your money is yours. Not visible to surveillance. Not subject to seizure. Not dependent on permission. Enforced by proofs, not promises."</blockquote>
+  <cite>&mdash; The CoinCync Manifesto</cite>
+</div>
+
+<!-- THREE PILLARS -->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 01</div>
+    <h2 class="section-title">Three principles.<br>Zero <em>compromise</em>.</h2>
+  </div>
+  <div class="pillars reveal-stagger">
+    <div class="pillar">
+      <div class="pillar-num">&sect; 01</div>
+      <h3>Private by default</h3>
+      <p>Every transaction is shielded with CLSAG ring-16 signatures, Pedersen commitments, Bulletproofs+ range proofs, and stealth addresses. No opt-out. No transparent mode. Privacy is mandatory.</p>
+    </div>
+    <div class="pillar">
+      <div class="pillar-num">&sect; 02</div>
+      <h3>Auditable by anyone</h3>
+      <p>Supply is cryptographically verifiable. Pedersen commitments are additively homomorphic &mdash; they balance without revealing amounts. No trusted setup. No ceremony. Anyone can audit.</p>
+    </div>
+    <div class="pillar">
+      <div class="pillar-num">&sect; 03</div>
+      <h3>No permission needed</h3>
+      <p>CPU-only RandomX mining. 0% developer tax. No premine. No founder allocation. The Constitution enforces these rules at the protocol level &mdash; permanently.</p>
+    </div>
+  </div>
+</section>
+
+<!-- PRIVACY LAYERS -->
+<section id="privacy">
+  <div class="section-header">
+    <div class="section-num">&sect; 02</div>
+    <h2 class="section-title">Four layers of <em>privacy</em>.</h2>
+    <p class="section-desc">Each layer addresses a different attack surface. Together they provide the strongest privacy guarantees of any cryptocurrency.</p>
+  </div>
+  <div class="layers reveal-stagger">
+    <div class="layer-card">
+      <div class="layer-num">Layer 1 &mdash; Cryptographic</div>
+      <h3>Protects the content</h3>
+      <p>Who sent. Who received. How much.</p>
+      <ul class="layer-features">
+        <li>CLSAG ring-16 signatures &mdash; real signer hidden among 16 decoys</li>
+        <li>Stealth addresses &mdash; one-time Ristretto255 destinations</li>
+        <li>Pedersen commitments &mdash; amounts hidden, homomorphic balance</li>
+        <li>Bulletproofs+ &mdash; compact non-negative range proofs</li>
+        <li>Encrypted memos &mdash; ChaCha20-Poly1305 + ECDH</li>
+        <li>Key images &mdash; double-spend prevention without revealing source</li>
+        <li>View tags &mdash; 90% faster wallet sync</li>
+      </ul>
+      <svg class="layer-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <rect x="4" y="11" width="16" height="10" rx="1"/>
+        <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+        <circle cx="12" cy="16" r="1.2" fill="currentColor"/>
+      </svg>
+    </div>
+    <div class="layer-card">
+      <div class="layer-num">Layer 2 &mdash; Network</div>
+      <h3>Protects the metadata</h3>
+      <p>IP addresses. Timing. Traffic patterns.</p>
+      <ul class="layer-features">
+        <li>Dandelion++ &mdash; random stem path before broadcast</li>
+        <li>Noise_XX &mdash; Signal-grade encrypted P2P</li>
+        <li>Traffic shaping &mdash; 0&ndash;200ms random jitter</li>
+        <li>Constant-rate padding &mdash; masks activity patterns</li>
+      </ul>
+      <svg class="layer-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/>
+        <ellipse cx="12" cy="12" rx="3" ry="9"/>
+        <line x1="3" y1="12" x2="21" y2="12"/>
+        <circle cx="6" cy="6" r="1.4" fill="currentColor"/>
+        <circle cx="18" cy="18" r="1.4" fill="currentColor"/>
+        <circle cx="6" cy="18" r="1.4" fill="currentColor"/>
+        <circle cx="18" cy="6" r="1.4" fill="currentColor"/>
+      </svg>
+    </div>
+    <div class="layer-card">
+      <div class="layer-num">Layer 3 &mdash; Wallet</div>
+      <h3>Protects the user</h3>
+      <p>Selective disclosure. Plausible deniability. Recovery.</p>
+      <ul class="layer-features">
+        <li>Uniform decoy selection &mdash; defeats recency analysis</li>
+        <li>Time-scoped view keys &mdash; export for a specific block range</li>
+        <li>Plausible deniability &mdash; dual-password encryption</li>
+        <li>Auto-churn &mdash; Poisson-distributed self-sends</li>
+        <li>Dead man's switch &mdash; time-locked recovery</li>
+        <li>Uniform 2-in/2-out shape &mdash; defeats heuristic analysis</li>
+        <li>FROST multi-sig &mdash; indistinguishable from single-sig</li>
+      </ul>
+      <svg class="layer-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 7H3v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7Z"/>
+        <path d="M3 7V5a2 2 0 0 1 2-2h11l3 4"/>
+        <circle cx="17" cy="13" r="1.4" fill="currentColor"/>
+      </svg>
+    </div>
+    <div class="layer-card">
+      <div class="layer-num">Layer 4 &mdash; Constitutional</div>
+      <h3>Enforced by consensus</h3>
+      <p>Hardcoded rules that no one can change.</p>
+      <ul class="layer-features">
+        <li>Mandatory privacy &mdash; no opt-out, no transparent mode</li>
+        <li>No surveillance &mdash; no blacklists, no freezing, no backdoors</li>
+        <li>No balance lookup &mdash; no RPC to query an address</li>
+        <li>4th Amendment &mdash; financial records constitutionally protected</li>
+      </ul>
+      <svg class="layer-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M6 4h11a3 3 0 0 1 3 3v13H8a2 2 0 0 1-2-2V4Z"/>
+        <path d="M6 4a3 3 0 0 0-3 3v0a3 3 0 0 0 3 3"/>
+        <line x1="9" y1="10" x2="16" y2="10"/>
+        <line x1="9" y1="14" x2="16" y2="14"/>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<!-- HOW A TRANSACTION WORKS -->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 03</div>
+    <h2 class="section-title">How a transaction <em>works</em>.</h2>
+    <p class="section-desc">Four cryptographic layers protect every transaction. Here's what happens when you send CYNC.</p>
+  </div>
+  <div class="tx-flow reveal">
+    <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto">
+      <!-- Connecting lines -->
+      <line x1="120" y1="140" x2="230" y2="140" stroke="#25241f" stroke-width="2" stroke-dasharray="4 3"/>
+      <line x1="330" y1="140" x2="440" y2="140" stroke="#25241f" stroke-width="2" stroke-dasharray="4 3"/>
+      <line x1="540" y1="140" x2="650" y2="140" stroke="#25241f" stroke-width="2" stroke-dasharray="4 3"/>
+      <!-- Arrow heads -->
+      <polygon points="228,135 238,140 228,145" fill="#25241f"/>
+      <polygon points="438,135 448,140 438,145" fill="#25241f"/>
+      <polygon points="648,135 658,140 648,145" fill="#25241f"/>
+
+      <!-- Sender -->
+      <circle cx="70" cy="140" r="40" fill="none" stroke="#d4a059" stroke-width="2"/>
+      <circle cx="58" cy="130" r="3" fill="#d4a059"/>
+      <circle cx="82" cy="130" r="3" fill="#d4a059"/>
+      <text x="70" y="200" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9" fill="#8a857d" letter-spacing=".5">SENDER</text>
+
+      <!-- Ring signature -->
+      <g transform="translate(280,140)">
+        <circle r="48" fill="none" stroke="#25241f" stroke-width="1.5"/>
+        <circle cx="0" cy="-38" r="6" fill="none" stroke="#5d5953" stroke-width="1.5"/>
+        <circle cx="33" cy="-18" r="6" fill="none" stroke="#5d5953" stroke-width="1.5"/>
+        <circle cx="33" cy="18" r="6" fill="none" stroke="#5d5953" stroke-width="1.5"/>
+        <circle cx="0" cy="38" r="6" fill="#d4a059" stroke="#d4a059" stroke-width="1.5"/>
+        <circle cx="-33" cy="18" r="6" fill="none" stroke="#5d5953" stroke-width="1.5"/>
+        <circle cx="-33" cy="-18" r="6" fill="none" stroke="#5d5953" stroke-width="1.5"/>
+      </g>
+      <text x="280" y="200" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9" fill="#d4a059" letter-spacing=".5">CLSAG RING-16</text>
+      <text x="280" y="215" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="8" fill="#5d5953">hide sender</text>
+
+      <!-- Pedersen commitment -->
+      <g transform="translate(490,140)">
+        <rect x="-44" y="-38" width="88" height="76" rx="4" fill="none" stroke="#25241f" stroke-width="1.5"/>
+        <text x="0" y="-10" text-anchor="middle" font-family="'Fraunces',Georgia,serif" font-style="italic" font-size="18" fill="#f5f0e8">C</text>
+        <text x="0" y="10" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="8" fill="#d4a059">rG + vH</text>
+        <text x="0" y="28" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="7" fill="#5d5953">BP+ PROOF</text>
+      </g>
+      <text x="490" y="200" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9" fill="#d4a059" letter-spacing=".5">PEDERSEN + BP+</text>
+      <text x="490" y="215" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="8" fill="#5d5953">hide amount</text>
+
+      <!-- Receiver -->
+      <g transform="translate(700,140)">
+        <rect x="-40" y="-36" width="80" height="72" rx="4" fill="none" stroke="#d4a059" stroke-width="1.5" stroke-dasharray="3 2"/>
+        <text x="0" y="-8" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="7" fill="#8a857d">ONE-TIME</text>
+        <text x="0" y="6" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="8" fill="#d4a059">STEALTH</text>
+        <text x="0" y="20" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="7" fill="#8a857d">ADDRESS</text>
+      </g>
+      <text x="700" y="200" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="9" fill="#d4a059" letter-spacing=".5">STEALTH ADDR</text>
+      <text x="700" y="215" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="8" fill="#5d5953">hide receiver</text>
+
+      <!-- Bottom summary -->
+      <line x1="100" y1="250" x2="700" y2="250" stroke="#25241f" stroke-width="1"/>
+      <text x="400" y="270" text-anchor="middle" font-family="'Fraunces',Georgia,serif" font-style="italic" font-size="12" fill="#8a857d">No observer can link sender, receiver, or amount.</text>
+    </svg>
+  </div>
+</section>
+
+<!-- ECONOMICS -->
+<section id="economics">
+  <div class="section-header">
+    <div class="section-num">&sect; 04</div>
+    <h2 class="section-title">Sound money.<br>Provable <em>scarcity</em>.</h2>
+    <p class="section-desc">An asymptotic emission curve with tail emission and fee burn creates a self-sustaining, naturally deflationary currency.</p>
+  </div>
+  <div class="ledger reveal">
+    <div class="ledger-row"><span class="ledger-label">Supply cap</span><span class="ledger-value">100,000,000 <span class="unit">CYNC</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Block time</span><span class="ledger-value">120 <span class="unit">SECONDS</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Algorithm</span><span class="ledger-value">RandomX <span class="unit">CPU-ONLY</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Initial reward</span><span class="ledger-value">~50 <span class="unit">CYNC/BLOCK</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Tail emission</span><span class="ledger-value">0.6 <span class="unit">CYNC/BLOCK FOREVER</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Fee burn</span><span class="ledger-value">30% <span class="unit">DESTROYED (50% CONGESTED)</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Developer tax</span><span class="ledger-value">0% <span class="unit">CONSTITUTIONAL LOCK</span></span></div>
+    <div class="ledger-row"><span class="ledger-label">Premine</span><span class="ledger-value">0 <span class="unit">EVERY CYNC WAS MINED</span></span></div>
+  </div>
+
+  <!-- Emission Curve -->
+  <div class="curve-wrap reveal" style="margin-top:40px">
+    <div style="font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.12em;text-transform:uppercase;margin-bottom:16px">Emission Curve &mdash; reward = max(0.6, (100M &minus; mined) / 2M)</div>
+    <svg viewBox="0 0 600 200" xmlns="http://www.w3.org/2000/svg">
+      <defs><linearGradient id="curve-grad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#d4a059" stop-opacity=".3"/><stop offset="100%" stop-color="#d4a059" stop-opacity="0"/></linearGradient></defs>
+      <!-- Grid -->
+      <line x1="50" y1="20" x2="50" y2="170" class="curve-axis"/><line x1="50" y1="170" x2="580" y2="170" class="curve-axis"/>
+      <line x1="50" y1="70" x2="580" y2="70" class="curve-grid"/><line x1="50" y1="120" x2="580" y2="120" class="curve-grid"/>
+      <!-- Y labels -->
+      <text x="45" y="25" text-anchor="end" class="curve-label">50</text>
+      <text x="45" y="75" text-anchor="end" class="curve-label">25</text>
+      <text x="45" y="125" text-anchor="end" class="curve-label">12.5</text>
+      <text x="45" y="173" text-anchor="end" class="curve-label">0.6</text>
+      <!-- X labels -->
+      <text x="50" y="188" text-anchor="middle" class="curve-label">0</text>
+      <text x="182" y="188" text-anchor="middle" class="curve-label">5y</text>
+      <text x="315" y="188" text-anchor="middle" class="curve-label">10y</text>
+      <text x="448" y="188" text-anchor="middle" class="curve-label">20y</text>
+      <text x="580" y="188" text-anchor="middle" class="curve-label">50y</text>
+      <!-- Curve fill -->
+      <path d="M50,20 Q150,22 182,70 Q250,110 315,140 Q400,155 448,162 L580,165 L580,170 L50,170 Z" class="curve-fill"/>
+      <!-- Curve line -->
+      <path d="M50,20 Q150,22 182,70 Q250,110 315,140 Q400,155 448,162 L520,164" class="curve-line"/>
+      <!-- Tail emission line -->
+      <line x1="520" y1="164" x2="580" y2="165" class="curve-tail"/>
+      <!-- Tail label -->
+      <text x="555" y="158" font-family="'JetBrains Mono',monospace" font-size="8" fill="#d4a059">TAIL 0.6</text>
+      <!-- Axis titles -->
+      <text x="5" y="100" transform="rotate(-90,5,100)" font-family="'JetBrains Mono',monospace" font-size="8" fill="#5d5953" letter-spacing=".5">CYNC / BLOCK</text>
+      <text x="315" y="200" text-anchor="middle" font-family="'JetBrains Mono',monospace" font-size="8" fill="#5d5953" letter-spacing=".5">YEARS SINCE GENESIS</text>
+    </svg>
+    <div style="font-size:12px;color:var(--t3);margin-top:12px;line-height:1.6">No halvings. No cliffs. Smooth asymptotic decay to 0.6 CYNC/block tail emission &mdash; sustaining miners forever while keeping supply capped at 100M.</div>
+  </div>
+
+  <!-- Fee Burn Visual -->
+  <div style="margin-top:40px">
+    <div style="font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.12em;text-transform:uppercase;margin-bottom:12px;text-align:center">Fee Distribution</div>
+    <div class="fee-visual reveal">
+      <div style="text-align:center">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--t4);margin-bottom:4px">NORMAL</div>
+        <div class="fee-bar" style="width:260px">
+          <div class="fee-burn" style="width:30%">30% BURN</div>
+          <div class="fee-miner">70% MINER</div>
+        </div>
+      </div>
+      <div style="text-align:center">
+        <div style="font-family:var(--mono);font-size:10px;color:var(--t4);margin-bottom:4px">CONGESTED</div>
+        <div class="fee-bar" style="width:260px">
+          <div class="fee-burn" style="width:50%">50% BURN</div>
+          <div class="fee-miner">50% MINER</div>
+        </div>
+      </div>
+    </div>
+    <div style="text-align:center;font-size:12px;color:var(--t4);margin-top:10px">Burned CYNC is permanently destroyed &mdash; reducing effective supply over time.</div>
+  </div>
+</section>
+
+
+<!-- CONSTITUTION QUOTES -->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 05</div>
+    <h2 class="section-title">Written in <em>stone</em>.</h2>
+    <p class="section-desc">The CoinCync Constitution is permanent. It cannot be amended, repealed, or superseded. These are not promises &mdash; they are protocol rules.</p>
+  </div>
+  <div class="mark-rolodex reveal" aria-hidden="true">
+    <div class="mark-card" id="mark-rolodex">
+      <div class="mark-card-face is-front"><img src="/assets/logo-gold-dark.svg" alt=""></div>
+      <div class="mark-card-face is-back"><img src="/assets/logo-cream-dark.svg" alt=""></div>
+    </div>
+  </div>
+  <div class="const-grid reveal-stagger">
+    <div class="const-card">
+      <div class="const-art">Article I &mdash; Fixed Supply</div>
+      <div class="const-quote">"The total supply of CYNC shall never exceed 100,000,000 coins. The network itself will reject any block that violates this formula."</div>
+    </div>
+    <div class="const-card">
+      <div class="const-art">Article III &mdash; Mandatory Privacy</div>
+      <div class="const-quote">"All transactions on CoinCync are private. There is no transparent mode. There is no opt-in privacy tier. Privacy is mandatory."</div>
+    </div>
+    <div class="const-card">
+      <div class="const-art">Article IX &mdash; No Surveillance</div>
+      <div class="const-quote">"The CoinCync protocol shall never include any feature whose primary purpose is to enable financial surveillance. Blacklists, chain analysis hooks, mandatory memos are permanently prohibited."</div>
+    </div>
+    <div class="const-card">
+      <div class="const-art">Article X &mdash; Immutability</div>
+      <div class="const-quote">"This Constitution is permanent. It cannot be amended. It cannot be repealed. It cannot be superseded by any governance process."</div>
+    </div>
+  </div>
+</section>
+
+<!-- QUICK START -->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 06</div>
+    <h2 class="section-title">Three commands to <em>mine</em>.</h2>
+    <p class="section-desc">Build from source and mine your first block. Any CPU. No GPU required. No pool required.</p>
+  </div>
+  <div class="terminal reveal">
+    <div class="terminal-bar">
+      <div class="terminal-dot" style="background:#c45c4f"></div>
+      <div class="terminal-dot" style="background:#e8b86d"></div>
+      <div class="terminal-dot" style="background:#7eb87c"></div>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--t4);margin-left:8px">coincync &mdash; bash</span>
+    </div>
+    <div class="terminal-body">
+      <span class="comment"># Clone and build (Rust 1.75+, ~3 min)</span><br>
+      <span class="prompt">$</span> git clone https://git.coincync.network/coincync/cync-protocol.git<br>
+      <span class="prompt">$</span> cd Cync-Protocol<br>
+      <span class="prompt">$</span> cargo build --release --features "randomx testnet"<br>
+      <span class="output">&nbsp;&nbsp;Compiling coincync v1.0.8 &mdash; 700+ tests pass</span><br><br>
+      <span class="comment"># Start a node</span><br>
+      <span class="prompt">$</span> ./target/release/coincync-node --network testnet<br>
+      <span class="output">&nbsp;&nbsp;Syncing... block 43891 of 43891 (100%)</span><br><br>
+      <span class="comment"># Mine on personal hardware (cloud VPS providers prohibit it)</span><br>
+      <span class="prompt">$</span> ./target/release/coincync-tui-miner --testnet --address tCYNC3... --threads 4<br>
+      <span class="output">&nbsp;&nbsp;Mining at 142 H/s &mdash; RandomX &mdash; 4 threads</span>
+    </div>
+  </div>
+  <div class="faucet-banner reveal">
+    <p>Don't want to mine to test the wallet? Get <strong style="color:var(--t)">10 free tCYNC</strong> from the testnet faucet &mdash; one drip per address per hour.</p>
+    <a href="/faucet">Open Faucet &rarr;</a>
+  </div>
+</section>
+
+<!-- DOWNLOAD / GET STARTED -->
+<section id="download">
+  <div class="section-header">
+    <div class="section-num">&sect; 07</div>
+    <h2 class="section-title">Get <em>started</em>.</h2>
+    <p class="section-desc">Two paths in. Pick the one that matches what you're trying to do.</p>
+  </div>
+
+  <!-- TWO-PATH SPLIT -->
+  <div class="reveal" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:24px;margin-bottom:36px">
+
+    <!-- USER PATH -->
+    <div style="border:1px solid var(--ac-dim);padding:28px 28px 24px;background:linear-gradient(180deg,rgba(212,160,89,.04),transparent)">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px">For users</div>
+      <div style="font-family:var(--display);font-size:24px;font-weight:400;color:var(--t);margin-bottom:6px">Send and receive CYNC</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:18px;line-height:1.6">Install the wallet, fund it, send your first private transaction. About 5 minutes.</div>
+      <ol style="padding-left:18px;margin:0;font-size:13px;color:var(--t2);line-height:2">
+        <li><a href="https://github.com/ghostrider1092/Coincync-Testnet-/releases/download/v1.0.8-testnet/CoinCync-Wallet-Setup.exe" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Download the wallet</a> &mdash; Windows installer, auto-syncs to testnet</li>
+        <li><a href="https://docs.coincync.network/getting-started/create-a-wallet" target="_blank" rel="noopener" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Create a wallet</a> &mdash; 24-word seed, encrypted on disk</li>
+        <li><a href="/faucet" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Claim 10 tCYNC from the faucet</a> &mdash; or mine your own with the wallet's built-in miner</li>
+        <li>Send your first private transaction &mdash; ring-signed by default, no opt-in needed</li>
+      </ol>
+    </div>
+
+    <!-- DEVELOPER PATH -->
+    <div style="border:1px solid var(--b);padding:28px 28px 24px;background:var(--s1)">
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ac);letter-spacing:.12em;text-transform:uppercase;margin-bottom:6px">For developers &amp; operators</div>
+      <div style="font-family:var(--display);font-size:24px;font-weight:400;color:var(--t);margin-bottom:6px">Build, run, integrate</div>
+      <div style="font-size:12px;color:var(--t3);margin-bottom:18px;line-height:1.6">Compile from source, run a full node, talk to it over JSON-RPC. About 30 minutes.</div>
+      <ol style="padding-left:18px;margin:0;font-size:13px;color:var(--t2);line-height:2">
+        <li><a href="https://docs.coincync.network/getting-started/build" target="_blank" rel="noopener" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Build from source</a> &mdash; Rust toolchain, <code style="font-family:var(--mono);font-size:11px">cargo build --release</code></li>
+        <li><a href="https://docs.coincync.network/getting-started/run-a-node" target="_blank" rel="noopener" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Run a node</a> &mdash; 2GB RAM, 20GB disk, syncs in &lt;1h on testnet</li>
+        <li><a href="https://docs.coincync.network/api/json-rpc" target="_blank" rel="noopener" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Talk to it via JSON-RPC</a> &mdash; 16 methods, curl-friendly examples</li>
+        <li><a href="https://git.coincync.network/coincync/cync-protocol/blob/main/docs/cip/" target="_blank" rel="noopener" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)">Submit a CIP</a> &mdash; propose changes, no permission required</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- LINK CARDS (DETAIL) -->
+  <div class="link-grid reveal-stagger">
+    <a href="https://github.com/ghostrider1092/Coincync-Testnet-/releases/download/v1.0.8-testnet/CoinCync-Wallet-Setup.exe" class="link-card">
+      <div class="link-title">Desktop Wallet</div>
+      <div class="link-desc">Windows installer. Auto-spawns a local node, generates an RPC key, and connects to testnet on first launch.</div>
+      <span class="link-arrow">&darr; Download Setup.exe</span>
+    </a>
+    <a href="https://docs.coincync.network/getting-started/mining-on-your-pc" class="link-card">
+      <div class="link-title">Start Mining</div>
+      <div class="link-desc">RandomX CPU-only. Any computer can mine. 50 CYNC per block at genesis.</div>
+      <span class="link-arrow">&rarr; Mining Guide</span>
+    </a>
+    <a href="https://docs.coincync.network/getting-started/run-a-node" class="link-card">
+      <div class="link-title">Run a Node</div>
+      <div class="link-desc">Strengthen the network. 2GB RAM, 20GB disk. Ubuntu, macOS, or Windows.</div>
+      <span class="link-arrow">&rarr; Node Guide</span>
+    </a>
+    <a href="https://docs.coincync.network/api/json-rpc" class="link-card">
+      <div class="link-title">Build on CoinCync</div>
+      <div class="link-desc">JSON-RPC API. 16 methods. Full documentation with curl examples.</div>
+      <span class="link-arrow">&rarr; API Reference</span>
+    </a>
+  </div>
+</section>
+
+<!-- ROADMAP -->
+<section id="roadmap">
+  <div class="section-header">
+    <div class="section-num">&sect; 08</div>
+    <h2 class="section-title">What's <em>next</em>.</h2>
+    <p class="section-desc">A transparent roadmap for CoinCync development.</p>
+  </div>
+  <div class="roadmap reveal-stagger">
+    <div class="roadmap-item completed">
+      <div class="roadmap-phase">Phase 1 &mdash; Foundation</div>
+      <div class="roadmap-title">Core Protocol &amp; Internal Testnet</div>
+      <div class="roadmap-desc">RandomX CPU mining, CLSAG-16 ring signatures (ring size 11&rarr;16 bootstrap ramp at block 10,000), Bulletproofs+ range proofs, stealth addresses, Dandelion++ propagation, desktop wallet, block explorer, 5-node fleet across 3 continents.</div>
+      <div class="roadmap-tag done">Complete</div>
+    </div>
+    <div class="roadmap-item completed">
+      <div class="roadmap-phase">Phase 2 &mdash; Privacy Innovations</div>
+      <div class="roadmap-title">7 Advanced Privacy Features</div>
+      <div class="roadmap-desc">Decoy defense, encrypted memos, scoped view keys, deniable wallets, traffic shaping, dead man's switch, auto-churn. FROST multi-sig indistinguishable from single-sig.</div>
+      <div class="roadmap-tag done">Complete</div>
+    </div>
+    <div class="roadmap-item completed">
+      <div class="roadmap-phase">Phase 3 &mdash; Constitutional Foundation</div>
+      <div class="roadmap-title">19 Articles &amp; 15 Rights, Compile-Time Locked</div>
+      <div class="roadmap-desc">Constitution + Bill of Rights with critical-files lockfile (SHA-256-protected) and 8 compile-time tripwire constants. Articles forbid the Terra-class failure modes (no algorithmic capture, no admin keys, no external trust, no surveillance layer, no fee redirects). CIP process documented; 9 CIPs published &mdash; CIP-001 (atomic swap), CIP-002 (cynchub), CIP-007 (hard-fork activation policy), CIP-008 (FROST coordinator), CIP-009 + CIP-009.D (reorg defense + miner-signed rolling checkpoints), CIP-010 (testnet hard-fork rehearsal), CIP-011 (rolling-finality activation), CIP-012 (FROST coordinator deployment).</div>
+      <div class="roadmap-tag done">Complete</div>
+    </div>
+    <div class="roadmap-item current">
+      <div class="roadmap-phase">Phase 4 &mdash; Public Testnet</div>
+      <div class="roadmap-title">Open Network &amp; Hardening</div>
+      <div class="roadmap-desc">Public testnet launching week of 2026-05-09. Anyone can run a node, mine, transact, build wallets. 72-hour pre-launch soak, peer-quality scoring, smoke-test transaction flow. Third-party audit kickoff. Real-world reliability data feeds the mainnet decision. Three new infrastructure crates shipped this phase: <code>coincync-frost-coordinator</code> (M-of-N signing relay, including <code>coord</code> WSS server with rate-limit + idle-timeout + Prometheus metrics, plus <code>coord-cli</code> operator binary), <code>coincync-rolling-finality</code> (pure-state library + real ed25519 verifier + borsh wire codec for CIP-009.D), and <code>coincync-swap</code> (atomic-swap protocol + handshake state machines + state persistence + <code>cyncswap</code> CLI). 165+ new tests covering composition + adversarial cases.</div>
+      <div class="roadmap-tag active">In Progress</div>
+    </div>
+    <div class="roadmap-item">
+      <div class="roadmap-phase">Phase 5 &mdash; Mainnet Prep (v1.0)</div>
+      <div class="roadmap-title">Base-Chain Audit &amp; Signed Releases</div>
+      <div class="roadmap-desc">Base-chain audit on consensus, P2P, wallet, mining, and reorg defense. Multi-maintainer signed-release infrastructure (M-of-N via FROST coordinator). Reproducible Docker builds verified byte-identical. Genesis ceremony preparation: mainnet seed nodes, initial checkpoint set, monitoring live ≥ 7 days pre-genesis. <strong>Atomic swaps (cyncswap) and the Orchard shielded pool are deliberately not in v1.0 scope</strong> &mdash; each is the largest novel-cryptography surface in the codebase and ships in its own release after its own audit. Same staging Monero used: chain first, novel crypto later.</div>
+      <div class="roadmap-tag">Planned</div>
+    </div>
+    <div class="roadmap-item">
+      <div class="roadmap-phase">Phase 6 &mdash; Mainnet Genesis (v1.0)</div>
+      <div class="roadmap-title">October 1, 2026 &mdash; Base Chain</div>
+      <div class="roadmap-desc">v1.0 mainnet launch. Privacy money chain: mine, send, receive, multi-sig, with the full 7-feature privacy stack and CIP-009 reorg defense active. Desktop wallet ships base-chain features only; the Trade tab unhides in v1.1 once cyncswap clears its own audit. Hardware wallet support and mobile wallet beta land in v1.0.x point releases.</div>
+      <div class="roadmap-tag">Planned</div>
+    </div>
+    <div class="roadmap-item">
+      <div class="roadmap-phase">Phase 7 &mdash; cyncswap (v1.1)</div>
+      <div class="roadmap-title">CIP-001: CYNC&harr;BTC Atomic Swaps</div>
+      <div class="roadmap-desc">Trustless CYNC&harr;BTC atomic swaps with the 6-layer user-safety stack. Substantially complete today &mdash; 346 tests pass with strict-DLEQ, mutation score 100% on audit-critical files, ~97% line coverage on the audit perimeter, libFuzzer + AddressSanitizer overnight runs clean across 27 targets. Ships <strong>after v1.0 mainnet is live</strong> and cyncswap has cleared its own dedicated audit (kickoff target ~30 days post-mainnet; estimated Q1&ndash;Q2 2027). Once it ships, every Bitcoin holder is one transaction away from holding CYNC trustlessly &mdash; no centralized exchange, no federation, no custodial bridge.</div>
+      <div class="roadmap-tag">Planned</div>
+    </div>
+    <div class="roadmap-item">
+      <div class="roadmap-phase">Phase 8 &mdash; cynchub Liquidity Layer</div>
+      <div class="roadmap-title">CIP-002: PoW-Secured Cross-Chain Trading</div>
+      <div class="roadmap-desc">12&ndash;24 months post-mainnet. Auxiliary PoW chain merge-mined with CoinCync, hosting an on-chain order book for trustless CYNC&harr;BTC&harr;stablecoin trading. Miners coordinate; HTLCs settle. The PoW alternative to PoS bridges &mdash; no multisig, no federation, no admin authority. Conditional on cyncswap stability and the v1.3 entry criteria in the public roadmap.</div>
+      <div class="roadmap-tag">Future</div>
+    </div>
+  </div>
+  <div style="text-align:center;margin-top:32px;font-size:12px;color:var(--t3);font-family:var(--mono);letter-spacing:.06em">
+    Public CIP register &middot; <a href="https://explorer.coincync.network/?p=proposals" style="color:var(--ac2);text-decoration:none">view all proposals &rarr;</a>
+  </div>
+</section>
+
+<!-- MAINNET COUNTDOWN -->
+<div class="manifesto reveal" style="background:var(--bg)">
+  <div style="font-family:var(--mono);font-size:11px;color:var(--ac);letter-spacing:.2em;text-transform:uppercase;margin-bottom:8px">Mainnet Genesis</div>
+  <div style="font-family:var(--display);font-size:clamp(24px,3vw,36px);font-weight:300;color:var(--t);margin-bottom:4px">October 1, 2026</div>
+  <div style="font-size:13px;color:var(--t3);margin-bottom:0">00:00:00 UTC &mdash; the first block that can never be changed</div>
+  <div class="countdown" id="countdown">
+    <div class="cd-unit"><div class="cd-val" id="cd-days">&mdash;</div><div class="cd-label">Days</div></div>
+    <div class="cd-unit"><div class="cd-val" id="cd-hours">&mdash;</div><div class="cd-label">Hours</div></div>
+    <div class="cd-unit"><div class="cd-val" id="cd-mins">&mdash;</div><div class="cd-label">Minutes</div></div>
+    <div class="cd-unit"><div class="cd-val" id="cd-secs">&mdash;</div><div class="cd-label">Seconds</div></div>
+  </div>
+</div>
+
+<!-- SECURITY -->
+<!--
+  FUNDING-GATED: bug-bounty payout cards are removed until the project
+  has funding to back the offers. Original 4-card grid (Critical / High
+  / Medium / Low with USD ranges) lives in git history; restore that
+  block when funding lands. For now, responsible-disclosure contact only,
+  no payout claims.
+-->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 09</div>
+    <h2 class="section-title">Responsible <em>disclosure</em>.</h2>
+    <p class="section-desc">Found a bug that could affect users? Reach out before posting publicly.</p>
+  </div>
+  <div class="reveal" style="max-width:760px;margin:0 auto;padding:32px 28px;background:var(--s1);border:1px solid var(--b)">
+    <p style="font-size:14px;color:var(--t2);line-height:1.7;margin:0 0 18px">
+      CoinCync is a solo-developer, MIT-licensed project at testnet stage. We don't currently have funding to back a paid bug-bounty program, and we'd rather say so plainly than promise payouts we can't honor. A funded program will launch alongside the third-party audit before mainnet.
+    </p>
+    <p style="font-size:14px;color:var(--t2);line-height:1.7;margin:0 0 18px">
+      In the meantime, please report security issues responsibly. Public credit on disclosure (with your consent), and a coordinated fix-and-publish timeline that protects users.
+    </p>
+    <p style="font-size:13px;color:var(--t3);line-height:1.7;margin:0;font-family:var(--mono)">
+      Email:&nbsp; <a href="/cdn-cgi/l/email-protection#d9aabcbaacabb0ada099bab6b0b7baa0b7baf7b6abbe" style="color:var(--ac);text-decoration:none;border-bottom:1px solid var(--ac-dim)"><span class="__cf_email__" data-cfemail="5526303620273c212c15363a3c3b362c3b367b3a2732">[email&#160;protected]</span></a><br>
+      PGP:&nbsp;&nbsp;&nbsp; <span style="color:var(--t4)">2CAA 920F 8B96 1772</span><br>
+      Scope:&nbsp; consensus, privacy, wallet integrity, key handling, network<br>
+      CI:&nbsp;&nbsp;&nbsp;&nbsp; 520+ tests, fmt + clippy + audit on every PR
+    </p>
+  </div>
+</section>
+
+<!-- FAQ -->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 10</div>
+    <h2 class="section-title">Frequently <em>asked</em>.</h2>
+  </div>
+  <div class="faq-list reveal">
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Is CoinCync a Monero fork?</div>
+      <div class="faq-a"><div class="faq-a-inner">No. CoinCync is written from scratch in Rust. It uses similar cryptographic primitives (CLSAG ring signatures, Pedersen commitments, Bulletproofs+, stealth addresses) because those are the strongest known tools for transaction privacy. But the codebase, consensus rules, emission curve, fee model, and Constitution are entirely original.</div></div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I mine on a laptop?</div>
+      <div class="faq-a"><div class="faq-a-inner">Yes. CoinCync uses RandomX, a CPU-only proof-of-work algorithm. GPUs and ASICs offer no advantage. Any modern CPU with 2GB of free RAM per thread can mine. At genesis, a laptop with 4 cores earns roughly 50 CYNC per block found.</div></div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">How is supply auditable if amounts are hidden?</div>
+      <div class="faq-a"><div class="faq-a-inner">Pedersen commitments are additively homomorphic. This means you can verify that inputs equal outputs without knowing the actual amounts. Every node independently checks that no coins are created from nothing &mdash; the math balances without revealing any values. Combined with Bulletproofs+ range proofs (which prove amounts are non-negative), this guarantees no hidden inflation.</div></div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Why no GPU or ASIC mining?</div>
+      <div class="faq-a"><div class="faq-a-inner">RandomX is designed so that the most efficient hardware to execute it is a general-purpose CPU. An ASIC for RandomX would essentially be a CPU, offering no economic advantage. This keeps mining accessible to anyone with a computer and prevents the centralization that GPU farms and ASICs create in other networks.</div></div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">What happens if I lose my keys?</div>
+      <div class="faq-a"><div class="faq-a-inner">Your funds are controlled by your 24-word seed phrase, encrypted with Argon2id + XChaCha20-Poly1305. If you lose both your seed phrase and your wallet file, the funds are permanently inaccessible. CoinCync includes a dead man's switch feature &mdash; time-locked recovery that can send funds to a backup address after a configurable period of inactivity.</div></div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Can I disclose transactions for tax or audit purposes?</div>
+      <div class="faq-a"><div class="faq-a-inner">Yes. Time-scoped view keys let you selectively reveal transactions within a specific block range to an auditor, exchange, or tax authority &mdash; without exposing your full history or breaking anyone else's privacy. You choose what to reveal and to whom.</div></div>
+    </div>
+    <div class="faq-item">
+      <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">When does mainnet launch?</div>
+      <div class="faq-a"><div class="faq-a-inner">October 1, 2026 at 00:00:00 UTC. The genesis message reads: "CoinCync Mainnet Genesis - Privacy You Can Audit - October 2026". Until then, the testnet is live with mining active. All testnet coins will be wiped at mainnet launch. <strong>v1.0 mainnet ships the base chain only</strong> &mdash; mine, send, receive, multi-sig, with the full 7-feature privacy stack. CYNC&harr;BTC atomic swaps (cyncswap) ship in v1.1 after their own dedicated audit, ~Q1&ndash;Q2 2027. Same staging Monero used: chain first, novel crypto later, each behind its own audit.</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- BUILT ON — open-source primitives the chain depends on -->
+<section>
+  <div class="section-header">
+    <div class="section-num">&sect; 11</div>
+    <h2 class="section-title">Built on <em>well-known</em> primitives.</h2>
+    <p class="section-desc">No homemade crypto. Every primitive in CoinCync is published, peer-reviewed, and well-documented. We stand on these shoulders.</p>
+  </div>
+  <div class="builtin-grid reveal">
+    <div class="builtin-row cols-2">
+      <a href="https://github.com/tevador/RandomX" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">RandomX</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">RandomX</span>
+          <span class="builtin-overlay-desc">CPU-only proof-of-work &mdash; ASIC-resistant by construction</span>
+        </div>
+      </a>
+      <a href="https://github.com/BLAKE3-team/BLAKE3" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">BLAKE3</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">BLAKE3</span>
+          <span class="builtin-overlay-desc">Cryptographic hash &mdash; parallelizable, faster than SHA-3</span>
+        </div>
+      </a>
+    </div>
+    <div class="builtin-row cols-4">
+      <a href="https://eprint.iacr.org/2019/654" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">CLSAG</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">CLSAG</span>
+          <span class="builtin-overlay-desc">Compact ring signatures &mdash; hides the real signer among 16 decoys</span>
+        </div>
+      </a>
+      <a href="https://eprint.iacr.org/2020/735" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">Bulletproofs+</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">Bulletproofs+</span>
+          <span class="builtin-overlay-desc">Range proofs &mdash; proves amounts non-negative without revealing them</span>
+        </div>
+      </a>
+      <a href="https://en.wikipedia.org/wiki/Commitment_scheme#A_perfectly_binding_scheme_based_on_the_discrete_log_problem" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">Pedersen</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">Pedersen</span>
+          <span class="builtin-overlay-desc">Hiding + binding commitments &mdash; additively homomorphic, supply auditable</span>
+        </div>
+      </a>
+      <a href="https://ristretto.group/" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">Ristretto255</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">Ristretto255</span>
+          <span class="builtin-overlay-desc">Prime-order group on Ed25519 &mdash; no cofactor footguns</span>
+        </div>
+      </a>
+    </div>
+    <div class="builtin-row cols-3">
+      <a href="https://noiseprotocol.org/noise.html" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">Noise_XX</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">Noise_XX</span>
+          <span class="builtin-overlay-desc">P2P handshake &mdash; mutual auth + forward secrecy, Signal-grade</span>
+        </div>
+      </a>
+      <a href="https://www.rfc-editor.org/rfc/rfc8439" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">ChaCha20-Poly1305</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">ChaCha20-Poly1305</span>
+          <span class="builtin-overlay-desc">AEAD cipher &mdash; RFC 8439, used for memos + P2P payload encryption</span>
+        </div>
+      </a>
+      <a href="https://borsh.io/" target="_blank" rel="noopener noreferrer" class="builtin-cell">
+        <span class="builtin-name">Borsh</span>
+        <div class="builtin-overlay" aria-hidden="true">
+          <span class="builtin-overlay-name">Borsh</span>
+          <span class="builtin-overlay-desc">Deterministic binary serialization &mdash; one canonical encoding for every block</span>
+        </div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<div class="cta-section reveal">
+  <h2>Don't trust.<br><em>Verify</em>.</h2>
+  <p>Every CYNC in existence traces to the emission curve. The math can be checked by anyone, at any block, on their own node.</p>
+  <div class="cta-buttons">
+    <a href="https://docs.coincync.network/introduction" class="btn-primary">Read the Whitepaper</a>
+    <a href="https://explorer.coincync.network" class="btn-ghost" target="_blank">Supply Audit</a>
+  </div>
+</div>
+
+</main>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-grid">
+    <div class="footer-col">
+      <h4>Product</h4>
+      <a href="https://github.com/ghostrider1092/Coincync-Testnet-/releases/download/v1.0.8-testnet/CoinCync-Wallet-Setup.exe">Desktop Wallet</a>
+      <a href="https://explorer.coincync.network" target="_blank">Block Explorer</a>
+      <a href="https://docs.coincync.network/getting-started/mining-on-your-pc">Mining Guide</a>
+      <a href="https://docs.coincync.network/getting-started/run-a-node">Run a Node</a>
+    </div>
+    <div class="footer-col">
+      <h4>Resources</h4>
+      <a href="https://docs.coincync.network/introduction">Whitepaper</a>
+      <a href="https://docs.coincync.network/protocol/privacy-model">Privacy Architecture</a>
+      <a href="https://docs.coincync.network/protocol/emission">Tokenomics</a>
+      <a href="https://docs.coincync.network/api/json-rpc">API Reference</a>
+    </div>
+    <div class="footer-col">
+      <h4>Community</h4>
+      <a href="https://git.coincync.network/coincync/cync-protocol" target="_blank">GitHub</a>
+      <a href="https://discord.gg/5tYNSCsqzy" target="_blank">Discord</a>
+      <a href="https://x.com/coincync" target="_blank">X / Twitter</a>
+    </div>
+    <div class="footer-col">
+      <h4>About</h4>
+      <a href="/brand">Brand Assets</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="https://docs.coincync.network/getting-started/create-a-wallet">Wallet Guide</a>
+      <a href="/status">Network Status</a>
+    </div>
+  </div>
+  <div class="footer-bottom">
+    <div class="footer-logo"><svg viewBox="0 0 200 200" width="24" height="24" aria-label="CoinCync logo" role="img" style="vertical-align:middle;margin-right:8px"><circle cx="100" cy="100" r="78" fill="none" stroke="#d4a059" stroke-width="14"/><path d="M 168 100 A 68 68 0 1 0 100 168" fill="none" stroke="#0a0a09" stroke-width="22"/><line x1="162" y1="100" x2="178" y2="100" stroke="#0a0a09" stroke-width="22"/><circle cx="68" cy="100" r="8" fill="#d4a059"/><circle cx="132" cy="100" r="8" fill="#d4a059"/></svg>Coin<em>Cync</em></div>
+    <div style="font-family:var(--display);font-style:italic;font-size:13px;color:var(--t4)">Privacy money that requires no permission.</div>
+    <div class="footer-credit">
+      <div class="lab">Developed by</div>
+      <div class="lab-name">Cync Lab</div>
+      <div class="lab-desc">Applied cryptography for financial privacy</div>
+    </div>
+  </div>
+</footer>
+
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+// --- HAMBURGER NAV ---
+(function(){
+  var toggle=document.querySelector('.nav-toggle');
+  var links=document.querySelector('.nav-links');
+  if(!toggle||!links) return;
+  toggle.addEventListener('click',function(){
+    var open=links.classList.toggle('open');
+    toggle.classList.toggle('active');
+    toggle.setAttribute('aria-expanded',open);
+  });
+  links.querySelectorAll('a').forEach(function(a){
+    a.addEventListener('click',function(){
+      links.classList.remove('open');
+      toggle.classList.remove('active');
+      toggle.setAttribute('aria-expanded','false');
+    });
+  });
+})();
+
+// --- SCROLL REVEAL ---
+(function(){
+  var els=document.querySelectorAll('.reveal,.reveal-stagger');
+  if(!els.length) return;
+  var observer=new IntersectionObserver(function(entries){
+    entries.forEach(function(entry){
+      if(entry.isIntersecting){
+        entry.target.classList.add('visible');
+        observer.unobserve(entry.target);
+      }
+    });
+  },{threshold:0.15});
+  els.forEach(function(el){observer.observe(el);});
+})();
+
+// --- HERO STAT COUNTER ANIMATION ---
+(function(){
+  var stats=document.querySelectorAll('.hero-stat .val');
+  if(!stats.length) return;
+  var animated=false;
+  var observer=new IntersectionObserver(function(entries){
+    if(animated) return;
+    entries.forEach(function(entry){
+      if(!entry.isIntersecting) return;
+      animated=true;
+      observer.disconnect();
+      stats.forEach(function(stat){
+        var text=stat.textContent.trim();
+        var suffix=text.replace(/^[\d.]+/,'');
+        var num=parseFloat(text);
+        if(isNaN(num)||num===0) return;
+        var duration=1200;
+        var startTime=null;
+        function step(ts){
+          if(!startTime) startTime=ts;
+          var progress=Math.min((ts-startTime)/duration,1);
+          var eased=1-Math.pow(1-progress,3);
+          var current=eased*num;
+          stat.textContent=Math.round(current)+suffix;
+          if(progress<1) requestAnimationFrame(step);
+        }
+        stat.textContent='0'+suffix;
+        requestAnimationFrame(step);
+      });
+    });
+  },{threshold:0.5});
+  var heroStats=document.querySelector('.hero-stats');
+  if(heroStats) observer.observe(heroStats);
+})();
+
+// --- MAINNET COUNTDOWN ---
+(function(){
+  var genesis=new Date('2026-10-01T00:00:00Z').getTime();
+  function tick(){
+    var now=Date.now();
+    var diff=genesis-now;
+    if(diff<=0){
+      document.getElementById('cd-days').textContent='0';
+      document.getElementById('cd-hours').textContent='0';
+      document.getElementById('cd-mins').textContent='0';
+      document.getElementById('cd-secs').textContent='0';
+      return;
+    }
+    var d=Math.floor(diff/86400000);
+    var h=Math.floor((diff%86400000)/3600000);
+    var m=Math.floor((diff%3600000)/60000);
+    var s=Math.floor((diff%60000)/1000);
+    document.getElementById('cd-days').textContent=d;
+    document.getElementById('cd-hours').textContent=h;
+    document.getElementById('cd-mins').textContent=m;
+    document.getElementById('cd-secs').textContent=s;
+  }
+  tick();
+  setInterval(tick,1000);
+})();
+
+// --- MARK ROLODEX (cycles 4 brand-mark variants in §06) ---
+// Two faces, four marks: every ~3 s we flip the card and swap whichever
+// face is now hidden to the next variant in sequence. So the user
+// always sees a fresh face after the flip animation completes.
+(function(){
+  var card=document.getElementById('mark-rolodex');
+  if(!card) return;
+  var marks=[
+    '/assets/logo-gold-dark.svg',
+    '/assets/logo-cream-dark.svg',
+    '/assets/logo-ink-brass.svg',
+    '/assets/logo-ink-cream.svg'
+  ];
+  var idx=1;
+  var front=card.querySelector('.is-front img');
+  var back=card.querySelector('.is-back img');
+  setInterval(function(){
+    var flipping=card.classList.toggle('flipping');
+    // Mid-flip (after the 0.9s animation midpoint): swap the now-hidden
+    // face's src to the *next-next* mark, so by the time it rotates
+    // back into view it has the right image.
+    setTimeout(function(){
+      idx=(idx+1)%marks.length;
+      if(flipping){
+        // Front is now hidden; queue its next image.
+        front.src=marks[idx];
+      } else {
+        back.src=marks[idx];
+      }
+    },900);
+  },3000);
+})();
+
+// --- HERO LAUNCH COUNTDOWN (testnet 2026-05-09) ---
+// Animates each digit cell when its value changes: the old value
+// slides up + fades out, the new value slides in from below + fades in
+// (350 ms each side, so a full swap is 700 ms total — fast enough that
+// the seconds digit finishes its swap well before the next tick fires).
+(function(){
+  var wrap=document.getElementById('lc-wrap');
+  if(!wrap) return;
+  var target=Date.parse(wrap.getAttribute('data-target')||'');
+  if(!target||isNaN(target)){wrap.classList.add('is-hidden');return;}
+  var DAY=86400000,HOUR=3600000,MIN=60000;
+  var els={d:document.getElementById('lc-d'),h:document.getElementById('lc-h'),m:document.getElementById('lc-m'),s:document.getElementById('lc-s')};
+  var last={d:null,h:null,m:null,s:null};
+  function setCell(el,val){
+    if(!el) return;
+    var str=String(val).padStart(2,'0');
+    if(el.textContent===str) return;
+    el.classList.remove('lc-in');
+    el.classList.add('lc-out');
+    setTimeout(function(){
+      el.textContent=str;
+      el.classList.remove('lc-out');
+      el.classList.add('lc-in');
+      setTimeout(function(){el.classList.remove('lc-in');},350);
+    },350);
+  }
+  function tick(){
+    var now=Date.now();
+    var diff=target-now;
+    if(diff<=0){
+      wrap.classList.add('is-launched');
+      return;
+    }
+    var d=Math.floor(diff/DAY);
+    var h=Math.floor((diff%DAY)/HOUR);
+    var m=Math.floor((diff%HOUR)/MIN);
+    var s=Math.floor((diff%MIN)/1000);
+    // Sanity bound: if the computed days is wildly out (>365) the data
+    // attribute is probably wrong — hide rather than confuse visitors.
+    if(d>365){wrap.classList.add('is-hidden');return;}
+    if(last.d===null){
+      // First tick — set instantly, no animation.
+      els.d.textContent=String(d).padStart(2,'0');
+      els.h.textContent=String(h).padStart(2,'0');
+      els.m.textContent=String(m).padStart(2,'0');
+      els.s.textContent=String(s).padStart(2,'0');
+      last={d:d,h:h,m:m,s:s};
+      return;
+    }
+    if(d!==last.d){setCell(els.d,d);last.d=d;}
+    if(h!==last.h){setCell(els.h,h);last.h=h;}
+    if(m!==last.m){setCell(els.m,m);last.m=m;}
+    if(s!==last.s){setCell(els.s,s);last.s=s;}
+  }
+  tick();
+  setInterval(tick,1000);
+})();
+
+// --- LIVE CHAIN STATS ---
+(function(){
+  fetch('https://explorer.coincync.network/api/testnet',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:'{"jsonrpc":"2.0","id":1,"method":"get_info"}'
+  }).then(function(r){return r.json()}).then(function(d){
+    if(d&&d.result){
+      var r=d.result;
+      var h=document.getElementById('live-height');
+      if(h&&r.height) h.textContent=Number(r.height).toLocaleString();
+      var n=document.getElementById('live-nodes');
+      if(n&&r.outgoing_connections_count!=null&&r.incoming_connections_count!=null){
+        n.textContent=r.outgoing_connections_count+r.incoming_connections_count;
+      }
+    }
+  }).catch(function(){});
+})();
+
+// ─── THEME + WALLPAPER PICKER ───────────────────────────────────────
+// Same constants and behaviour as the explorer, so user preference
+// carries between coincync.network and explorer.coincync.network on
+// the same origin. Defaults to "dark" (the brand). All UI updates
+// (label, thumb icon, active class) flow through setTheme() so calling
+// it from anywhere keeps the picker in sync. Each setTheme call also
+// triggers a 420ms spin/fade swap animation on the thumb.
+(function(){
+  var THEMES=['paper','dark','brass','cream','midnight','forge','vault','mono','contrast'];
+  var DARK_THEMES=['dark','midnight','forge','vault','mono','contrast'];
+  var THEME_LABELS={paper:'Paper',dark:'Dark',brass:'Brass',cream:'Cream',midnight:'Midnight',forge:'Forge',vault:'Vault',mono:'Mono',contrast:'Contrast'};
+  // Per-theme SVG icon shown in the pill's circular thumb. Single-colour
+  // (currentColor) so each picks up the active --ac2 via CSS. Designed
+  // for 14×14 display — keep paths simple, avoid sub-pixel detail.
+  var THEME_ICONS={
+    paper:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19 L19 5 M14 4 L20 10 M11 8 L16 13"/><path d="M5 19 L8 16"/></svg>',
+    dark:     '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.5 13.4A8 8 0 0 1 10.6 4.5 8 8 0 1 0 19.5 13.4z"/></svg>',
+    brass:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4" fill="currentColor"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>',
+    cream:    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>',
+    midnight: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 L13.5 9.5 L21 11 L13.5 12.5 L12 20 L10.5 12.5 L3 11 L10.5 9.5 Z"/></svg>',
+    forge:    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c-4 0-7-2.7-7-6.5 0-2.5 2-4 3-5.5C9 9 9 7 9 4c1 1 5 4 6 8 0 0 1-1 1-3 1.5 1.5 4 4 4 7.5 0 3.8-3 5.5-8 5.5z"/></svg>',
+    vault:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.5 19.2 3c.6 4.5-1 12-9.2 16M2 22c1-4 5-8 9-9"/></svg>',
+    mono:     '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg>',
+    contrast: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3 A9 9 0 0 1 12 21 Z" fill="currentColor"/></svg>'
+  };
+  var WALLPAPERS={
+    'none':         {url:null,theme:null,label:'None'},
+    '01-field':     {url:'/assets/wallpapers/wallpaper-01-commitment-field-landscape.svg',theme:'dark',label:'Commitment Field'},
+    '01-mark':      {url:'/assets/wallpapers/wallpaper-01-mark-landscape.svg',theme:'dark',label:'Mark'},
+    '02-proof':     {url:'/assets/wallpapers/wallpaper-02-proof-landscape.svg',theme:'dark',label:'The Proof'},
+    '02-lockup':    {url:'/assets/wallpapers/wallpaper-02-lockup-landscape.svg',theme:'dark',label:'Lockup'},
+    '03-veil':      {url:'/assets/wallpapers/wallpaper-03-veil-landscape.svg',theme:'dark',label:'The Veil'},
+    '03-reversed':  {url:'/assets/wallpapers/wallpaper-03-reversed-landscape.svg',theme:'brass',label:'Reversed'},
+    '04-formula':   {url:'/assets/wallpapers/wallpaper-04-formula-landscape.svg',theme:'dark',label:'The Formula'},
+    '04-mono':      {url:'/assets/wallpapers/wallpaper-04-mono-pair-landscape.svg',theme:'mono',label:'Mono Pair'},
+    '05-library':   {url:'/assets/wallpapers/wallpaper-05-library-landscape.svg',theme:'dark',label:'The Library'},
+    '05-specimen':  {url:'/assets/wallpapers/wallpaper-05-specimen-sheet-landscape.svg',theme:'dark',label:'Specimen'},
+    '06-construct': {url:'/assets/wallpapers/wallpaper-06-construction-landscape.svg',theme:'dark',label:'Construction'}
+  };
+
+  // Render the per-theme SVG icon into the pill's thumb. Called from
+  // setTheme on every change; uses innerHTML because the icons are
+  // small static SVG fragments (no event handlers, no XSS surface —
+  // strings come from THEME_ICONS, not user input).
+  function renderThumbIcon(name){
+    var thumb=document.getElementById('theme-thumb');
+    if(!thumb) return;
+    thumb.innerHTML=THEME_ICONS[name]||THEME_ICONS.dark;
+  }
+
+  // Trigger the spin/fade swap animation. The .swap class is removed at
+  // the end of the keyframe so the next call retriggers cleanly. We swap
+  // the icon mid-animation (at ~50% of duration, when the icon is faded
+  // out) so the user only sees the new icon emerge.
+  function animateThumbSwap(name){
+    var thumb=document.getElementById('theme-thumb');
+    var label=document.getElementById('theme-label');
+    if(!thumb) return;
+    thumb.classList.remove('swap');
+    if(label) label.classList.remove('swap');
+    // Force reflow so the next add re-fires the animation
+    void thumb.offsetWidth;
+    thumb.classList.add('swap');
+    if(label) label.classList.add('swap');
+    // Mid-animation: swap the SVG content + label text under the fade
+    setTimeout(function(){
+      renderThumbIcon(name);
+      if(label) label.textContent=THEME_LABELS[name]||name;
+    },180);
+    // Cleanup: remove .swap once the keyframe finishes so a hover
+    // rotation isn't blocked.
+    setTimeout(function(){
+      thumb.classList.remove('swap');
+      if(label) label.classList.remove('swap');
+    },440);
+  }
+
+  function setTheme(name,keepOpen,skipAnimation){
+    if(THEMES.indexOf(name)===-1) name='dark';
+    var el=document.documentElement;
+    el.classList.remove('dark');
+    el.setAttribute('data-theme',name);
+    if(DARK_THEMES.indexOf(name)!==-1) el.classList.add('dark');
+    if(skipAnimation){
+      renderThumbIcon(name);
+      var label=document.getElementById('theme-label');
+      if(label) label.textContent=THEME_LABELS[name]||name;
+    } else {
+      animateThumbSwap(name);
+    }
+    var btn=document.getElementById('theme-btn');
+    if(btn) btn.setAttribute('aria-expanded','false');
+    document.querySelectorAll('.theme-opt').forEach(function(b){
+      b.classList.toggle('active',b.getAttribute('data-theme')===name);
+    });
+    if(!keepOpen){
+      var picker=document.getElementById('theme-picker');
+      if(picker) picker.classList.remove('open');
+    }
+    try{localStorage.setItem('cync-theme',name);}catch(_){}
+  }
+
+  function setWallpaper(id,userClick){
+    var wp=WALLPAPERS[id];
+    if(!wp) return;
+    var body=document.body;
+    var thumb=document.getElementById('theme-thumb');
+    if(id==='none'||!wp.url){
+      body.classList.remove('has-wallpaper');
+      body.style.backgroundImage='';
+      if(thumb){thumb.classList.remove('with-wp');thumb.style.backgroundImage='';}
+      try{localStorage.removeItem('cync-wallpaper');}catch(_){}
+    } else {
+      body.classList.add('has-wallpaper');
+      body.style.backgroundImage='url('+wp.url+')';
+      // Tiny crop of the same SVG goes into the pill thumb so a glance
+      // tells you both active theme (icon) and active wallpaper (background).
+      if(thumb){thumb.classList.add('with-wp');thumb.style.backgroundImage='url('+wp.url+')';}
+      try{localStorage.setItem('cync-wallpaper',id);}catch(_){}
+      // Only auto-switch theme on an active click (not on page-load
+      // restore — user's chosen theme wins on reload).
+      if(wp.theme && userClick) setTheme(wp.theme,true);
+    }
+    document.querySelectorAll('.wp-thumb').forEach(function(b){
+      b.classList.toggle('active',b.getAttribute('data-wp')===id);
+    });
+  }
+
+  // Wire button handlers (delegating click to data-theme/data-wp attrs).
+  document.querySelectorAll('.theme-opt').forEach(function(b){
+    b.addEventListener('click',function(){setTheme(b.getAttribute('data-theme'));});
+  });
+  document.querySelectorAll('.wp-thumb').forEach(function(b){
+    b.addEventListener('click',function(){setWallpaper(b.getAttribute('data-wp'),true);});
+  });
+  var btn=document.getElementById('theme-btn');
+  if(btn){
+    btn.addEventListener('click',function(e){
+      e.stopPropagation();
+      var picker=document.getElementById('theme-picker');
+      var open=picker.classList.toggle('open');
+      btn.setAttribute('aria-expanded',open?'true':'false');
+    });
+  }
+  // Close on outside click
+  document.addEventListener('click',function(e){
+    var picker=document.getElementById('theme-picker');
+    if(picker && !picker.contains(e.target)){
+      picker.classList.remove('open');
+      if(btn) btn.setAttribute('aria-expanded','false');
+    }
+  });
+
+  // Init from localStorage. Inline head script already applied
+  // data-theme + .dark before paint to prevent flash; here we sync the
+  // picker UI (label, icon, active state) and restore the wallpaper if
+  // any. Pass skipAnimation=true so the page doesn't spin its own pill
+  // on every load.
+  (function init(){
+    var t;try{t=localStorage.getItem('cync-theme');}catch(_){}
+    if(!t||THEMES.indexOf(t)===-1) t='dark';
+    setTheme(t,true,true);
+    var w;try{w=localStorage.getItem('cync-wallpaper');}catch(_){}
+    if(w && WALLPAPERS[w]) setWallpaper(w);
+  })();
+})();
+</script>
+
+</body>
+</html>

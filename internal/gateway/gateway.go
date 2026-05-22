@@ -10,6 +10,7 @@ import (
 
 	"github.com/0xForce-Network/simple-sub2api/internal/accountpool"
 	"github.com/0xForce-Network/simple-sub2api/internal/config"
+	"github.com/0xForce-Network/simple-sub2api/internal/gatewayauth"
 	"github.com/0xForce-Network/simple-sub2api/internal/metrics"
 	"github.com/0xForce-Network/simple-sub2api/internal/proxyclient"
 	"github.com/0xForce-Network/simple-sub2api/internal/routing"
@@ -18,6 +19,7 @@ import (
 
 type Store interface {
 	Snapshot() config.Config
+	TouchGatewayKeyLastUsed(id string, usedAt string) error
 }
 
 type Handler struct {
@@ -42,37 +44,43 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	parsed, body, err := upstreamcompat.ParseChatCompletionRequest(r.Body, 4<<20)
 	if err != nil {
-		h.recordRequest("", http.StatusBadRequest, false, err.Error())
+		h.recordRequest("", config.GatewayKey{}, "", "", http.StatusBadRequest, false, err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_request")
 		return
 	}
 	cfg := h.Store.Snapshot()
-	decision := routing.Decide(cfg.Routing, routing.Request{TaskType: taskTypeFromRequest(r, parsed), Model: parsed.Model, Tags: tagsFromRequest(r)})
-	account, state, err := h.Pool.Select(decision)
+	matchedKey, ok := gatewayauth.MatchedGatewayKey(r)
+	if !ok {
+		matchedKey = config.GatewayKey{ID: "legacy", RoutingPolicy: config.KeyRoutingPolicy{Mode: "all_enabled"}}
+	}
+	taskType := taskTypeFromRequest(r, parsed)
+	decision := routing.Decide(cfg.Routing, routing.Request{TaskType: taskType, Model: parsed.Model, Tags: tagsFromRequest(r)})
+	account, state, err := h.Pool.SelectWithPolicy(decision, matchedKey.RoutingPolicy)
 	if err != nil {
 		h.recordRouting(decision, accountpool.AccountState{}, "no eligible account")
-		h.recordRequest("", http.StatusServiceUnavailable, false, "no eligible upstream account")
+		h.recordRequest("", matchedKey, parsed.Model, taskType, http.StatusServiceUnavailable, false, "no eligible upstream account")
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no eligible upstream account", "server_error", "no_eligible_account")
 		return
 	}
+	h.touchKey(matchedKey)
 	h.recordRouting(decision, state, "")
 	client, err := clientForAccount(cfg, account)
 	if err != nil {
 		h.cooldown(account.ID)
-		h.recordRequest(account.ID, http.StatusBadGateway, false, "configured proxy is unavailable")
+		h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "configured proxy is unavailable")
 		writeOpenAIError(w, http.StatusBadGateway, "configured proxy is unavailable", "api_error", "proxy_unavailable")
 		return
 	}
 	upstreamReq, err := upstreamcompat.BuildUpstreamRequest(r, account, body)
 	if err != nil {
-		h.recordRequest(account.ID, http.StatusBadRequest, false, "invalid upstream account configuration")
+		h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadRequest, false, "invalid upstream account configuration")
 		writeOpenAIError(w, http.StatusBadRequest, "invalid upstream account configuration", "invalid_request_error", "invalid_upstream")
 		return
 	}
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
 		h.cooldown(account.ID)
-		h.recordRequest(account.ID, http.StatusBadGateway, false, "upstream request failed")
+		h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "upstream request failed")
 		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed", "api_error", "upstream_request_failed")
 		return
 	}
@@ -81,10 +89,10 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.cooldown(account.ID)
 	}
 	if parsed.Stream {
-		h.writeStream(w, resp, state.AccountID)
+		h.writeStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
 		return
 	}
-	h.writeNonStream(w, resp, state.AccountID)
+	h.writeNonStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
 }
 
 func clientForAccount(cfg config.Config, account config.Account) (*http.Client, error) {
@@ -100,7 +108,7 @@ func clientForAccount(cfg config.Config, account config.Account) (*http.Client, 
 	return proxyclient.HTTPClient(spec, timeout)
 }
 
-func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, accountID string) {
+func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
 	copySafeHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", contentType(resp.Header.Get("Content-Type"), "application/json"))
 	w.Header().Set("X-Simple-Sub2API-Account", accountID)
@@ -115,11 +123,11 @@ func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, acco
 			h.Metrics.RecordQuotaSwitch(accountID)
 		}
 	}
-	h.recordRequest(accountID, resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
+	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, resp.StatusCode >= 200 && resp.StatusCode < 300, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
 	_, _ = w.Write(body)
 }
 
-func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, accountID string) {
+func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -127,7 +135,7 @@ func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, account
 	flusher, _ := w.(http.Flusher)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_, _ = io.Copy(w, resp.Body)
-		h.recordRequest(accountID, resp.StatusCode, false, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
+		h.recordRequest(accountID, key, model, taskType, resp.StatusCode, false, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -143,7 +151,7 @@ func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, account
 	if flusher != nil {
 		flusher.Flush()
 	}
-	h.recordRequest(accountID, resp.StatusCode, true, "")
+	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, true, "")
 }
 
 func (h Handler) cooldown(accountID string) {
@@ -155,6 +163,15 @@ func (h Handler) cooldown(accountID string) {
 	}
 	if h.Logger != nil {
 		h.Logger.Warn("gateway upstream account cooldown", "account_id", accountID)
+	}
+}
+
+func (h Handler) touchKey(key config.GatewayKey) {
+	if h.Store == nil || key.ID == "" || key.ID == "legacy" {
+		return
+	}
+	if err := h.Store.TouchGatewayKeyLastUsed(key.ID, time.Now().UTC().Format(time.RFC3339)); err != nil && h.Logger != nil {
+		h.Logger.Warn("gateway key last-used update failed", "key_id", key.ID, "error", err.Error())
 	}
 }
 
@@ -173,11 +190,11 @@ func (h Handler) recordRouting(decision routing.Decision, state accountpool.Acco
 	})
 }
 
-func (h Handler) recordRequest(accountID string, statusCode int, success bool, message string) {
+func (h Handler) recordRequest(accountID string, key config.GatewayKey, model string, taskType string, statusCode int, success bool, message string) {
 	if h.Metrics == nil {
 		return
 	}
-	h.Metrics.RecordRequest(metrics.RequestResult{AccountID: accountID, StatusCode: statusCode, Success: success, Error: message})
+	h.Metrics.RecordRequest(metrics.RequestResult{AccountID: accountID, GatewayKeyID: key.ID, GatewayKeyRef: key.Preview, Model: model, TaskType: taskType, StatusCode: statusCode, Success: success, Error: message})
 }
 
 func taskTypeFromRequest(r *http.Request, parsed upstreamcompat.ChatCompletionRequest) string {

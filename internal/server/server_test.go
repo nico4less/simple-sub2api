@@ -55,6 +55,119 @@ func TestM0SecurityBoundaries(t *testing.T) {
 	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer " + rotated.GatewayKey}, nil, http.StatusOK)
 }
 
+func TestE003GatewayKeysCRUDRotateAndAuth(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[],"usage":{"total_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "Simple", Tier: "simple", Tags: []string{"code"}, Credential: "api_key=sk-local", BaseURL: upstream.URL, Enabled: true}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	createBody := []byte(`{"config_version":1,"key":{"id":"client_key","name":"Client Key","status":"enabled","routing_policy":{"mode":"tags","tags":["code"]},"note":"local"},"key_value":"s2a_client-test-key-value-000000"}`)
+	createResp := doRequest(t, http.MethodPost, srv.URL+"/api/keys", map[string]string{"Cookie": cookie.String()}, createBody)
+	if createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create key status = %d", createResp.StatusCode)
+	}
+	var created struct {
+		ConfigVersion int    `json:"config_version"`
+		KeyValue      string `json:"key_value"`
+		Key           struct {
+			KeyHash string `json:"key_hash"`
+			Preview string `json:"preview"`
+		} `json:"key"`
+	}
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode created key: %v", err)
+	}
+	if created.KeyValue != "s2a_client-test-key-value-000000" || created.Key.KeyHash != "configured" || created.Key.Preview == "" {
+		t.Fatalf("created response = %#v", created)
+	}
+	if got := store.Snapshot().GatewayKeys[1].KeyHash; strings.Contains(got, created.KeyValue) || !strings.HasPrefix(got, "sha256:") {
+		t.Fatalf("stored key hash unsafe: %q", got)
+	}
+
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + created.KeyValue}, body, http.StatusOK)
+	if store.Snapshot().GatewayKeys[1].LastUsedAt == "" {
+		t.Fatalf("last_used_at was not updated")
+	}
+
+	disableBody := []byte(`{"config_version":2,"key":{"id":"client_key","name":"Client Key","status":"disabled","routing_policy":{"mode":"tags","tags":["code"]},"preview":"ignored","created_at":"ignored","updated_at":"ignored"}}`)
+	disableResp := doRequest(t, http.MethodPut, srv.URL+"/api/keys/client_key", map[string]string{"Cookie": cookie.String()}, disableBody)
+	if disableResp.StatusCode != http.StatusOK {
+		t.Fatalf("disable key status = %d", disableResp.StatusCode)
+	}
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + created.KeyValue}, body, http.StatusUnauthorized)
+
+	enableBody := []byte(`{"config_version":3,"key":{"id":"client_key","name":"Client Key","status":"enabled","routing_policy":{"mode":"tags","tags":["code"]},"preview":"ignored","created_at":"ignored","updated_at":"ignored"}}`)
+	enableResp := doRequest(t, http.MethodPut, srv.URL+"/api/keys/client_key", map[string]string{"Cookie": cookie.String()}, enableBody)
+	if enableResp.StatusCode != http.StatusOK {
+		t.Fatalf("enable key status = %d", enableResp.StatusCode)
+	}
+	rotateResp := doRequest(t, http.MethodPost, srv.URL+"/api/keys/client_key/rotate", map[string]string{"Cookie": cookie.String()}, []byte(`{"config_version":4}`))
+	if rotateResp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate key status = %d", rotateResp.StatusCode)
+	}
+	var rotated struct {
+		ConfigVersion int    `json:"config_version"`
+		KeyValue      string `json:"key_value"`
+	}
+	if err := json.NewDecoder(rotateResp.Body).Decode(&rotated); err != nil {
+		t.Fatalf("decode rotated key: %v", err)
+	}
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + created.KeyValue}, body, http.StatusUnauthorized)
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + rotated.KeyValue}, body, http.StatusOK)
+	assertStatus(t, http.MethodDelete, srv.URL+"/api/keys/client_key", map[string]string{"Cookie": cookie.String()}, []byte(`{"config_version":5}`), http.StatusOK)
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + rotated.KeyValue}, body, http.StatusUnauthorized)
+}
+
+func TestE003DefaultGatewayKeyAuthoritativeAndRevealClosed(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.GatewayAuth.GatewayKey = "s2a_legacy-default-key-value-000000"
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+	legacyKey := "s2a_legacy-default-key-value-000000"
+
+	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer " + legacyKey}, nil, http.StatusOK)
+	assertStatus(t, http.MethodGet, srv.URL+"/api/admin/gateway-key", map[string]string{"Cookie": cookie.String()}, nil, http.StatusGone)
+	assertStatus(t, http.MethodPost, srv.URL+"/api/keys/default/reveal", map[string]string{"Cookie": cookie.String()}, nil, http.StatusGone)
+
+	disableBody := []byte(`{"config_version":1,"key":{"id":"default","name":"Default Gateway Key","status":"disabled","routing_policy":{"mode":"all_enabled"},"preview":"ignored","created_at":"ignored","updated_at":"ignored"}}`)
+	assertStatus(t, http.MethodPut, srv.URL+"/api/keys/default", map[string]string{"Cookie": cookie.String()}, disableBody, http.StatusOK)
+	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer " + legacyKey}, nil, http.StatusUnauthorized)
+
+	enableBody := []byte(`{"config_version":2,"key":{"id":"default","name":"Default Gateway Key","status":"enabled","routing_policy":{"mode":"all_enabled"},"preview":"ignored","created_at":"ignored","updated_at":"ignored"}}`)
+	assertStatus(t, http.MethodPut, srv.URL+"/api/keys/default", map[string]string{"Cookie": cookie.String()}, enableBody, http.StatusOK)
+	assertStatus(t, http.MethodDelete, srv.URL+"/api/keys/default", map[string]string{"Cookie": cookie.String()}, []byte(`{"config_version":3}`), http.StatusOK)
+	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer " + legacyKey}, nil, http.StatusUnauthorized)
+	if store.Snapshot().GatewayKeys == nil || len(store.Snapshot().GatewayKeys) != 0 {
+		t.Fatalf("gateway_keys should remain authoritative empty collection after delete: %#v", store.Snapshot().GatewayKeys)
+	}
+}
+
 func TestCORSDefaultClosed(t *testing.T) {
 	cfg := config.DefaultConfig()
 	store, err := config.NewMemoryStore(cfg)
@@ -218,7 +331,7 @@ func TestQueueCFailedProxyUpdatePreservesStoredConfig(t *testing.T) {
 	}
 }
 
-func TestQueueEDashboardShellAndStateAreAdminProtected(t *testing.T) {
+func TestQueueELoginAndTwoPageIAShell(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Dashboard.AdminPassword = "admin-secret"
 	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "Simple", Tier: "simple", Credential: "api_key=sk-local", Enabled: true}}
@@ -229,7 +342,40 @@ func TestQueueEDashboardShellAndStateAreAdminProtected(t *testing.T) {
 	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
 	defer srv.Close()
 
-	shellResp := doRequest(t, http.MethodGet, srv.URL+"/dashboard", nil, nil)
+	rootResp := doRequest(t, http.MethodGet, srv.URL+"/", map[string]string{"X-Test-No-Redirect": "1"}, nil)
+	if rootResp.StatusCode != http.StatusFound || rootResp.Header.Get("Location") != "/login" {
+		t.Fatalf("unauthenticated root redirect = %d %q", rootResp.StatusCode, rootResp.Header.Get("Location"))
+	}
+	unauthDashboard := doRequest(t, http.MethodGet, srv.URL+"/dashboard", map[string]string{"X-Test-No-Redirect": "1"}, nil)
+	if unauthDashboard.StatusCode != http.StatusFound || unauthDashboard.Header.Get("Location") != "/login" {
+		t.Fatalf("unauthenticated dashboard redirect = %d %q", unauthDashboard.StatusCode, unauthDashboard.Header.Get("Location"))
+	}
+	loginShellResp := doRequest(t, http.MethodGet, srv.URL+"/login", nil, nil)
+	if loginShellResp.StatusCode != http.StatusOK {
+		t.Fatalf("login shell status = %d", loginShellResp.StatusCode)
+	}
+	loginShellBody, err := io.ReadAll(loginShellResp.Body)
+	if err != nil {
+		t.Fatalf("read login shell: %v", err)
+	}
+	loginHTML := string(loginShellBody)
+	for _, forbidden := range []string{"Username", "Register", "Password reset", "OAuth", "captcha", "TOTP", "Invite"} {
+		if strings.Contains(loginHTML, forbidden) {
+			t.Fatalf("login shell contains out-of-scope marker %q", forbidden)
+		}
+	}
+	for _, marker := range []string{"Simple Sub2API Console", "module", "/assets/"} {
+		if !strings.Contains(loginHTML, marker) {
+			t.Fatalf("login shell missing marker %q", marker)
+		}
+	}
+
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+	authLogin := doRequest(t, http.MethodGet, srv.URL+"/login", map[string]string{"Cookie": cookie.String(), "X-Test-No-Redirect": "1"}, nil)
+	if authLogin.StatusCode != http.StatusFound || authLogin.Header.Get("Location") != "/dashboard" {
+		t.Fatalf("authenticated login redirect = %d %q", authLogin.StatusCode, authLogin.Header.Get("Location"))
+	}
+	shellResp := doRequest(t, http.MethodGet, srv.URL+"/dashboard", map[string]string{"Cookie": cookie.String()}, nil)
 	if shellResp.StatusCode != http.StatusOK {
 		t.Fatalf("dashboard shell status = %d", shellResp.StatusCode)
 	}
@@ -237,17 +383,34 @@ func TestQueueEDashboardShellAndStateAreAdminProtected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read dashboard shell: %v", err)
 	}
-	if !strings.Contains(string(shellBody), "Simple Sub2API Dashboard") || strings.Contains(string(shellBody), "https://") {
+	shellHTML := string(shellBody)
+	if !strings.Contains(shellHTML, "Simple Sub2API Console") || strings.Contains(shellHTML, "https://") {
 		t.Fatalf("dashboard shell missing title or contains external asset reference")
 	}
-	for _, marker := range []string{"Account Add / Save", "OAuth Sources", "Subscription Import Preview / Apply", "Routing Edit / Test", "Proxy Config / Probe", "QPS", "recentErrors", "loadMetrics()", "quotaBars", "applyImport()", "refreshOAuth", "reauthOAuth"} {
-		if !strings.Contains(string(shellBody), marker) {
+	for _, marker := range []string{"Simple Sub2API Console", "module", "/assets/"} {
+		if !strings.Contains(shellHTML, marker) {
 			t.Fatalf("dashboard shell missing marker %q", marker)
 		}
 	}
+	for _, forbidden := range []string{"OAuth Sources", "Routing Edit / Test", "Proxy Config / Probe", "Debug Output", "refreshOAuth", "reauthOAuth"} {
+		if strings.Contains(shellHTML, forbidden) {
+			t.Fatalf("dashboard shell still contains non-E000 marker %q", forbidden)
+		}
+	}
+	accountsResp := doRequest(t, http.MethodGet, srv.URL+"/admin/accounts", map[string]string{"Cookie": cookie.String()}, nil)
+	if accountsResp.StatusCode != http.StatusOK {
+		t.Fatalf("accounts shell status = %d", accountsResp.StatusCode)
+	}
+	keysAliasResp := doRequest(t, http.MethodGet, srv.URL+"/keys", map[string]string{"Cookie": cookie.String()}, nil)
+	if keysAliasResp.StatusCode != http.StatusOK {
+		t.Fatalf("keys alias shell status = %d", keysAliasResp.StatusCode)
+	}
+	assetResp := doRequest(t, http.MethodGet, srv.URL+"/assets/index.js", nil, nil)
+	if assetResp.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard asset status = %d", assetResp.StatusCode)
+	}
 
 	assertStatus(t, http.MethodGet, srv.URL+"/api/admin/dashboard/state", nil, nil, http.StatusUnauthorized)
-	cookie := loginCookie(t, srv.URL, "admin-secret")
 	stateResp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/dashboard/state", map[string]string{"Cookie": cookie.String()}, nil)
 	if stateResp.StatusCode != http.StatusOK {
 		t.Fatalf("dashboard state status = %d", stateResp.StatusCode)
@@ -311,6 +474,70 @@ func TestQueueFMetricsAPIIsAdminOnly(t *testing.T) {
 	}
 	if snapshot.StartedAt == "" || snapshot.QPS != 0 || snapshot.TotalRequests != 0 || len(snapshot.RecentErrors) != 0 {
 		t.Fatalf("unexpected fresh metrics snapshot: %#v", snapshot)
+	}
+}
+
+func TestRCHardeningDebugSnapshotAdminOnlyDisabledAndSanitized(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret-sentinel"
+	cfg.GatewayAuth.GatewayKey = "s2a_gateway-secret-sentinel-value"
+	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "Simple", Tier: "simple", Credential: "api_key=account-secret-sentinel", Enabled: true}}
+	cfg.OAuthSources = []config.OAuthSource{{ID: "oauth_1", Platform: "openai", Type: "token_bundle", Label: "OAuth", Tier: "advanced", Enabled: true, Credentials: map[string]string{"refresh_token": "oauth-secret-sentinel"}, RefreshState: config.RefreshState{Status: "unknown"}}}
+	cfg.SubscriptionSources = []config.SubscriptionSource{{ID: "sub_1", Kind: "inline_bundle", Label: "Inline", Tier: "simple", Enabled: true, InlineBundle: "inline-secret-sentinel"}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	disabledSrv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer disabledSrv.Close()
+
+	assertStatus(t, http.MethodGet, disabledSrv.URL+"/api/admin/debug/snapshot", nil, nil, http.StatusUnauthorized)
+	cookie := loginCookie(t, disabledSrv.URL, "admin-secret-sentinel")
+	disabledResp := doRequest(t, http.MethodGet, disabledSrv.URL+"/api/admin/debug/snapshot", map[string]string{"Cookie": cookie.String()}, nil)
+	if disabledResp.StatusCode != http.StatusOK {
+		t.Fatalf("disabled debug status = %d", disabledResp.StatusCode)
+	}
+	var disabled struct {
+		Enabled bool   `json:"enabled"`
+		Status  string `json:"status"`
+	}
+	if err := json.NewDecoder(disabledResp.Body).Decode(&disabled); err != nil {
+		t.Fatalf("decode disabled debug: %v", err)
+	}
+	if disabled.Enabled || disabled.Status != "disabled" {
+		t.Fatalf("disabled debug snapshot leaked state: %#v", disabled)
+	}
+
+	enabledSrv := httptest.NewServer(server.NewWithOptions(store, slog.New(slog.NewTextHandler(io.Discard, nil)), server.Options{DebugDashboard: true}).Handler())
+	defer enabledSrv.Close()
+	enabledCookie := loginCookie(t, enabledSrv.URL, "admin-secret-sentinel")
+	enabledResp := doRequest(t, http.MethodGet, enabledSrv.URL+"/api/admin/debug/snapshot", map[string]string{"Cookie": enabledCookie.String()}, nil)
+	if enabledResp.StatusCode != http.StatusOK {
+		t.Fatalf("enabled debug status = %d", enabledResp.StatusCode)
+	}
+	body, err := io.ReadAll(enabledResp.Body)
+	if err != nil {
+		t.Fatalf("read enabled debug body: %v", err)
+	}
+	var snapshot struct {
+		Enabled       bool `json:"enabled"`
+		ConfigSummary struct {
+			Accounts            int `json:"accounts"`
+			OAuthSources        int `json:"oauth_sources"`
+			SubscriptionSources int `json:"subscription_sources"`
+			EnabledAccounts     int `json:"enabled_accounts"`
+		} `json:"config_summary"`
+	}
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		t.Fatalf("decode enabled debug: %v", err)
+	}
+	if !snapshot.Enabled || snapshot.ConfigSummary.Accounts != 1 || snapshot.ConfigSummary.EnabledAccounts != 1 || snapshot.ConfigSummary.OAuthSources != 1 || snapshot.ConfigSummary.SubscriptionSources != 1 {
+		t.Fatalf("enabled debug snapshot summary = %#v", snapshot)
+	}
+	for _, sentinel := range []string{"admin-secret-sentinel", "gateway-secret-sentinel", "account-secret-sentinel", "oauth-secret-sentinel", "inline-secret-sentinel", "Authorization", "Cookie"} {
+		if strings.Contains(string(body), sentinel) {
+			t.Fatalf("debug snapshot leaked sentinel %q in %s", sentinel, string(body))
+		}
 	}
 }
 
@@ -425,6 +652,202 @@ func TestQueueEAccountDeleteAndRefresh(t *testing.T) {
 	}
 }
 
+func TestE002AccountsCoreCRUDImportExportAndPoolDisable(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Proxies = []config.ProxyConfig{{ID: "proxy_1", URL: "http://127.0.0.1:8081"}}
+	cfg.Quota.Policies = []config.QuotaPolicy{{ID: "quota_1", Source: "manual", DailyLimitTokens: 1000}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeFixtureJSON(t, w, map[string]any{"object": "list", "data": []any{}})
+	}))
+	defer upstream.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	createBody, err := json.Marshal(map[string]any{
+		"config_version": 1,
+		"account": map[string]any{
+			"id":           "acct_core",
+			"type":         "openai_api_key",
+			"label":        "Core Account",
+			"tier":         "simple",
+			"tags":         []string{"primary", "manual"},
+			"credential":   "api_key=sk-core-secret",
+			"base_url":     upstream.URL,
+			"model":        "gpt-test",
+			"quota_policy": "quota_1",
+			"enabled":      true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal create body: %v", err)
+	}
+	createResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/accounts", map[string]string{"Cookie": cookie.String()}, createBody)
+	if createResp.StatusCode != http.StatusOK {
+		t.Fatalf("create status = %d", createResp.StatusCode)
+	}
+	if got := store.Snapshot().Accounts[0].Credential; got != "api_key=sk-core-secret" {
+		t.Fatalf("stored credential = %q", got)
+	}
+
+	listResp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/accounts", map[string]string{"Cookie": cookie.String()}, nil)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d", listResp.StatusCode)
+	}
+	listBody, err := io.ReadAll(listResp.Body)
+	if err != nil {
+		t.Fatalf("read list body: %v", err)
+	}
+	if strings.Contains(string(listBody), "sk-core-secret") || !strings.Contains(string(listBody), "Core Account") || !strings.Contains(string(listBody), "proxy_1") {
+		t.Fatalf("list response did not redact/include expected account fields: %s", string(listBody))
+	}
+
+	var listed struct {
+		ConfigVersion int `json:"config_version"`
+		Accounts      []struct {
+			Config struct {
+				ID         string   `json:"id"`
+				Credential string   `json:"credential"`
+				Tags       []string `json:"tags"`
+			} `json:"config"`
+			RuntimeStatus string `json:"runtime_status"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(listBody, &listed); err != nil {
+		t.Fatalf("decode accounts list: %v", err)
+	}
+	if listed.ConfigVersion != 2 || len(listed.Accounts) != 1 || listed.Accounts[0].RuntimeStatus != "healthy" || strings.Contains(listed.Accounts[0].Config.Credential, "sk-core-secret") {
+		t.Fatalf("unexpected accounts list: %#v", listed)
+	}
+
+	updateBody := []byte(`{"config_version":2,"account":{"id":"acct_core","type":"openai_api_key","label":"Core Account Disabled","tier":"simple","tags":["disabled"],"credential":"redacted","model":"gpt-test","enabled":false}}`)
+	updateResp := doRequest(t, http.MethodPut, srv.URL+"/api/admin/accounts/acct_core", map[string]string{"Cookie": cookie.String()}, updateBody)
+	if updateResp.StatusCode != http.StatusOK {
+		t.Fatalf("update status = %d", updateResp.StatusCode)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Accounts[0].Credential != "api_key=sk-core-secret" || snapshot.Accounts[0].Enabled {
+		t.Fatalf("update failed to preserve credential or disable account: %#v", snapshot.Accounts[0])
+	}
+	assertStatus(t, http.MethodPost, srv.URL+"/api/admin/routing/decide", map[string]string{"Cookie": cookie.String()}, []byte(`{"task_type":"document","model":"gpt-4o-mini"}`), http.StatusOK)
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + store.GatewayKey()}, []byte(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`), http.StatusServiceUnavailable)
+
+	testResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/accounts/acct_core/test", map[string]string{"Cookie": cookie.String()}, nil)
+	if testResp.StatusCode != http.StatusOK {
+		t.Fatalf("test status = %d", testResp.StatusCode)
+	}
+	var testResult struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(testResp.Body).Decode(&testResult); err != nil {
+		t.Fatalf("decode test result: %v", err)
+	}
+	if testResult.Status != "disabled" {
+		t.Fatalf("disabled account test result = %#v", testResult)
+	}
+
+	previewResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/accounts/import/preview", map[string]string{"Cookie": cookie.String()}, []byte(`{"kind":"line_tokens","content":"sk-imported-secret\n","tier":"simple","label":"E002 Import"}`))
+	if previewResp.StatusCode != http.StatusOK {
+		t.Fatalf("preview status = %d", previewResp.StatusCode)
+	}
+	previewBody, err := io.ReadAll(previewResp.Body)
+	if err != nil {
+		t.Fatalf("read preview body: %v", err)
+	}
+	if strings.Contains(string(previewBody), "sk-imported-secret") {
+		t.Fatalf("preview leaked import secret: %s", string(previewBody))
+	}
+	applyResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/accounts/import/apply", map[string]string{"Cookie": cookie.String()}, []byte(`{"config_version":3,"import":{"kind":"line_tokens","content":"sk-imported-secret\n","tier":"simple","label":"E002 Import"}}`))
+	if applyResp.StatusCode != http.StatusOK {
+		t.Fatalf("apply status = %d", applyResp.StatusCode)
+	}
+	if len(store.Snapshot().Accounts) != 2 {
+		t.Fatalf("import did not add account: %#v", store.Snapshot().Accounts)
+	}
+
+	exportResp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/accounts/export", map[string]string{"Cookie": cookie.String()}, nil)
+	if exportResp.StatusCode != http.StatusOK {
+		t.Fatalf("export status = %d", exportResp.StatusCode)
+	}
+	exportBody, err := io.ReadAll(exportResp.Body)
+	if err != nil {
+		t.Fatalf("read export body: %v", err)
+	}
+	if strings.Contains(string(exportBody), "sk-core-secret") || strings.Contains(string(exportBody), "sk-imported-secret") || !strings.Contains(string(exportBody), "accounts") {
+		t.Fatalf("export did not redact or include accounts: %s", string(exportBody))
+	}
+}
+
+func TestE004DeleteAccountPrunesGatewayPolicyAndRecentUsageIsRedacted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "A", Tier: "simple", Credential: "api_key=sk-upstream", BaseURL: upstream.URL, Enabled: true}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	createKeyBody := []byte(`{"config_version":1,"key":{"id":"acct_only","name":"Account Only","status":"enabled","routing_policy":{"mode":"account_ids","account_ids":["acct_1"]}},"key_value":"s2a_custom-account-only-key-000000"}`)
+	createKeyResp := doRequest(t, http.MethodPost, srv.URL+"/api/keys", map[string]string{"Cookie": cookie.String()}, createKeyBody)
+	if createKeyResp.StatusCode != http.StatusOK {
+		t.Fatalf("create key status = %d", createKeyResp.StatusCode)
+	}
+	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer s2a_custom-account-only-key-000000"}, []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`), http.StatusOK)
+	versionAfterUsage := store.Snapshot().ConfigVersion
+
+	metricsResp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/dashboard/recent-usage", map[string]string{"Cookie": cookie.String()}, nil)
+	if metricsResp.StatusCode != http.StatusOK {
+		t.Fatalf("recent usage status = %d", metricsResp.StatusCode)
+	}
+	metricsBody, err := io.ReadAll(metricsResp.Body)
+	if err != nil {
+		t.Fatalf("read recent usage body: %v", err)
+	}
+	if strings.Contains(string(metricsBody), "s2a_custom-account-only-key-000000") || strings.Contains(string(metricsBody), "sk-upstream") {
+		t.Fatalf("recent usage leaked secret material: %s", string(metricsBody))
+	}
+	if !strings.Contains(string(metricsBody), "acct_1") || !strings.Contains(string(metricsBody), "acct_only") {
+		t.Fatalf("recent usage missing expected identifiers: %s", string(metricsBody))
+	}
+	if !strings.Contains(string(metricsBody), "\"rank\":1") || !strings.Contains(string(metricsBody), "\"success_rate\":1") || !strings.Contains(string(metricsBody), "Account Only") {
+		t.Fatalf("recent usage missing rank, success rate, or labels: %s", string(metricsBody))
+	}
+
+	deleteBody, err := json.Marshal(map[string]any{"config_version": versionAfterUsage})
+	if err != nil {
+		t.Fatalf("marshal delete body: %v", err)
+	}
+	deleteResp := doRequest(t, http.MethodDelete, srv.URL+"/api/admin/accounts/acct_1", map[string]string{"Cookie": cookie.String()}, deleteBody)
+	if deleteResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status = %d", deleteResp.StatusCode)
+	}
+	snapshot := store.Snapshot()
+	if len(snapshot.Accounts) != 0 || len(snapshot.GatewayKeys) != 2 || len(snapshot.GatewayKeys[1].RoutingPolicy.AccountIDs) != 0 {
+		t.Fatalf("account delete did not prune gateway policy: %#v", snapshot)
+	}
+}
+
 func assertStatus(t *testing.T, method string, url string, headers map[string]string, body []byte, want int) {
 	t.Helper()
 	resp := doRequest(t, method, url, headers, body)
@@ -447,9 +870,18 @@ func doRequest(t *testing.T, method string, url string, headers map[string]strin
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for key, value := range headers {
+		if key == "X-Test-No-Redirect" {
+			continue
+		}
 		req.Header.Set(key, value)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := http.DefaultClient
+	if headers["X-Test-No-Redirect"] != "" {
+		client = &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("Do() error = %v", err)
 	}
@@ -474,4 +906,12 @@ func loginCookie(t *testing.T, serverURL string, password string) *http.Cookie {
 		t.Fatalf("login status = %d", loginResp.StatusCode)
 	}
 	return firstCookie(t, loginResp, dashboard.CookieName)
+}
+
+func writeFixtureJSON(t *testing.T, w http.ResponseWriter, value any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		t.Fatalf("encode fixture JSON: %v", err)
+	}
 }

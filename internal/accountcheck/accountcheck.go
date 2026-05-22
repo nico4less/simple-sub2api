@@ -10,6 +10,7 @@ import (
 
 	"github.com/0xForce-Network/simple-sub2api/internal/config"
 	"github.com/0xForce-Network/simple-sub2api/internal/proxyclient"
+	"github.com/0xForce-Network/simple-sub2api/internal/upstreamcompat"
 )
 
 type Result struct {
@@ -64,7 +65,12 @@ func (c Checker) Check(ctx context.Context, cfg config.Config, account config.Ac
 		result.Message = sanitize(err)
 		return result
 	}
-	probeURL := strings.TrimRight(account.BaseURL, "/") + "/v1/models"
+	probeURL, err := upstreamcompat.OpenAIAPIURL(account.BaseURL, "/v1/models")
+	if err != nil {
+		result.Status = "error"
+		result.Message = "probe URL is invalid"
+		return result
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 	if err != nil {
 		result.Status = "error"

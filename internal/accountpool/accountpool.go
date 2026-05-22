@@ -3,6 +3,7 @@ package accountpool
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -135,13 +136,21 @@ func (m *Manager) Cooldown(accountID string, until time.Time) {
 }
 
 func (m *Manager) Select(decision routing.Decision) (config.Account, AccountState, error) {
+	return m.SelectWithPolicy(decision, config.KeyRoutingPolicy{Mode: "all_enabled"})
+}
+
+func (m *Manager) SelectWithPolicy(decision routing.Decision, policy config.KeyRoutingPolicy) (config.Account, AccountState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.refreshCooldownsLocked(time.Now().UTC())
 	eligible := make([]AccountState, 0)
-	for _, tier := range append(append([]string(nil), decision.PreferTiers...), decision.FallbackTiers...) {
+	tiers := append(append([]string(nil), decision.PreferTiers...), decision.FallbackTiers...)
+	if len(policy.Tiers) > 0 {
+		tiers = append([]string(nil), policy.Tiers...)
+	}
+	for _, tier := range tiers {
 		for _, state := range m.snapshot.Accounts {
-			if state.Tier == tier && state.Status == "healthy" {
+			if state.Tier == tier && state.Status == "healthy" && matchesKeyPolicy(state, policy) {
 				eligible = append(eligible, state)
 			}
 		}
@@ -168,6 +177,52 @@ func (m *Manager) Select(decision routing.Decision) (config.Account, AccountStat
 		}
 	}
 	return account, chosen, nil
+}
+
+func matchesKeyPolicy(state AccountState, policy config.KeyRoutingPolicy) bool {
+	mode := policy.Mode
+	if mode == "" {
+		mode = "all_enabled"
+	}
+	switch mode {
+	case "all_enabled", "tier_preference":
+		return true
+	case "tags":
+		if len(policy.Tags) == 0 {
+			return true
+		}
+		return hasAnyTag(state.Tags, policy.Tags)
+	case "groups":
+		if len(policy.GroupIDs) == 0 {
+			return true
+		}
+		return hasAnyTag(state.Tags, policy.GroupIDs)
+	case "account_ids":
+		if len(policy.AccountIDs) == 0 {
+			return true
+		}
+		for _, id := range policy.AccountIDs {
+			if id == state.AccountID {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func hasAnyTag(accountTags []string, policyTags []string) bool {
+	seen := map[string]bool{}
+	for _, tag := range accountTags {
+		seen[strings.ToLower(strings.TrimSpace(tag))] = true
+	}
+	for _, tag := range policyTags {
+		if seen[strings.ToLower(strings.TrimSpace(tag))] {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) refreshCooldownsLocked(now time.Time) {

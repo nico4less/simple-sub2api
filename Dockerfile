@@ -1,9 +1,19 @@
+FROM node:20-alpine AS frontend-build
+
+WORKDIR /src
+COPY frontend/package*.json ./frontend/
+WORKDIR /src/frontend
+RUN npm install
+COPY frontend ./
+RUN npm run build
+
 FROM golang:1.22-alpine AS build
 
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
 COPY internal ./internal
+COPY --from=frontend-build /src/internal/dashboard/static ./internal/dashboard/static
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/simple-sub2api ./cmd/simple-sub2api
 
 FROM alpine:3.20

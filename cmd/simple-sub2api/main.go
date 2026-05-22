@@ -20,6 +20,7 @@ func main() {
 	allowLAN := flag.Bool("allow-lan", false, "explicitly allow non-loopback bind addresses")
 	adminPassword := flag.String("admin-password", "", "dashboard admin password; required for LAN bind")
 	corsOrigins := flag.String("cors-origins", "", "comma-separated explicit CORS origins; empty keeps CORS closed")
+	debugDashboard := flag.Bool("debug-dashboard", false, "explicitly enable admin-only sanitized dashboard debug snapshot output")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -72,13 +73,22 @@ func main() {
 		slog.String("bind", cfg.Server.Bind),
 		slog.Bool("allow_lan", cfg.Server.AllowLAN),
 		slog.Bool("cors_enabled", len(cfg.Server.CORSAllowedOrigins) > 0),
+		slog.Bool("debug_dashboard", debugDashboardEnabled(*debugDashboard)),
 	)
 
-	handler := server.New(store, logger).Handler()
+	handler := server.NewWithOptions(store, logger, server.Options{DebugDashboard: debugDashboardEnabled(*debugDashboard)}).Handler()
 	if err := http.ListenAndServe(cfg.Server.Bind, handler); err != nil {
 		logger.Error("server stopped", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+}
+
+func debugDashboardEnabled(flagValue bool) bool {
+	if flagValue {
+		return true
+	}
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("SIMPLE_SUB2API_DEBUG_DASHBOARD")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func visitedFlags() map[string]bool {

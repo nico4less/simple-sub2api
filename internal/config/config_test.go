@@ -1,7 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -123,5 +126,40 @@ func TestStoreUpdateEnforcesConfigVersionConflict(t *testing.T) {
 	_, err = store.Update(999, func(cfg *Config) error { return nil })
 	if !errors.Is(err, ErrConfigVersionConflict) {
 		t.Fatalf("Update() error = %v, want ErrConfigVersionConflict", err)
+	}
+}
+
+func TestFileStoreUpdateReloadsDiskVersionBeforeMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "simple.json")
+	store, created, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if !created {
+		t.Fatal("Open() did not create fresh config")
+	}
+	disk := store.Snapshot()
+	disk.ConfigVersion = 7
+	disk.Accounts = []Account{{ID: "acct_disk", Type: "openai_api_key", Label: "Disk", Tier: "simple", Credential: "api_key=sk-disk", Enabled: true}}
+	data, err := json.MarshalIndent(disk, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal disk config: %v", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write disk config: %v", err)
+	}
+	_, err = store.Update(1, func(cfg *Config) error { return nil })
+	if !errors.Is(err, ErrConfigVersionConflict) {
+		t.Fatalf("Update() error = %v, want ErrConfigVersionConflict", err)
+	}
+	updated, err := store.Update(7, func(cfg *Config) error {
+		cfg.Accounts[0].Label = "Disk Updated"
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Update() after reload error = %v", err)
+	}
+	if updated.ConfigVersion != 8 || updated.Accounts[0].Label != "Disk Updated" {
+		t.Fatalf("updated config = %#v", updated)
 	}
 }

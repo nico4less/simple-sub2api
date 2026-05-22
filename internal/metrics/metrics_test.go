@@ -28,6 +28,12 @@ func TestRecorderSnapshotAndRecentErrors(t *testing.T) {
 	if len(snapshot.RecentErrors) != 2 {
 		t.Fatalf("recent error ring length = %d", len(snapshot.RecentErrors))
 	}
+	if len(snapshot.RecentUsage) != 4 || len(snapshot.TopUsage) == 0 {
+		t.Fatalf("recent usage missing: %#v", snapshot)
+	}
+	if snapshot.TopUsage[0].AccountID != "acct_1" || snapshot.TopUsage[0].Requests != 2 || snapshot.TopUsage[0].Successes != 1 || snapshot.TopUsage[0].Errors != 1 {
+		t.Fatalf("top usage aggregate = %#v", snapshot.TopUsage)
+	}
 	for _, item := range snapshot.RecentErrors {
 		if item.Message == "Bearer sk-secret leaked" {
 			t.Fatalf("secret-bearing message was not redacted: %#v", snapshot.RecentErrors)

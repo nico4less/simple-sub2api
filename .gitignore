@@ -1,0 +1,6 @@
+build/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+internal/dashboard/static/assets/
+!build/config.json
+!build/run.sh

@@ -1,14 +1,20 @@
 package gatewayauth
 
 import (
-	"crypto/subtle"
+	"context"
 	"net/http"
 	"strings"
+
+	"github.com/0xForce-Network/simple-sub2api/internal/config"
 )
 
 type KeyProvider interface {
-	GatewayKey() string
+	MatchGatewayKey(value string) config.GatewayKeyMatch
 }
+
+type contextKey string
+
+const matchedGatewayKeyContextKey contextKey = "matched_gateway_key"
 
 type Authorizer struct {
 	Provider KeyProvider
@@ -16,24 +22,33 @@ type Authorizer struct {
 
 func (a Authorizer) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := a.Provider.GatewayKey()
-		if key == "" || !matchesBearer(r.Header.Get("Authorization"), key) {
+		candidate, ok := bearerToken(r.Header.Get("Authorization"))
+		if !ok {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "gateway key required", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		match := a.Provider.MatchGatewayKey(candidate)
+		if !match.OK {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "gateway key required", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), matchedGatewayKeyContextKey, match.Key)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-func matchesBearer(header string, key string) bool {
+func MatchedGatewayKey(r *http.Request) (config.GatewayKey, bool) {
+	key, ok := r.Context().Value(matchedGatewayKeyContextKey).(config.GatewayKey)
+	return key, ok
+}
+
+func bearerToken(header string) (string, bool) {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
-		return false
+		return "", false
 	}
 	candidate := strings.TrimSpace(strings.TrimPrefix(header, prefix))
-	if len(candidate) != len(key) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) == 1
+	return candidate, candidate != ""
 }
