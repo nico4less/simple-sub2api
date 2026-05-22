@@ -39,6 +39,7 @@ func BuildUpstreamRequest(base *http.Request, account config.Account, body []byt
 	if err != nil {
 		return nil, err
 	}
+	body = normalizeAnthropicBillingHeader(body, base.Header.Get("User-Agent"))
 	request, err := http.NewRequestWithContext(base.Context(), http.MethodPost, requestURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

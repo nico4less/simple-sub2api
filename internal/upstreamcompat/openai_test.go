@@ -3,6 +3,7 @@ package upstreamcompat_test
 import (
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -134,5 +135,36 @@ func TestBuildUpstreamRequestSetsDefaultUserAgent(t *testing.T) {
 	}
 	if got := request.Header.Get("Accept"); got != "application/json" {
 		t.Fatalf("default Accept = %q", got)
+	}
+}
+
+func TestBuildUpstreamRequestSignsClaudeCodeBillingHeader(t *testing.T) {
+	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.81.df2; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":[{"type":"text","text":"keep literal cch=00000 in user content"}]}]}`)
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/chat/completions", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	base.Header.Set("User-Agent", "claude-cli/2.1.22 (external, cli)")
+
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{BaseURL: "https://api.anthropic.com", Credential: "api_key=sk-upstream"}, body)
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	gotBody, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	got := string(gotBody)
+	if strings.Contains(got, "cc_version=2.1.81") || !strings.Contains(got, "cc_version=2.1.22.df2") {
+		t.Fatalf("billing cc_version was not synced: %s", got)
+	}
+	if strings.Contains(got, "x-anthropic-billing-header: cc_version=2.1.22.df2; cc_entrypoint=cli; cch=00000;") {
+		t.Fatalf("billing cch placeholder was not signed: %s", got)
+	}
+	if !regexp.MustCompile(`x-anthropic-billing-header: cc_version=2\.1\.22\.df2; cc_entrypoint=cli; cch=[0-9a-f]{5};`).MatchString(got) {
+		t.Fatalf("billing cch signature missing or malformed: %s", got)
+	}
+	if !strings.Contains(got, "keep literal cch=00000 in user content") {
+		t.Fatalf("user cch literal was modified: %s", got)
 	}
 }

@@ -97,6 +97,33 @@ func TestValidateRejectsInvalidAccountSchema(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsMixedSubscriptionFamiliesInGroup(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{
+		{ID: "openai_acct", Type: "openai_api_key", Label: "OpenAI", Tier: "simple", Credential: "api_key=sk-openai", Metadata: map[string]any{"platform": "openai"}, Enabled: true},
+		{ID: "claude_acct", Type: "oauth", Label: "Claude", Tier: "simple", Credential: "refresh_token=claude", Metadata: map[string]any{"platform": "anthropic"}, Enabled: true},
+	}
+	cfg.Groups = []Group{{ID: "openai", Name: "OpenAI", Platform: "openai", Status: "active", AccountIDs: []string{"openai_acct", "claude_acct"}, CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"}}
+	if err := EnsureDefaultsAndSecrets(&cfg); err != nil {
+		t.Fatalf("EnsureDefaultsAndSecrets() error = %v", err)
+	}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "cannot include") {
+		t.Fatalf("Validate() error = %v, want mixed platform rejection", err)
+	}
+}
+
+func TestValidateAcceptsSingleSubscriptionFamilyGroup(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Accounts = []Account{{ID: "claude_acct", Type: "oauth", Label: "Claude", Tier: "simple", Credential: "refresh_token=claude", Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}
+	cfg.Groups = []Group{{ID: "claude", Name: "Claude", Platform: "anthropic", Status: "active", AccountIDs: []string{"claude_acct"}, CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"}}
+	if err := EnsureDefaultsAndSecrets(&cfg); err != nil {
+		t.Fatalf("EnsureDefaultsAndSecrets() error = %v", err)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() rejected single-family group: %v", err)
+	}
+}
+
 func TestValidateNormalizesSocks5ProxyToSocks5H(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Proxies = []ProxyConfig{{ID: "proxy_1", URL: "socks5://127.0.0.1:1080"}}

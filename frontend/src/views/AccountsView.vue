@@ -85,6 +85,11 @@ const accountNameInput = ref<HTMLInputElement | null>(null)
 
 const OAUTH_CALLBACK_URL = 'http://localhost:1455/auth/callback'
 const ANTIGRAVITY_CALLBACK_URL = 'http://localhost:8085/callback'
+const CLAUDE_OAUTH_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
+const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+const CLAUDE_OAUTH_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback'
+const CLAUDE_OAUTH_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
+const CLAUDE_SETUP_TOKEN_SCOPE = 'user:inference'
 const OPENAI_CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const GEMINI_CODE_ASSIST_CALLBACK_URL = 'https://codeassist.google.com/authcode'
 const GEMINI_CLI_CLIENT_ID = '681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com'
@@ -195,6 +200,26 @@ function randomOAuthToken(byteLength = 32): string {
   return base64UrlEncode(bytes)
 }
 
+function randomOAuthHexToken(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength)
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes)
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256)
+    }
+  }
+  return Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function buildClaudeAuthorizationURL(state: string, codeChallenge: string, scope: string): string {
+  const encodedRedirectURI = encodeURIComponent(CLAUDE_OAUTH_REDIRECT_URI)
+  const encodedScope = encodeURIComponent(scope).replace(/%20/g, '+')
+  return `${CLAUDE_OAUTH_AUTHORIZE_URL}?code=true&client_id=${CLAUDE_OAUTH_CLIENT_ID}&response_type=code&redirect_uri=${encodedRedirectURI}&scope=${encodedScope}&code_challenge=${codeChallenge}&code_challenge_method=S256&state=${state}`
+}
+
 async function buildCodeChallenge(verifier: string): Promise<string> {
   const verifierBytes = new TextEncoder().encode(verifier)
   if (globalThis.crypto?.subtle) {
@@ -204,12 +229,16 @@ async function buildCodeChallenge(verifier: string): Promise<string> {
   return base64UrlEncode(sha256Digest(verifierBytes))
 }
 
+function resetOAuthAssistantState() {
+  activeOAuthTab.value = 'manual'
+  computedAuthUrl.value = ''
+  copiedUrl.value = false
+  authCodeInput.value = ''
+}
+
 watch(editorOpen, (isOpen: boolean) => {
   if (isOpen) {
-    activeOAuthTab.value = 'manual'
-    computedAuthUrl.value = ''
-    copiedUrl.value = false
-    authCodeInput.value = ''
+    resetOAuthAssistantState()
   }
 })
 
@@ -632,10 +661,7 @@ const availableGroups = computed(() => (groupsState.value?.groups || []).map((su
 const selectedGroupIDs = computed(() => splitList(form.group_ids))
 const filteredGroupsForPlatform = computed(() => {
   const groups = availableGroups.value
-  if (form.platform === 'antigravity' && form.mixed_scheduling) {
-    return groups.filter((group) => group.platform === 'mixed' || group.platform === 'antigravity' || group.platform === 'anthropic' || group.platform === 'gemini')
-  }
-  return groups.filter((group) => group.platform === 'mixed' || group.platform === form.platform)
+  return groups.filter((group) => group.platform === form.platform)
 })
 const isOAuthFlow = computed(() => form.category === 'oauth-based')
 const showAPICredential = computed(() => form.category === 'apikey' || form.category === 'upstream')
@@ -831,6 +857,7 @@ function normalizeCategoryForPlatform(platform: PlatformOption, category: Accoun
 }
 
 function selectPlatform(platform: PlatformOption) {
+  if (form.platform !== platform) resetOAuthAssistantState()
   form.platform = platform
   form.category = normalizeCategoryForPlatform(platform, form.category)
   if (form.model_mode === 'whitelist') syncPlatformModels()
@@ -838,6 +865,7 @@ function selectPlatform(platform: PlatformOption) {
 }
 
 function selectCategory(category: AccountCategory) {
+  if (form.category !== category) resetOAuthAssistantState()
   form.category = category
   inferSimpleType()
 }
@@ -1134,53 +1162,65 @@ watch(authCodeInput, (newVal: string) => {
 
 async function handleGenerateAuthLink() {
   try {
-    const state = randomOAuthToken(24)
-    const codeVerifier = randomOAuthToken(32)
-    const codeChallenge = await buildCodeChallenge(codeVerifier)
     const params = new URLSearchParams()
 
     if (form.platform === 'openai') {
-      params.set('response_type', 'code')
+      const state = randomOAuthHexToken(32)
+      const codeVerifier = randomOAuthHexToken(64)
+      const codeChallenge = await buildCodeChallenge(codeVerifier)
       params.set('client_id', OPENAI_CODEX_CLIENT_ID)
-      params.set('redirect_uri', OAUTH_CALLBACK_URL)
-      params.set('scope', 'openid profile email offline_access')
-      params.set('state', state)
       params.set('code_challenge', codeChallenge)
       params.set('code_challenge_method', 'S256')
-      params.set('id_token_add_organizations', 'true')
       params.set('codex_cli_simplified_flow', 'true')
+      params.set('id_token_add_organizations', 'true')
+      params.set('redirect_uri', OAUTH_CALLBACK_URL)
+      params.set('response_type', 'code')
+      params.set('scope', 'openid profile email offline_access')
+      params.set('state', state)
       computedAuthUrl.value = `https://auth.openai.com/oauth/authorize?${params.toString()}`
+    } else if (form.platform === 'anthropic') {
+      const state = randomOAuthToken(32)
+      const codeVerifier = randomOAuthToken(32)
+      const codeChallenge = await buildCodeChallenge(codeVerifier)
+      const scope = form.add_method === 'setup-token' ? CLAUDE_SETUP_TOKEN_SCOPE : CLAUDE_OAUTH_SCOPE
+      computedAuthUrl.value = buildClaudeAuthorizationURL(state, codeChallenge, scope)
     } else if (form.platform === 'gemini') {
+      const state = randomOAuthToken(32)
+      const codeVerifier = randomOAuthToken(32)
+      const codeChallenge = await buildCodeChallenge(codeVerifier)
       const isAIStudio = form.gemini_oauth_type === 'ai_studio'
       const redirectUri = isAIStudio ? OAUTH_CALLBACK_URL : GEMINI_CODE_ASSIST_CALLBACK_URL
       const scope = isAIStudio
         ? 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/generative-language.retriever'
         : 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile'
-      params.set('response_type', 'code')
+      params.set('access_type', 'offline')
       params.set('client_id', GEMINI_CLI_CLIENT_ID)
-      params.set('redirect_uri', redirectUri)
-      params.set('scope', scope)
-      params.set('state', state)
       params.set('code_challenge', codeChallenge)
       params.set('code_challenge_method', 'S256')
-      params.set('access_type', 'offline')
-      params.set('prompt', 'consent')
       params.set('include_granted_scopes', 'true')
+      params.set('prompt', 'consent')
+      params.set('redirect_uri', redirectUri)
+      params.set('response_type', 'code')
+      params.set('scope', scope)
+      params.set('state', state)
       if (form.gemini_oauth_type === 'code_assist' && form.vertex_project_id.trim()) {
         params.set('project_id', form.vertex_project_id.trim())
       }
       computedAuthUrl.value = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
     } else if (form.platform === 'antigravity') {
+      const state = randomOAuthToken(32)
+      const codeVerifier = randomOAuthToken(32)
+      const codeChallenge = await buildCodeChallenge(codeVerifier)
+      params.set('access_type', 'offline')
       params.set('client_id', ANTIGRAVITY_CLIENT_ID)
+      params.set('code_challenge', codeChallenge)
+      params.set('code_challenge_method', 'S256')
+      params.set('include_granted_scopes', 'true')
+      params.set('prompt', 'consent')
       params.set('redirect_uri', ANTIGRAVITY_CALLBACK_URL)
       params.set('response_type', 'code')
       params.set('scope', 'https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs')
       params.set('state', state)
-      params.set('code_challenge', codeChallenge)
-      params.set('code_challenge_method', 'S256')
-      params.set('access_type', 'offline')
-      params.set('prompt', 'consent')
-      params.set('include_granted_scopes', 'true')
       computedAuthUrl.value = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
     }
     error.value = ''
@@ -1219,6 +1259,7 @@ function handlePrimaryAccountAction() {
 
 function goBackToAccountSetup() {
   editorStep.value = 1
+  resetOAuthAssistantState()
 }
 
 

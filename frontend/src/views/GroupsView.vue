@@ -32,7 +32,7 @@ const editorMode = ref<'create' | 'edit'>('create')
 const form = reactive({
   id: '',
   name: '',
-  platform: 'mixed' as GroupConfig['platform'],
+  platform: 'openai' as GroupConfig['platform'],
   description: '',
   status: 'active' as GroupConfig['status'],
   account_ids: [] as string[],
@@ -55,7 +55,7 @@ const rows = computed<GroupRow[]>(() =>
     return {
       id: group.id,
       name: group.name || group.id,
-      platform: group.platform || 'mixed',
+      platform: group.platform || 'openai',
       status: group.status || 'active',
       accountCount: summary.account_count || group.account_ids?.length || 0,
       accounts: group.account_ids || [],
@@ -87,7 +87,7 @@ async function loadAll() {
 function resetForm() {
   form.id = ''
   form.name = ''
-  form.platform = 'mixed'
+  form.platform = 'openai'
   form.description = ''
   form.status = 'active'
   form.account_ids = []
@@ -130,6 +130,32 @@ function accountPlatform(account: AccountConfig) {
   if (platform === 'anthropic') return 'Claude'
   if (platform) return platform
   return account.type || 'unknown'
+}
+
+function accountPlatformValue(account: AccountConfig) {
+  const platform = String(account.metadata?.platform || '')
+  if (platform) return platform
+  if ((account.type || '').startsWith('openai')) return 'openai'
+  if ((account.type || '').startsWith('anthropic')) return 'anthropic'
+  if ((account.type || '').startsWith('gemini')) return 'gemini'
+  return ''
+}
+
+const accountsForSelectedPlatform = computed(() => accounts.value.filter((account) => accountPlatformValue(account) === form.platform))
+
+function groupAccentClass(platform: string) {
+  if (platform === 'anthropic') return 'ring-orange-400/50 dark:ring-orange-500/40 border-orange-300 dark:border-orange-700'
+  if (platform === 'gemini' || platform === 'antigravity') return 'ring-purple-400/50 dark:ring-purple-500/40 border-purple-300 dark:border-purple-700'
+  return 'ring-emerald-400/50 dark:ring-emerald-500/40 border-emerald-300 dark:border-emerald-700'
+}
+
+function groupRowClass(row: GroupRow) {
+  const accent = groupAccentClass(row.platform)
+  return [
+    'border-l-4 bg-white/70 dark:bg-dark-800/70',
+    accent,
+    'md:shadow-[0_0_0_1px_rgba(255,255,255,0.03)_inset]'
+  ].join(' ')
 }
 
 function splitList(value: string) {
@@ -194,7 +220,8 @@ onMounted(() => {
           <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
             <div>
               <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Group Management</h2>
-              <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">Manage API key groups. Groups bind gateway keys to OpenAI, Claude, Gemini, or Antigravity account pools without billing rate logic.</p>
+              <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">Manage API key groups. Each group is a single-subscription-family package for OpenAI, Claude, Gemini, or Antigravity account pools without billing rate logic.</p>
+              <p class="mt-1 text-xs text-amber-600 dark:text-amber-300">Do not mix subscription families in one group: OpenAI groups can only contain OpenAI accounts, Claude groups can only contain Claude accounts, and so on.</p>
             </div>
             <button class="btn btn-primary" type="button" @click="openCreate">Create Group</button>
           </div>
@@ -216,7 +243,7 @@ onMounted(() => {
       <p v-if="error" class="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">{{ error }}</p>
 
       <section class="card">
-        <DataTable :columns="columns" :rows="filteredRows" empty-text="No groups match the current filter.">
+        <DataTable :columns="columns" :rows="filteredRows" empty-text="No groups match the current filter." :row-class="groupRowClass">
           <template #cell-name="{ row }">
             <div class="space-y-1">
               <p class="font-semibold text-gray-950 dark:text-white">{{ row.name }}</p>
@@ -247,7 +274,7 @@ onMounted(() => {
           <div class="flex items-center justify-between gap-3">
             <div>
               <h2 class="text-lg font-black">{{ editorMode === 'create' ? 'Create Group' : 'Edit Group' }}</h2>
-              <p class="text-xs text-gray-500 dark:text-gray-400">Groups define which upstream account pool an API key can use. Rate multipliers are intentionally omitted.</p>
+              <p class="text-xs text-gray-500 dark:text-gray-400">Groups define which upstream account pool an API key can use. A group must stay within one subscription family to avoid cross-client forwarding risk.</p>
             </div>
             <button class="btn btn-secondary" type="button" @click="editorOpen = false">Close</button>
           </div>
@@ -258,7 +285,6 @@ onMounted(() => {
             <div class="grid gap-3 sm:grid-cols-2">
               <label class="grid gap-1 text-sm font-semibold">Platform
                 <select v-model="form.platform" class="input">
-                  <option value="mixed">Mixed</option>
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Claude</option>
                   <option value="gemini">Gemini</option>
@@ -280,13 +306,14 @@ onMounted(() => {
                 <span class="badge badge-primary">{{ form.account_ids.length }} selected</span>
               </div>
               <div class="grid gap-2 sm:grid-cols-2">
-                <label v-for="account in accounts" :key="account.id" :class="['rounded-xl border-2 p-3 transition', form.account_ids.includes(account.id) ? 'border-primary-500 bg-primary-50 dark:bg-primary-950/30' : 'border-gray-200 dark:border-dark-700']">
+                <label v-for="account in accountsForSelectedPlatform" :key="account.id" :class="['rounded-xl border-2 p-3 transition', form.account_ids.includes(account.id) ? 'border-primary-500 bg-primary-50 dark:bg-primary-950/30' : 'border-gray-200 dark:border-dark-700']">
                   <input :checked="form.account_ids.includes(account.id)" type="checkbox" class="mr-2" @change="toggleAccount(account.id)" />
                   <span class="font-semibold">{{ accountLabel(account) }}</span>
                   <span class="ml-2 text-xs text-gray-500 dark:text-gray-400">{{ accountPlatform(account) }} · {{ account.id }}</span>
                 </label>
               </div>
               <p v-if="accounts.length === 0" class="text-sm text-gray-500 dark:text-gray-400">Create accounts first, then return here to assign them into routing groups.</p>
+              <p v-else-if="accountsForSelectedPlatform.length === 0" class="text-sm text-gray-500 dark:text-gray-400">No {{ form.platform }} accounts are available. Switch platform or create matching accounts first.</p>
             </section>
           </div>
           <div class="mt-4 flex flex-wrap justify-end gap-2">

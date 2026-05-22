@@ -59,6 +59,7 @@ type GatewayKey struct {
 	ID            string           `json:"id"`
 	Name          string           `json:"name"`
 	KeyHash       string           `json:"key_hash"`
+	KeyValue      string           `json:"key_value,omitempty"`
 	Preview       string           `json:"preview"`
 	Status        string           `json:"status"`
 	RoutingPolicy KeyRoutingPolicy `json:"routing_policy"`
@@ -225,7 +226,7 @@ func DefaultConfig() Config {
 		},
 		Dashboard: DashboardConfig{SessionTTLSeconds: 8 * 60 * 60},
 		Groups: []Group{
-			{ID: "default1x0", Name: "default1x0", Platform: "mixed", Description: "Default local routing group", Status: "active", CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"},
+			defaultOpenAIGroup(),
 		},
 		Quota: QuotaConfig{
 			WarnThreshold:   0.80,
@@ -244,6 +245,10 @@ func DefaultConfig() Config {
 		Metrics:        MetricsConfig{RecentErrorsLimit: 100},
 		UpstreamCompat: UpstreamCompatConfig{Enabled: true, ManifestPath: "internal/upstreamcompat/SYNC_MANIFEST.md"},
 	}
+}
+
+func defaultOpenAIGroup() Group {
+	return Group{ID: "openai", Name: "openai", Platform: "openai", Description: "Default OpenAI routing group", Status: "active", CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"}
 }
 
 func Open(path string) (*Store, bool, error) {
@@ -492,6 +497,9 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 	if cfg.Groups == nil {
 		cfg.Groups = DefaultConfig().Groups
 	}
+	if !hasGroupID(cfg.Groups, "openai") {
+		cfg.Groups = append([]Group{defaultOpenAIGroup()}, cfg.Groups...)
+	}
 	if cfg.Probe.TimeoutSeconds <= 0 {
 		cfg.Probe.TimeoutSeconds = 15
 	}
@@ -511,6 +519,15 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 		cfg.Proxies[i].URL = NormalizeProxyURL(cfg.Proxies[i].URL)
 	}
 	return nil
+}
+
+func hasGroupID(groups []Group, id string) bool {
+	for _, group := range groups {
+		if group.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func Validate(cfg Config) error {
@@ -605,6 +622,9 @@ func DecodeStrict(r io.Reader, cfg *Config) error {
 func Redacted(cfg Config) Config {
 	cfg.GatewayAuth.GatewayKey = maskSecret(cfg.GatewayAuth.GatewayKey)
 	cfg.GatewayKeys = cloneGatewayKeys(cfg.GatewayKeys)
+	for i := range cfg.GatewayKeys {
+		cfg.GatewayKeys[i].KeyValue = ""
+	}
 	if cfg.Dashboard.AdminPassword != "" {
 		cfg.Dashboard.AdminPassword = "configured"
 	}
@@ -718,6 +738,9 @@ func validateGatewayKeys(keys []GatewayKey, cfg Config) error {
 		if !strings.HasPrefix(key.KeyHash, "sha256:") || len(key.KeyHash) != len("sha256:")+64 {
 			return fmt.Errorf("gateway key %q key_hash must use sha256 hex format", key.ID)
 		}
+		if strings.TrimSpace(key.KeyValue) != "" && key.KeyHash != HashGatewayKey(key.KeyValue) {
+			return fmt.Errorf("gateway key %q key_value does not match key_hash", key.ID)
+		}
 		if strings.TrimSpace(key.Preview) == "" {
 			return fmt.Errorf("gateway key %q preview is required", key.ID)
 		}
@@ -747,9 +770,9 @@ func validateGatewayKeys(keys []GatewayKey, cfg Config) error {
 
 func validateGroups(groups []Group, cfg Config) error {
 	seen := map[string]bool{}
-	accountIDs := map[string]bool{}
+	accountsByID := map[string]Account{}
 	for _, account := range cfg.Accounts {
-		accountIDs[account.ID] = true
+		accountsByID[account.ID] = account
 	}
 	for _, group := range groups {
 		if err := validateID("groups.id", group.ID); err != nil {
@@ -762,7 +785,7 @@ func validateGroups(groups []Group, cfg Config) error {
 		if strings.TrimSpace(group.Name) == "" {
 			return fmt.Errorf("group %q name is required", group.ID)
 		}
-		if !oneOf(group.Platform, "mixed", "openai", "anthropic", "gemini", "antigravity") {
+		if !oneOf(group.Platform, "openai", "anthropic", "gemini", "antigravity") {
 			return fmt.Errorf("group %q platform is invalid", group.ID)
 		}
 		if group.Status != "active" && group.Status != "disabled" {
@@ -772,12 +795,38 @@ func validateGroups(groups []Group, cfg Config) error {
 			return fmt.Errorf("group %q timestamps are required", group.ID)
 		}
 		for _, accountID := range group.AccountIDs {
-			if !accountIDs[accountID] {
+			account, ok := accountsByID[accountID]
+			if !ok {
 				return fmt.Errorf("group %q references unknown account %q", group.ID, accountID)
+			}
+			accountPlatform := AccountPlatform(account)
+			if accountPlatform == "" {
+				return fmt.Errorf("group %q account %q platform is required", group.ID, accountID)
+			}
+			if accountPlatform != group.Platform {
+				return fmt.Errorf("group %q platform %q cannot include %q account %q", group.ID, group.Platform, accountPlatform, accountID)
 			}
 		}
 	}
 	return nil
+}
+
+func AccountPlatform(account Account) string {
+	if account.Metadata != nil {
+		if value, ok := account.Metadata["platform"].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	typ := strings.TrimSpace(account.Type)
+	switch {
+	case strings.HasPrefix(typ, "openai"):
+		return "openai"
+	case strings.HasPrefix(typ, "anthropic"):
+		return "anthropic"
+	case strings.HasPrefix(typ, "gemini"):
+		return "gemini"
+	}
+	return ""
 }
 
 func validateProxies(proxies []ProxyConfig) error {

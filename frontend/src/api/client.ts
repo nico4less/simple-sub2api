@@ -36,6 +36,7 @@ export interface GatewayKey {
   id: string
   name: string
   key_hash?: string
+  key_value?: string
   preview: string
   status: 'enabled' | 'disabled'
   routing_policy: KeyRoutingPolicy
@@ -77,7 +78,7 @@ export interface AccountConfig {
 export interface GroupConfig {
   id: string
   name: string
-  platform: 'mixed' | 'openai' | 'anthropic' | 'gemini' | 'antigravity'
+  platform: 'openai' | 'anthropic' | 'gemini' | 'antigravity'
   description?: string
   status: 'active' | 'disabled'
   tags?: string[]

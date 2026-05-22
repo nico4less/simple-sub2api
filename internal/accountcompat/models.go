@@ -224,6 +224,7 @@ func PreparePayload(payload DataPayload, existing config.Config, sourceLabel str
 			Tier:       tier,
 			Tags:       append([]string(nil), tags...),
 			Credential: credential,
+			Metadata:   map[string]any{"platform": item.Platform, "account_category": item.Type},
 			ProxyRef:   proxyRef,
 			Enabled:    true,
 		}

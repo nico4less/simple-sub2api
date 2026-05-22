@@ -89,6 +89,7 @@ func TestE003GatewayKeysCRUDRotateAndAuth(t *testing.T) {
 		ConfigVersion int    `json:"config_version"`
 		KeyValue      string `json:"key_value"`
 		Key           struct {
+			KeyValue string `json:"key_value"`
 			KeyHash string `json:"key_hash"`
 			Preview string `json:"preview"`
 		} `json:"key"`
@@ -96,11 +97,31 @@ func TestE003GatewayKeysCRUDRotateAndAuth(t *testing.T) {
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
 		t.Fatalf("decode created key: %v", err)
 	}
-	if created.KeyValue != "s2a_client-test-key-value-000000" || created.Key.KeyHash != "configured" || created.Key.Preview == "" {
+	if created.KeyValue != "s2a_client-test-key-value-000000" || created.Key.KeyValue != "" || created.Key.KeyHash != "configured" || created.Key.Preview == "" {
 		t.Fatalf("created response = %#v", created)
 	}
 	if got := store.Snapshot().GatewayKeys[1].KeyHash; strings.Contains(got, created.KeyValue) || !strings.HasPrefix(got, "sha256:") {
 		t.Fatalf("stored key hash unsafe: %q", got)
+	}
+	if got := store.Snapshot().GatewayKeys[1].KeyValue; got != created.KeyValue {
+		t.Fatalf("stored key plaintext should remain available for dashboard copy: %q", got)
+	}
+	keysResp := doRequest(t, http.MethodGet, srv.URL+"/api/keys", map[string]string{"Cookie": cookie.String()}, nil)
+	if keysResp.StatusCode != http.StatusOK {
+		t.Fatalf("keys status = %d", keysResp.StatusCode)
+	}
+	var listed struct {
+		Keys []struct {
+			ID       string `json:"id"`
+			KeyValue string `json:"key_value"`
+			KeyHash  string `json:"key_hash"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(keysResp.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode keys: %v", err)
+	}
+	if len(listed.Keys) != 2 || listed.Keys[1].ID != "client_key" || listed.Keys[1].KeyValue != created.KeyValue || listed.Keys[1].KeyHash != "configured" {
+		t.Fatalf("created key list response missing persistent copyable material or redaction: %#v", listed.Keys)
 	}
 
 	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
@@ -154,6 +175,25 @@ func TestE003DefaultGatewayKeyAuthoritativeAndRevealClosed(t *testing.T) {
 	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer " + legacyKey}, nil, http.StatusOK)
 	assertStatus(t, http.MethodGet, srv.URL+"/api/admin/gateway-key", map[string]string{"Cookie": cookie.String()}, nil, http.StatusGone)
 	assertStatus(t, http.MethodPost, srv.URL+"/api/keys/default/reveal", map[string]string{"Cookie": cookie.String()}, nil, http.StatusGone)
+
+	keysResp := doRequest(t, http.MethodGet, srv.URL+"/api/keys", map[string]string{"Cookie": cookie.String()}, nil)
+	if keysResp.StatusCode != http.StatusOK {
+		t.Fatalf("keys status = %d", keysResp.StatusCode)
+	}
+	var listed struct {
+		Keys []struct {
+			ID       string `json:"id"`
+			KeyHash  string `json:"key_hash"`
+			KeyValue string `json:"key_value"`
+			Preview  string `json:"preview"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(keysResp.Body).Decode(&listed); err != nil {
+		t.Fatalf("decode keys: %v", err)
+	}
+	if len(listed.Keys) != 1 || listed.Keys[0].ID != "default" || listed.Keys[0].KeyValue != legacyKey || listed.Keys[0].KeyHash != "configured" || listed.Keys[0].Preview == "" {
+		t.Fatalf("default key response missing copyable material or redaction: %#v", listed.Keys)
+	}
 
 	disableBody := []byte(`{"config_version":1,"key":{"id":"default","name":"Default Gateway Key","status":"disabled","routing_policy":{"mode":"all_enabled"},"preview":"ignored","created_at":"ignored","updated_at":"ignored"}}`)
 	assertStatus(t, http.MethodPut, srv.URL+"/api/keys/default", map[string]string{"Cookie": cookie.String()}, disableBody, http.StatusOK)

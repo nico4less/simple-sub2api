@@ -370,6 +370,7 @@ func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 			key.RoutingPolicy.Mode = "all_enabled"
 		}
 		key.KeyHash = config.HashGatewayKey(plaintext)
+		key.KeyValue = plaintext
 		key.Preview = config.KeyPreview(plaintext)
 		key.CreatedAt = now
 		key.UpdatedAt = now
@@ -427,6 +428,7 @@ func (s *Server) keyByID(w http.ResponseWriter, r *http.Request) {
 				}
 				candidate := req.GatewayKey
 				candidate.KeyHash = current.KeyHash
+				candidate.KeyValue = current.KeyValue
 				candidate.Preview = current.Preview
 				candidate.CreatedAt = current.CreatedAt
 				candidate.LastUsedAt = current.LastUsedAt
@@ -571,6 +573,7 @@ func (s *Server) rotateKeyByID(w http.ResponseWriter, r *http.Request, id string
 			}
 			rotated = current
 			rotated.KeyHash = config.HashGatewayKey(plaintext)
+			rotated.KeyValue = plaintext
 			rotated.Preview = config.KeyPreview(plaintext)
 			rotated.UpdatedAt = now
 			rotated.LastUsedAt = ""
@@ -1401,10 +1404,17 @@ func (s *Server) accountsResponse() accountsResponse {
 }
 
 func (s *Server) keysResponse() keysResponse {
-	cfg := config.Redacted(s.store.Snapshot())
+	snapshot := s.store.Snapshot()
+	cfg := config.Redacted(snapshot)
 	keys := make([]config.GatewayKey, 0, len(cfg.GatewayKeys))
-	for _, key := range cfg.GatewayKeys {
-		keys = append(keys, redactedGatewayKey(key))
+	for _, key := range snapshot.GatewayKeys {
+		redacted := redactedGatewayKey(key)
+		if strings.TrimSpace(key.KeyValue) != "" && key.KeyHash == config.HashGatewayKey(key.KeyValue) {
+			redacted.KeyValue = key.KeyValue
+		} else if key.ID == "default" && keyMatchesGatewayAuth(snapshot, key) {
+			redacted.KeyValue = snapshot.GatewayAuth.GatewayKey
+		}
+		keys = append(keys, redacted)
 	}
 	return keysResponse{ConfigVersion: cfg.ConfigVersion, Keys: keys, Accounts: cfg.Accounts, Groups: cfg.Groups}
 }
@@ -1576,7 +1586,16 @@ func groupExists(groups []config.Group, id string) bool {
 
 func redactedGatewayKey(key config.GatewayKey) config.GatewayKey {
 	key.KeyHash = "configured"
+	key.KeyValue = ""
 	return key
+}
+
+func keyMatchesGatewayAuth(cfg config.Config, key config.GatewayKey) bool {
+	plaintext := strings.TrimSpace(cfg.GatewayAuth.GatewayKey)
+	if plaintext == "" || strings.TrimSpace(key.KeyHash) == "" {
+		return false
+	}
+	return key.KeyHash == config.HashGatewayKey(plaintext) && key.Preview == config.KeyPreview(plaintext)
 }
 
 func gatewayKeyIDFromName(name string, now string) string {
