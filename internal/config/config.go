@@ -25,6 +25,7 @@ const DefaultPath = "simple_sub2api.config.json"
 var (
 	ErrConfigVersionConflict = errors.New("config_version conflict")
 	idPattern                = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$`)
+	tunnelTokenPattern       = regexp.MustCompile(`^[A-Za-z0-9._=-]+$`)
 )
 
 type Config struct {
@@ -43,6 +44,7 @@ type Config struct {
 	Probe               ProbeConfig          `json:"probe"`
 	Metrics             MetricsConfig        `json:"metrics"`
 	UpstreamCompat      UpstreamCompatConfig `json:"upstreamcompat"`
+	Tunnel              TunnelConfig         `json:"tunnel,omitempty"`
 }
 
 type ServerConfig struct {
@@ -78,15 +80,27 @@ type KeyRoutingPolicy struct {
 }
 
 type Group struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Platform    string   `json:"platform"`
-	Description string   `json:"description,omitempty"`
-	Status      string   `json:"status"`
-	Tags        []string `json:"tags,omitempty"`
-	AccountIDs  []string `json:"account_ids,omitempty"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
+	ID             string              `json:"id"`
+	Name           string              `json:"name"`
+	Platform       string              `json:"platform"`
+	Description    string              `json:"description,omitempty"`
+	Status         string              `json:"status"`
+	Tags           []string            `json:"tags,omitempty"`
+	AccountIDs     []string            `json:"account_ids,omitempty"`
+	CreatedAt      string              `json:"created_at"`
+	UpdatedAt      string              `json:"updated_at"`
+	RotationPolicy GroupRotationPolicy `json:"rotation_policy,omitempty"`
+}
+
+type GroupRotationPolicy struct {
+	Strategy                 string  `json:"strategy"`
+	StickySessionsEnabled    bool    `json:"sticky_sessions_enabled"`
+	StickyHeader             string  `json:"sticky_header,omitempty"`
+	RetryOnErrors            bool    `json:"retry_on_errors"`
+	RotateErrorCodes         []int   `json:"rotate_error_codes,omitempty"`
+	CooldownDurationSeconds  int     `json:"cooldown_duration_seconds,omitempty"`
+	EnableQuotaProtection    bool    `json:"enable_quota_protection"`
+	MinQuotaThresholdPercent float64 `json:"min_quota_threshold_percent,omitempty"`
 }
 
 type GatewayKeyMatch struct {
@@ -190,6 +204,14 @@ type MetricsConfig struct {
 	RecentErrorsLimit int `json:"recent_errors_limit"`
 }
 
+type TunnelConfig struct {
+	Enabled       bool   `json:"enabled"`
+	Mode          string `json:"mode"`
+	BinaryPath    string `json:"binary_path,omitempty"`
+	Token         string `json:"token,omitempty"`
+	LogLimitLines int    `json:"log_limit_lines,omitempty"`
+}
+
 type UpstreamCompatConfig struct {
 	Enabled      bool   `json:"enabled"`
 	ManifestPath string `json:"manifest_path"`
@@ -244,6 +266,7 @@ func DefaultConfig() Config {
 		Probe:          ProbeConfig{TimeoutSeconds: 15, Model: "gpt-4o-mini", SavePolicy: "save_disabled_on_error"},
 		Metrics:        MetricsConfig{RecentErrorsLimit: 100},
 		UpstreamCompat: UpstreamCompatConfig{Enabled: true, ManifestPath: "internal/upstreamcompat/SYNC_MANIFEST.md"},
+		Tunnel:         TunnelConfig{Mode: "quick", LogLimitLines: 100},
 	}
 }
 
@@ -361,6 +384,40 @@ func (s *Store) TouchGatewayKeyLastUsed(id string, usedAt string) error {
 		return nil
 	}
 	return nil
+}
+
+func (s *Store) DisableAccount(accountID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(accountID) == "" {
+		return false, nil
+	}
+	if err := s.reloadLocked(); err != nil {
+		return false, err
+	}
+	candidate := cloneConfig(s.cfg)
+	for i := range candidate.Accounts {
+		if candidate.Accounts[i].ID != accountID {
+			continue
+		}
+		if !candidate.Accounts[i].Enabled {
+			return false, nil
+		}
+		candidate.Accounts[i].Enabled = false
+		candidate.ConfigVersion = s.cfg.ConfigVersion + 1
+		if err := EnsureDefaultsAndSecrets(&candidate); err != nil {
+			return false, err
+		}
+		if err := Validate(candidate); err != nil {
+			return false, err
+		}
+		if err := s.saveConfigLocked(candidate); err != nil {
+			return false, err
+		}
+		s.cfg = candidate
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *Store) ApplyOverrides(overrides RuntimeOverrides) error {
@@ -500,6 +557,9 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 	if !hasGroupID(cfg.Groups, "openai") {
 		cfg.Groups = append([]Group{defaultOpenAIGroup()}, cfg.Groups...)
 	}
+	for i := range cfg.Groups {
+		ensureGroupRotationDefaults(&cfg.Groups[i].RotationPolicy)
+	}
 	if cfg.Probe.TimeoutSeconds <= 0 {
 		cfg.Probe.TimeoutSeconds = 15
 	}
@@ -512,6 +572,7 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 	if cfg.Metrics.RecentErrorsLimit <= 0 {
 		cfg.Metrics.RecentErrorsLimit = 100
 	}
+	ensureTunnelDefaults(&cfg.Tunnel)
 	if strings.TrimSpace(cfg.UpstreamCompat.ManifestPath) == "" {
 		cfg.UpstreamCompat.ManifestPath = "internal/upstreamcompat/SYNC_MANIFEST.md"
 	}
@@ -528,6 +589,36 @@ func hasGroupID(groups []Group, id string) bool {
 		}
 	}
 	return false
+}
+
+func ensureGroupRotationDefaults(policy *GroupRotationPolicy) {
+	if strings.TrimSpace(policy.Strategy) == "" {
+		policy.Strategy = "polling"
+	}
+	if strings.TrimSpace(policy.StickyHeader) == "" {
+		policy.StickyHeader = "X-Session-ID"
+	}
+	if len(policy.RotateErrorCodes) == 0 {
+		policy.RotateErrorCodes = []int{429, 401, 403, 404, 500}
+	}
+	if policy.CooldownDurationSeconds == 0 {
+		policy.CooldownDurationSeconds = 60
+	}
+	if policy.MinQuotaThresholdPercent == 0 {
+		policy.MinQuotaThresholdPercent = 0.10
+	}
+}
+
+func ensureTunnelDefaults(tunnel *TunnelConfig) {
+	tunnel.Mode = strings.TrimSpace(tunnel.Mode)
+	if tunnel.Mode == "" {
+		tunnel.Mode = "quick"
+	}
+	tunnel.BinaryPath = strings.TrimSpace(tunnel.BinaryPath)
+	tunnel.Token = strings.TrimSpace(tunnel.Token)
+	if tunnel.LogLimitLines == 0 {
+		tunnel.LogLimitLines = 100
+	}
 }
 
 func Validate(cfg Config) error {
@@ -604,6 +695,9 @@ func Validate(cfg Config) error {
 	if cfg.Metrics.RecentErrorsLimit < 1 || cfg.Metrics.RecentErrorsLimit > 1000 {
 		return errors.New("metrics.recent_errors_limit must be in range 1..1000")
 	}
+	if err := validateTunnel(cfg.Tunnel); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -637,7 +731,26 @@ func Redacted(cfg Config) Config {
 	for i := range cfg.Accounts {
 		cfg.Accounts[i].Credential = maskSecret(cfg.Accounts[i].Credential)
 	}
+	cfg.Tunnel.Token = maskSecret(cfg.Tunnel.Token)
 	return cfg
+}
+
+func validateTunnel(tunnel TunnelConfig) error {
+	if !oneOf(tunnel.Mode, "quick", "named") {
+		return errors.New("tunnel.mode must be quick or named")
+	}
+	if tunnel.LogLimitLines < 10 || tunnel.LogLimitLines > 1000 {
+		return errors.New("tunnel.log_limit_lines must be in range 10..1000")
+	}
+	if tunnel.Token != "" {
+		if len(tunnel.Token) < 32 || len(tunnel.Token) > 4096 || !tunnelTokenPattern.MatchString(tunnel.Token) {
+			return errors.New("tunnel.token must be a valid Cloudflare tunnel token")
+		}
+	}
+	if tunnel.Enabled && tunnel.Mode == "named" && tunnel.Token == "" {
+		return errors.New("tunnel.token is required when tunnel.enabled=true and tunnel.mode=named")
+	}
+	return nil
 }
 
 func NormalizeProxyURL(raw string) string {
@@ -794,6 +907,9 @@ func validateGroups(groups []Group, cfg Config) error {
 		if strings.TrimSpace(group.CreatedAt) == "" || strings.TrimSpace(group.UpdatedAt) == "" {
 			return fmt.Errorf("group %q timestamps are required", group.ID)
 		}
+		if err := validateGroupRotationPolicy(group.ID, group.RotationPolicy); err != nil {
+			return err
+		}
 		for _, accountID := range group.AccountIDs {
 			account, ok := accountsByID[accountID]
 			if !ok {
@@ -807,6 +923,32 @@ func validateGroups(groups []Group, cfg Config) error {
 				return fmt.Errorf("group %q platform %q cannot include %q account %q", group.ID, group.Platform, accountPlatform, accountID)
 			}
 		}
+	}
+	return nil
+}
+
+func validateGroupRotationPolicy(groupID string, policy GroupRotationPolicy) error {
+	if !oneOf(policy.Strategy, "polling", "least_connections", "p2c", "priority") {
+		return fmt.Errorf("group %q rotation_policy.strategy is invalid", groupID)
+	}
+	if strings.TrimSpace(policy.StickyHeader) == "" {
+		return fmt.Errorf("group %q rotation_policy.sticky_header is required", groupID)
+	}
+	if policy.CooldownDurationSeconds < 0 || policy.CooldownDurationSeconds > 86400 {
+		return fmt.Errorf("group %q rotation_policy.cooldown_duration_seconds must be in range 0..86400", groupID)
+	}
+	if policy.MinQuotaThresholdPercent < 0 || policy.MinQuotaThresholdPercent > 1 {
+		return fmt.Errorf("group %q rotation_policy.min_quota_threshold_percent must be in range 0..1", groupID)
+	}
+	seenCodes := map[int]bool{}
+	for _, code := range policy.RotateErrorCodes {
+		if code < 100 || code > 599 {
+			return fmt.Errorf("group %q rotation_policy.rotate_error_codes contains invalid HTTP status %d", groupID, code)
+		}
+		if seenCodes[code] {
+			return fmt.Errorf("group %q rotation_policy.rotate_error_codes contains duplicate HTTP status %d", groupID, code)
+		}
+		seenCodes[code] = true
 	}
 	return nil
 }
@@ -1023,6 +1165,7 @@ func cloneGroups(groups []Group) []Group {
 	for i := range out {
 		out[i].Tags = append([]string(nil), groups[i].Tags...)
 		out[i].AccountIDs = append([]string(nil), groups[i].AccountIDs...)
+		out[i].RotationPolicy.RotateErrorCodes = append([]int(nil), groups[i].RotationPolicy.RotateErrorCodes...)
 	}
 	return out
 }

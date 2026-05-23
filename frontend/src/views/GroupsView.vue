@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { createGroup, deleteGroup, loadGroups, updateGroup, type AccountConfig, type GroupConfig, type GroupSummary, type GroupsResponse } from '@/api/client'
 import AppShell from '@/components/AppShell.vue'
@@ -8,6 +9,8 @@ import Icon from '@/components/Icon.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import { useAdminState } from '@/composables/useAdminState'
 import type { Column } from '@/types/ui'
+
+const { t } = useI18n()
 
 interface GroupRow extends Record<string, unknown> {
   id: string
@@ -36,16 +39,24 @@ const form = reactive({
   description: '',
   status: 'active' as GroupConfig['status'],
   account_ids: [] as string[],
-  tags: ''
+  tags: '',
+  strategy: 'polling' as NonNullable<GroupConfig['rotation_policy']>['strategy'],
+  sticky_sessions_enabled: false,
+  sticky_header: 'X-Session-ID',
+  retry_on_errors: true,
+  rotate_error_codes: '429, 401, 403, 404, 500',
+  cooldown_duration_seconds: 60,
+  enable_quota_protection: false,
+  min_quota_threshold_percent: 10
 })
 
-const columns: Column<GroupRow>[] = [
-  { key: 'name', label: 'Name' },
-  { key: 'platform', label: 'Platform' },
-  { key: 'accounts', label: 'Accounts' },
-  { key: 'status', label: 'Status' },
-  { key: 'actions', label: 'Actions' }
-]
+const columns = computed<Column<GroupRow>[]>(() => [
+  { key: 'name', label: t('groups.columns.name') },
+  { key: 'platform', label: t('groups.columns.platform') },
+  { key: 'accounts', label: t('groups.columns.accounts') },
+  { key: 'status', label: t('common.status') },
+  { key: 'actions', label: t('common.actions') }
+])
 
 const accounts = computed(() => groupsState.value?.accounts || [])
 
@@ -92,6 +103,14 @@ function resetForm() {
   form.status = 'active'
   form.account_ids = []
   form.tags = ''
+  form.strategy = 'polling'
+  form.sticky_sessions_enabled = false
+  form.sticky_header = 'X-Session-ID'
+  form.retry_on_errors = true
+  form.rotate_error_codes = '429, 401, 403, 404, 500'
+  form.cooldown_duration_seconds = 60
+  form.enable_quota_protection = false
+  form.min_quota_threshold_percent = 10
 }
 
 function openCreate() {
@@ -110,6 +129,14 @@ function openEdit(row: GroupRow) {
   form.status = group.status
   form.account_ids = [...(group.account_ids || [])]
   form.tags = (group.tags || []).filter((tag) => tag !== group.id).join(', ')
+  form.strategy = group.rotation_policy?.strategy || 'polling'
+  form.sticky_sessions_enabled = group.rotation_policy?.sticky_sessions_enabled || false
+  form.sticky_header = group.rotation_policy?.sticky_header || 'X-Session-ID'
+  form.retry_on_errors = group.rotation_policy?.retry_on_errors ?? true
+  form.rotate_error_codes = (group.rotation_policy?.rotate_error_codes || [429, 401, 403, 404, 500]).join(', ')
+  form.cooldown_duration_seconds = group.rotation_policy?.cooldown_duration_seconds || 60
+  form.enable_quota_protection = group.rotation_policy?.enable_quota_protection || false
+  form.min_quota_threshold_percent = Math.round((group.rotation_policy?.min_quota_threshold_percent || 0.1) * 100)
   editorOpen.value = true
 }
 
@@ -162,6 +189,11 @@ function splitList(value: string) {
   return value.split(/[,\n]+/).map((item) => item.trim()).filter(Boolean)
 }
 
+function parseStatusCodes(value: string) {
+  const codes = value.split(/[,\n]+/).map((item) => Number(item.trim())).filter((code) => Number.isInteger(code) && code >= 100 && code <= 599)
+  return Array.from(new Set(codes))
+}
+
 function buildGroup(): GroupConfig {
   const tags = Array.from(new Set([form.id, ...splitList(form.tags)].filter(Boolean)))
   return {
@@ -172,6 +204,16 @@ function buildGroup(): GroupConfig {
     status: form.status,
     account_ids: [...form.account_ids],
     tags,
+    rotation_policy: {
+      strategy: form.strategy,
+      sticky_sessions_enabled: form.sticky_sessions_enabled,
+      sticky_header: form.sticky_header.trim() || 'X-Session-ID',
+      retry_on_errors: form.retry_on_errors,
+      rotate_error_codes: parseStatusCodes(form.rotate_error_codes),
+      cooldown_duration_seconds: Number(form.cooldown_duration_seconds) || 60,
+      enable_quota_protection: form.enable_quota_protection,
+      min_quota_threshold_percent: Math.max(0, Math.min(100, Number(form.min_quota_threshold_percent) || 10)) / 100
+    },
     created_at: '',
     updated_at: ''
   }
@@ -182,10 +224,10 @@ async function saveGroup() {
   const group = buildGroup()
   if (editorMode.value === 'create') {
     await createGroup(groupsState.value.config_version, group)
-    notice.value = `Created group ${group.name}.`
+    notice.value = t('groups.created', { name: group.name })
   } else {
     await updateGroup(groupsState.value.config_version, group)
-    notice.value = `Updated group ${group.name}.`
+    notice.value = t('groups.updated', { name: group.name })
   }
   editorOpen.value = false
   await loadAll()
@@ -196,14 +238,14 @@ async function toggleGroup(row: GroupRow) {
   const group = structuredClone(row.summary.config)
   group.status = group.status === 'active' ? 'disabled' : 'active'
   await updateGroup(groupsState.value.config_version, group)
-  notice.value = `${group.name} ${group.status}.`
+  notice.value = t('groups.statusChanged', { name: group.name, status: group.status })
   await loadAll()
 }
 
 async function removeGroup(row: GroupRow) {
   if (!groupsState.value) return
   await deleteGroup(groupsState.value.config_version, row.id)
-  notice.value = `Deleted group ${row.name}.`
+  notice.value = t('groups.deleted', { name: row.name })
   await loadAll()
 }
 
@@ -219,23 +261,23 @@ onMounted(() => {
         <article class="card lg:col-span-2">
           <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
             <div>
-              <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Group Management</h2>
-              <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">Manage API key groups. Each group is a single-subscription-family package for OpenAI, Claude, Gemini, or Antigravity account pools without billing rate logic.</p>
-              <p class="mt-1 text-xs text-amber-600 dark:text-amber-300">Do not mix subscription families in one group: OpenAI groups can only contain OpenAI accounts, Claude groups can only contain Claude accounts, and so on.</p>
+              <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('groups.title') }}</h2>
+              <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">{{ $t('groups.subtitle') }}</p>
+              <p class="mt-1 text-xs text-amber-600 dark:text-amber-300">{{ $t('groups.warning') }}</p>
             </div>
-            <button class="btn btn-primary" type="button" @click="openCreate">Create Group</button>
+            <button class="btn btn-primary" type="button" @click="openCreate">{{ $t('groups.createGroup') }}</button>
           </div>
         </article>
         <article class="card">
-          <p class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Active groups</p>
+          <p class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('groups.activeGroups') }}</p>
           <p class="mt-2 text-3xl font-black text-gray-950 dark:text-white">{{ rows.filter((row) => row.status === 'active').length }}</p>
         </article>
       </section>
 
       <section class="card">
         <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <input v-model="search" class="input sm:max-w-md" placeholder="Search groups, platform, status, or account ID" />
-          <button class="btn btn-secondary" type="button" :disabled="loading" @click="loadAll"><Icon name="refresh" /><span class="ml-2">Refresh</span></button>
+          <input v-model="search" class="input sm:max-w-md" :placeholder="$t('groups.searchPlaceholder')" />
+          <button class="btn btn-secondary" type="button" :disabled="loading" @click="loadAll"><Icon name="refresh" /><span class="ml-2">{{ $t('common.refresh') }}</span></button>
         </div>
       </section>
 
@@ -243,7 +285,7 @@ onMounted(() => {
       <p v-if="error" class="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">{{ error }}</p>
 
       <section class="card">
-        <DataTable :columns="columns" :rows="filteredRows" empty-text="No groups match the current filter." :row-class="groupRowClass">
+        <DataTable :columns="columns" :rows="filteredRows" :empty-text="$t('groups.noMatch')" :row-class="groupRowClass">
           <template #cell-name="{ row }">
             <div class="space-y-1">
               <p class="font-semibold text-gray-950 dark:text-white">{{ row.name }}</p>
@@ -254,16 +296,16 @@ onMounted(() => {
           <template #cell-platform="{ row }"><span class="badge badge-primary">{{ row.platform }}</span></template>
           <template #cell-accounts="{ row }">
             <div class="max-w-md space-y-1 text-xs">
-              <p>{{ row.accountCount }} linked accounts</p>
-              <p class="break-all text-gray-500 dark:text-gray-400">{{ row.accounts.join(', ') || 'none' }}</p>
+              <p>{{ $t('groups.linkedAccounts', { count: row.accountCount }) }}</p>
+              <p class="break-all text-gray-500 dark:text-gray-400">{{ row.accounts.join(', ') || $t('common.none') }}</p>
             </div>
           </template>
           <template #cell-status="{ row }"><StatusBadge :status="String(row.status)" /></template>
           <template #cell-actions="{ row }">
             <div class="flex flex-wrap gap-2">
-              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="openEdit(row)">Edit</button>
-              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="toggleGroup(row)">{{ row.status === 'active' ? 'Disable' : 'Enable' }}</button>
-              <button class="btn btn-danger px-3 py-1.5" type="button" @click="removeGroup(row)">Delete</button>
+              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="openEdit(row)">{{ $t('common.edit') }}</button>
+              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="toggleGroup(row)">{{ row.status === 'active' ? $t('common.disable') : $t('common.enable') }}</button>
+              <button class="btn btn-danger px-3 py-1.5" type="button" @click="removeGroup(row)">{{ $t('common.delete') }}</button>
             </div>
           </template>
         </DataTable>
@@ -273,17 +315,17 @@ onMounted(() => {
         <section class="card xforce-modal-panel max-h-[92vh] w-full max-w-4xl overflow-auto">
           <div class="flex items-center justify-between gap-3">
             <div>
-              <h2 class="text-lg font-black">{{ editorMode === 'create' ? 'Create Group' : 'Edit Group' }}</h2>
-              <p class="text-xs text-gray-500 dark:text-gray-400">Groups define which upstream account pool an API key can use. A group must stay within one subscription family to avoid cross-client forwarding risk.</p>
+              <h2 class="text-lg font-black">{{ editorMode === 'create' ? $t('groups.createGroup') : $t('groups.editGroup') }}</h2>
+              <p class="text-xs text-gray-500 dark:text-gray-400">{{ $t('groups.editorSubtitle') }}</p>
             </div>
-            <button class="btn btn-secondary" type="button" @click="editorOpen = false">Close</button>
+            <button class="btn btn-secondary" type="button" @click="editorOpen = false">{{ $t('common.close') }}</button>
           </div>
           <div class="mt-4 grid gap-4">
             <input v-model="form.id" type="hidden" />
-            <label class="grid gap-1 text-sm font-semibold">Name<input v-model="form.name" class="input" placeholder="OpenAI primary group" /></label>
-            <label class="grid gap-1 text-sm font-semibold">Description<textarea v-model="form.description" class="input min-h-20" placeholder="Optional local routing note" /></label>
+            <label class="grid gap-1 text-sm font-semibold">{{ $t('groups.columns.name') }}<input v-model="form.name" class="input" placeholder="OpenAI primary group" /></label>
+            <label class="grid gap-1 text-sm font-semibold">{{ $t('groups.description') }}<textarea v-model="form.description" class="input min-h-20" placeholder="Optional local routing note" /></label>
             <div class="grid gap-3 sm:grid-cols-2">
-              <label class="grid gap-1 text-sm font-semibold">Platform
+              <label class="grid gap-1 text-sm font-semibold">{{ $t('groups.platform') }}
                 <select v-model="form.platform" class="input">
                   <option value="openai">OpenAI</option>
                   <option value="anthropic">Claude</option>
@@ -291,19 +333,71 @@ onMounted(() => {
                   <option value="antigravity">Antigravity</option>
                 </select>
               </label>
-              <label class="grid gap-1 text-sm font-semibold">Status
+              <label class="grid gap-1 text-sm font-semibold">{{ $t('common.status') }}
                 <select v-model="form.status" class="input">
                   <option value="active">active</option>
                   <option value="disabled">disabled</option>
                 </select>
               </label>
             </div>
-            <label class="grid gap-1 text-sm font-semibold">Tags<input v-model="form.tags" class="input" placeholder="optional matching aliases" /></label>
+            <label class="grid gap-1 text-sm font-semibold">{{ $t('groups.tags') }}<input v-model="form.tags" class="input" placeholder="optional matching aliases" /></label>
+
+            <section class="rounded-2xl border border-primary-200/70 bg-primary-50/40 p-4 dark:border-primary-900/60 dark:bg-primary-950/20">
+              <div class="mb-3 flex items-center justify-between gap-3 border-b border-primary-200/50 pb-2 dark:border-primary-900/40">
+                <div class="flex items-center gap-2">
+                  <Icon name="refresh" />
+                  <h3 class="text-sm font-bold uppercase tracking-wider text-gray-700 dark:text-gray-300">{{ $t('groups.rotationTitle') }}</h3>
+                </div>
+                <span class="badge badge-primary">{{ $t('groups.groupPolicy') }}</span>
+              </div>
+              <div class="grid gap-4 sm:grid-cols-2">
+                <label class="grid gap-1 text-sm font-semibold">{{ $t('groups.rotationStrategy') }}
+                  <select v-model="form.strategy" class="input">
+                    <option value="polling">{{ $t('groups.roundRobin') }}</option>
+                    <option value="least_connections">{{ $t('groups.leastConnections') }}</option>
+                    <option value="p2c">P2C</option>
+                    <option value="priority">{{ $t('groups.priorityOrder') }}</option>
+                  </select>
+                  <span class="text-[10px] font-normal text-gray-500">{{ $t('groups.rotationHint') }}</span>
+                </label>
+                <label class="grid gap-1 text-sm font-semibold">{{ $t('groups.cooldownDuration') }}
+                  <input v-model="form.cooldown_duration_seconds" class="input" min="0" max="86400" type="number" />
+                  <span class="text-[10px] font-normal text-gray-500">{{ $t('groups.cooldownHint') }}</span>
+                </label>
+              </div>
+              <div class="mt-4 grid gap-4 border-t border-primary-200/50 pt-3 dark:border-primary-900/40">
+                <label class="flex items-center justify-between gap-4 text-sm font-semibold">
+                  <span><span class="block">{{ $t('groups.stickySession') }}</span><span class="block text-xs font-normal text-gray-500">{{ $t('groups.stickyHint') }}</span></span>
+                  <input v-model="form.sticky_sessions_enabled" type="checkbox" />
+                </label>
+                <label v-if="form.sticky_sessions_enabled" class="grid gap-1 border-l-2 border-primary-500/50 pl-4 text-sm font-semibold">{{ $t('groups.stickyHeader') }}
+                  <input v-model="form.sticky_header" class="input" placeholder="X-Session-ID" />
+                </label>
+              </div>
+              <div class="mt-4 grid gap-4 border-t border-primary-200/50 pt-3 dark:border-primary-900/40">
+                <label class="flex items-center justify-between gap-4 text-sm font-semibold">
+                  <span><span class="block">{{ $t('groups.failover') }}</span><span class="block text-xs font-normal text-gray-500">{{ $t('groups.failoverHint') }}</span></span>
+                  <input v-model="form.retry_on_errors" type="checkbox" />
+                </label>
+                <label v-if="form.retry_on_errors" class="grid gap-1 border-l-2 border-primary-500/50 pl-4 text-sm font-semibold">{{ $t('groups.rotateCodes') }}
+                  <input v-model="form.rotate_error_codes" class="input" placeholder="429, 401, 403, 404, 500" />
+                </label>
+              </div>
+              <div class="mt-4 grid gap-4 border-t border-primary-200/50 pt-3 dark:border-primary-900/40">
+                <label class="flex items-center justify-between gap-4 text-sm font-semibold">
+                  <span><span class="block">{{ $t('groups.quotaGuard') }}</span><span class="block text-xs font-normal text-gray-500">{{ $t('groups.quotaGuardHint') }}</span></span>
+                  <input v-model="form.enable_quota_protection" type="checkbox" />
+                </label>
+                <label v-if="form.enable_quota_protection" class="grid gap-1 border-l-2 border-primary-500/50 pl-4 text-sm font-semibold">{{ $t('groups.minQuota') }}
+                  <input v-model="form.min_quota_threshold_percent" class="input" min="0" max="100" type="number" />
+                </label>
+              </div>
+            </section>
 
             <section class="rounded-2xl border border-gray-200 p-4 dark:border-dark-700">
               <div class="mb-3 flex items-center justify-between gap-3">
-                <h3 class="text-sm font-bold uppercase tracking-wider text-gray-500 dark:text-gray-400">Accounts in this group</h3>
-                <span class="badge badge-primary">{{ form.account_ids.length }} selected</span>
+                <h3 class="text-sm font-bold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('groups.accountsInGroup') }}</h3>
+                <span class="badge badge-primary">{{ $t('groups.selected', { count: form.account_ids.length }) }}</span>
               </div>
               <div class="grid gap-2 sm:grid-cols-2">
                 <label v-for="account in accountsForSelectedPlatform" :key="account.id" :class="['rounded-xl border-2 p-3 transition', form.account_ids.includes(account.id) ? 'border-primary-500 bg-primary-50 dark:bg-primary-950/30' : 'border-gray-200 dark:border-dark-700']">
@@ -312,13 +406,13 @@ onMounted(() => {
                   <span class="ml-2 text-xs text-gray-500 dark:text-gray-400">{{ accountPlatform(account) }} · {{ account.id }}</span>
                 </label>
               </div>
-              <p v-if="accounts.length === 0" class="text-sm text-gray-500 dark:text-gray-400">Create accounts first, then return here to assign them into routing groups.</p>
-              <p v-else-if="accountsForSelectedPlatform.length === 0" class="text-sm text-gray-500 dark:text-gray-400">No {{ form.platform }} accounts are available. Switch platform or create matching accounts first.</p>
+              <p v-if="accounts.length === 0" class="text-sm text-gray-500 dark:text-gray-400">{{ $t('groups.createAccountsFirst') }}</p>
+              <p v-else-if="accountsForSelectedPlatform.length === 0" class="text-sm text-gray-500 dark:text-gray-400">{{ $t('groups.noPlatformAccounts', { platform: form.platform }) }}</p>
             </section>
           </div>
           <div class="mt-4 flex flex-wrap justify-end gap-2">
-            <button class="btn btn-secondary" type="button" @click="editorOpen = false">Cancel</button>
-            <button class="btn btn-primary" type="button" :disabled="!form.name.trim()" @click="saveGroup">Save Group</button>
+            <button class="btn btn-secondary" type="button" @click="editorOpen = false">{{ $t('common.cancel') }}</button>
+            <button class="btn btn-primary" type="button" :disabled="!form.name.trim()" @click="saveGroup">{{ $t('groups.saveGroup') }}</button>
           </div>
         </section>
       </div>

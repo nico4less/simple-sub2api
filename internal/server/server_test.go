@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/0xForce-Network/simple-sub2api/internal/config"
 	"github.com/0xForce-Network/simple-sub2api/internal/dashboard"
 	"github.com/0xForce-Network/simple-sub2api/internal/server"
+	"github.com/0xForce-Network/simple-sub2api/internal/tunnel"
 )
 
 func TestM0SecurityBoundaries(t *testing.T) {
@@ -90,8 +92,8 @@ func TestE003GatewayKeysCRUDRotateAndAuth(t *testing.T) {
 		KeyValue      string `json:"key_value"`
 		Key           struct {
 			KeyValue string `json:"key_value"`
-			KeyHash string `json:"key_hash"`
-			Preview string `json:"preview"`
+			KeyHash  string `json:"key_hash"`
+			Preview  string `json:"preview"`
 		} `json:"key"`
 	}
 	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
@@ -157,6 +159,78 @@ func TestE003GatewayKeysCRUDRotateAndAuth(t *testing.T) {
 	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + rotated.KeyValue}, body, http.StatusOK)
 	assertStatus(t, http.MethodDelete, srv.URL+"/api/keys/client_key", map[string]string{"Cookie": cookie.String()}, []byte(`{"config_version":5}`), http.StatusOK)
 	assertStatus(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{"Authorization": "Bearer " + rotated.KeyValue}, body, http.StatusUnauthorized)
+}
+
+func TestTunnelAdminStatusAndConfigHotUpdate(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	fakeTunnel := &fakeTunnelController{status: tunnel.RuntimeStatus{Status: tunnel.StatusStopped}}
+	srv := httptest.NewServer(server.NewWithOptions(store, slog.New(slog.NewTextHandler(io.Discard, nil)), server.Options{TunnelManager: fakeTunnel}).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	assertStatus(t, http.MethodGet, srv.URL+"/api/admin/tunnel/status", nil, nil, http.StatusUnauthorized)
+	statusResp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/tunnel/status", map[string]string{"Cookie": cookie.String()}, nil)
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("status endpoint status = %d", statusResp.StatusCode)
+	}
+	var status tunnel.RuntimeStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode tunnel status: %v", err)
+	}
+	if status.Status != tunnel.StatusStopped {
+		t.Fatalf("initial tunnel status = %#v", status)
+	}
+
+	body := []byte(`{"config_version":1,"tunnel":{"enabled":true,"mode":"named","binary_path":"/bin/echo","token":"01234567-89ab-cdef-0123-456789abcdef","log_limit_lines":25}}`)
+	updateResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/tunnel/config", map[string]string{"Cookie": cookie.String()}, body)
+	if updateResp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(updateResp.Body)
+		t.Fatalf("update tunnel status = %d body=%s", updateResp.StatusCode, string(payload))
+	}
+	var updated struct {
+		ConfigVersion int                  `json:"config_version"`
+		Tunnel        config.TunnelConfig  `json:"tunnel"`
+		Status        tunnel.RuntimeStatus `json:"status"`
+	}
+	if err := json.NewDecoder(updateResp.Body).Decode(&updated); err != nil {
+		t.Fatalf("decode update response: %v", err)
+	}
+	if updated.ConfigVersion != 2 || !updated.Tunnel.Enabled || updated.Tunnel.Token == "01234567-89ab-cdef-0123-456789abcdef" || !strings.Contains(updated.Tunnel.Token, "...") {
+		t.Fatalf("unsafe update response = %#v", updated)
+	}
+	if updated.Status.Status != tunnel.StatusConnected || updated.Status.PublicURL != "https://fake.trycloudflare.com" {
+		t.Fatalf("update status = %#v", updated.Status)
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Tunnel.Token != "01234567-89ab-cdef-0123-456789abcdef" || !snapshot.Tunnel.Enabled || snapshot.ConfigVersion != 2 {
+		t.Fatalf("stored tunnel config = %#v version=%d", snapshot.Tunnel, snapshot.ConfigVersion)
+	}
+	if len(fakeTunnel.applies) != 2 {
+		t.Fatalf("apply count = %d, want init plus update", len(fakeTunnel.applies))
+	}
+	if fakeTunnel.applies[1].cfg.Token != snapshot.Tunnel.Token || fakeTunnel.applies[1].bind != snapshot.Server.Bind {
+		t.Fatalf("apply record = %#v", fakeTunnel.applies[1])
+	}
+
+	maskedBody := []byte(`{"config_version":2,"tunnel":{"enabled":true,"mode":"named","binary_path":"/bin/echo","token":"0123...cdef","log_limit_lines":30}}`)
+	maskedResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/tunnel/config", map[string]string{"Cookie": cookie.String()}, maskedBody)
+	if maskedResp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(maskedResp.Body)
+		t.Fatalf("masked update status = %d body=%s", maskedResp.StatusCode, string(payload))
+	}
+	if got := store.Snapshot().Tunnel.Token; got != "01234567-89ab-cdef-0123-456789abcdef" {
+		t.Fatalf("masked token was not preserved: %q", got)
+	}
+
+	badResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/tunnel/config", map[string]string{"Cookie": cookie.String()}, []byte(`{"config_version":3,"tunnel":{"enabled":true,"mode":"invalid","log_limit_lines":100}}`))
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid tunnel update status = %d", badResp.StatusCode)
+	}
 }
 
 func TestE003DefaultGatewayKeyAuthoritativeAndRevealClosed(t *testing.T) {
@@ -946,6 +1020,46 @@ func loginCookie(t *testing.T, serverURL string, password string) *http.Cookie {
 		t.Fatalf("login status = %d", loginResp.StatusCode)
 	}
 	return firstCookie(t, loginResp, dashboard.CookieName)
+}
+
+type fakeTunnelController struct {
+	mu      sync.Mutex
+	status  tunnel.RuntimeStatus
+	applies []fakeTunnelApply
+	stops   int
+}
+
+type fakeTunnelApply struct {
+	cfg  config.TunnelConfig
+	bind string
+}
+
+func (f *fakeTunnelController) Apply(cfg config.TunnelConfig, bind string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.applies = append(f.applies, fakeTunnelApply{cfg: cfg, bind: bind})
+	if cfg.Enabled {
+		f.status = tunnel.RuntimeStatus{Status: tunnel.StatusConnected, PublicURL: "https://fake.trycloudflare.com", RecentLogs: []string{"fake connected"}}
+		return nil
+	}
+	f.status = tunnel.RuntimeStatus{Status: tunnel.StatusStopped}
+	return nil
+}
+
+func (f *fakeTunnelController) Status() tunnel.RuntimeStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	status := f.status
+	status.RecentLogs = append([]string(nil), f.status.RecentLogs...)
+	return status
+}
+
+func (f *fakeTunnelController) Stop() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stops++
+	f.status = tunnel.RuntimeStatus{Status: tunnel.StatusStopped}
+	return nil
 }
 
 func writeFixtureJSON(t *testing.T, w http.ResponseWriter, value any) {

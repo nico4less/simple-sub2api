@@ -15,14 +15,16 @@ defineProps<{
       <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-700">
         <thead class="bg-gray-50/80 text-left text-xs uppercase tracking-wider text-gray-500 dark:bg-dark-800/80 dark:text-gray-400">
           <tr>
-            <th v-for="column in columns" :key="String(column.key)" class="px-4 py-3 font-semibold">
-              {{ column.label }}
+            <th v-for="column in columns" :key="String(column.key)" :class="['px-2 py-2 font-semibold', column.headerClass]">
+              <slot :name="`header-${String(column.key)}`" :column="column">
+                {{ column.label }}
+              </slot>
             </th>
           </tr>
         </thead>
         <tbody class="divide-y divide-gray-100 bg-white/60 dark:divide-dark-800 dark:bg-dark-900/50">
-          <tr v-for="(row, rowIndex) in rows" :key="rowIndex" :class="['hover:bg-primary-50/40 dark:hover:bg-primary-900/10']">
-            <td v-for="(column, columnIndex) in columns" :key="String(column.key)" :class="[columnIndex === 0 ? rowClass?.(row) : '', 'px-4 py-3 align-top']">
+          <tr v-for="(row, rowIndex) in rows" :key="String(row.id || rowIndex)" :class="['group transition-colors hover:bg-primary-50/40 dark:hover:bg-primary-900/10', rowClass?.(row)]">
+            <td v-for="column in columns" :key="String(column.key)" :class="['px-2 py-2 align-middle', column.cellClass]">
               <slot :name="`cell-${String(column.key)}`" :row="row" :value="row[column.key as keyof T]">
                 {{ row[column.key as keyof T] }}
               </slot>
@@ -34,8 +36,8 @@ defineProps<{
     <div class="space-y-3 p-3 md:hidden">
       <article v-for="(row, rowIndex) in rows" :key="rowIndex" :class="['rounded-xl border border-gray-200 bg-white/70 p-3 dark:border-dark-700 dark:bg-dark-800/70', rowClass?.(row)]">
         <dl class="space-y-2 text-sm">
-          <div v-for="column in columns" :key="String(column.key)" class="flex justify-between gap-3">
-            <dt class="text-gray-500 dark:text-gray-400">{{ column.label }}</dt>
+          <div v-for="column in columns" v-show="!column.mobileHidden" :key="String(column.key)" class="grid gap-1 rounded-lg border border-gray-100/70 bg-white/40 p-2 dark:border-dark-700/70 dark:bg-dark-900/30">
+            <dt class="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ column.mobileLabel || column.label }}</dt>
             <dd class="text-right font-medium">
               <slot :name="`cell-${String(column.key)}`" :row="row" :value="row[column.key as keyof T]">
                 {{ row[column.key as keyof T] }}

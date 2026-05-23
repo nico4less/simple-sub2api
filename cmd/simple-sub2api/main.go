@@ -1,18 +1,34 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/0xForce-Network/simple-sub2api/internal/config"
 	"github.com/0xForce-Network/simple-sub2api/internal/logging"
 	"github.com/0xForce-Network/simple-sub2api/internal/server"
 	"github.com/0xForce-Network/simple-sub2api/internal/version"
 )
+
+const shutdownTimeout = 10 * time.Second
+
+type managedHTTPServer interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+}
+
+type tunnelStopper interface {
+	StopTunnel() error
+}
 
 func main() {
 	configPath := flag.String("config", config.DefaultPath, "path to simple-sub2api JSON config")
@@ -76,11 +92,51 @@ func main() {
 		slog.Bool("debug_dashboard", debugDashboardEnabled(*debugDashboard)),
 	)
 
-	handler := server.NewWithOptions(store, logger, server.Options{DebugDashboard: debugDashboardEnabled(*debugDashboard)}).Handler()
-	if err := http.ListenAndServe(cfg.Server.Bind, handler); err != nil {
+	app := server.NewWithOptions(store, logger, server.Options{DebugDashboard: debugDashboardEnabled(*debugDashboard)})
+	httpServer := &http.Server{Addr: cfg.Server.Bind, Handler: app.Handler()}
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	if err := serveWithGracefulShutdown(ctx, httpServer, app, logger); err != nil {
 		logger.Error("server stopped", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+}
+
+func serveWithGracefulShutdown(ctx context.Context, httpServer managedHTTPServer, stopper tunnelStopper, logger *slog.Logger) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- httpServer.ListenAndServe()
+	}()
+	select {
+	case <-ctx.Done():
+		if logger != nil {
+			logger.Info("shutdown signal received")
+		}
+		return shutdownHTTPAndTunnel(httpServer, stopper)
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return stopTunnel(stopper)
+		}
+		stopErr := stopTunnel(stopper)
+		return errors.Join(err, stopErr)
+	}
+}
+
+func shutdownHTTPAndTunnel(httpServer managedHTTPServer, stopper tunnelStopper) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	shutdownErr := httpServer.Shutdown(ctx)
+	if errors.Is(shutdownErr, http.ErrServerClosed) {
+		shutdownErr = nil
+	}
+	return errors.Join(shutdownErr, stopTunnel(stopper))
+}
+
+func stopTunnel(stopper tunnelStopper) error {
+	if stopper == nil {
+		return nil
+	}
+	return stopper.StopTunnel()
 }
 
 func debugDashboardEnabled(flagValue bool) bool {

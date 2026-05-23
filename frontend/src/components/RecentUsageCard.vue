@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import type { UsageAggregate } from '@/api/client'
 import DataTable from '@/components/DataTable.vue'
@@ -17,6 +18,8 @@ interface UsageRow extends Record<string, unknown> {
   success_rate: string
   last_used_at: string
 }
+
+const { t } = useI18n()
 
 const props = defineProps<{
   rows: UsageAggregate[]
@@ -49,37 +52,37 @@ const usageRows = computed<UsageRow[]>(() => {
   })
 })
 
-const usageColumns: Column<UsageRow>[] = [
+const usageColumns = computed<Column<UsageRow>[]>(() => [
   { key: 'rank', label: '#' },
-  { key: 'account', label: 'Account' },
-  { key: 'label', label: 'Label' },
-  { key: 'key', label: 'Key preview' },
-  { key: 'requests', label: 'Requests' },
-  { key: 'successes', label: 'OK' },
-  { key: 'errors', label: 'Errors' },
-  { key: 'success_rate', label: 'Success rate' },
-  { key: 'last_used_at', label: 'Last used' }
-]
+  { key: 'account', label: t('recentUsage.columns.account') },
+  { key: 'label', label: t('recentUsage.columns.label') },
+  { key: 'key', label: t('recentUsage.columns.keyPreview') },
+  { key: 'requests', label: t('recentUsage.columns.requests') },
+  { key: 'successes', label: t('recentUsage.columns.ok') },
+  { key: 'errors', label: t('recentUsage.columns.errors') },
+  { key: 'success_rate', label: t('recentUsage.columns.successRate') },
+  { key: 'last_used_at', label: t('recentUsage.columns.lastUsed') }
+])
 </script>
 
 <template>
   <article class="card lg:col-span-2">
     <div class="mb-3 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
       <div>
-        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Recent Usage (Top 12)</h2>
-        <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">In-memory ranked account/key activity. Prompts, responses, tokens, and secret key material are never stored.</p>
+        <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('recentUsage.title') }}</h2>
+        <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{{ $t('recentUsage.subtitle') }}</p>
       </div>
       <button class="btn btn-secondary" type="button" :disabled="loading" @click="$emit('refresh')">
         <Icon name="refresh" />
-        <span class="ml-2">{{ loading ? 'Refreshing...' : 'Refresh Usage' }}</span>
+        <span class="ml-2">{{ loading ? $t('common.refreshing') : $t('recentUsage.refreshUsage') }}</span>
       </button>
     </div>
     <p v-if="error" class="mb-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
       {{ error }}
     </p>
     <p v-if="loading && usageRows.length === 0" class="rounded-2xl border border-dashed border-gray-300 p-6 text-center text-sm text-gray-500 dark:border-dark-700 dark:text-gray-400">
-      Loading recent gateway usage...
+      {{ $t('recentUsage.loading') }}
     </p>
-    <DataTable v-else :columns="usageColumns" :rows="usageRows" empty-text="No gateway traffic recorded yet." />
+    <DataTable v-else :columns="usageColumns" :rows="usageRows" :empty-text="$t('recentUsage.empty')" />
   </article>
 </template>

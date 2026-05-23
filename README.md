@@ -1,75 +1,96 @@
-# Simple Sub2API
+# Simple Sub2API 🚀
 
-Personal-only account-pool gateway skeleton for the Simple Sub2API plan.
+A premium, high-fidelity, personal & small-team account-pool subscription gateway.
 
-## Current status
+`Simple Sub2API` is a lightweight, zero-inbound-port API proxy and account rotation gateway designed specifically for **solo developers, power users, and collaborative groups**. Rejecting bloated commercial architectures, it operates on a strict **"Single-Tenant, High-Fidelity, Absolute Privacy"** philosophy, providing the ultimate control over your API subscription pools.
 
-Queue A / M0 provides the local server skeleton and security boundary:
+---
 
-- health and version endpoints
-- default loopback bind
-- explicit LAN guard requiring an admin password
-- single local gateway key for `/v1/*`
-- Dashboard admin session separated from gateway key
-- CORS closed by default
+## 🌟 Key Highlights & Design Philosophy
 
-Queue B / M1 adds the local configuration and source-management baseline:
+### 1. ⚡ Zero Billing Bloat & Dynamic Quota Self-Adjustment
+> [!TIP]
+> **No more over-utilized or wasted accounts.**
+> In typical group/individual settings, some accounts end up exhausted while others sit idle. Simple Sub2API balances dynamic concurrency across your account pools in real-time, matching team workloads without commercial overhead.
 
-- strict JSON config schema with `config_version`
-- OAuth/account source records for personal account management only
-- subscription source records
-- redacted import preview for pasted line tokens, JSON bundles, inline bundles, and subscription URL content
-- explicit import apply with optimistic `config_version` conflict handling
-- source deletion impact preview and derived-account disable behavior
-- proxy schema validation with `socks5://` normalized to `socks5h://`
+* **No Tedious Administration**: Avoids complex user levels, billing systems, credits management, or database dependencies.
+* **Friendly Interface**: A gorgeous, reactive glassmorphic UI displays your active accounts, routing configurations, and live gateway throughput.
 
-Queue C / M2 adds the local runtime layer needed before gateway compatibility:
+### 2. 🛡️ High-Fidelity Transparent Proxying (Direct Official API Connection)
+> [!IMPORTANT]
+> **Zero dilution, zero context manipulation.**
+> Commercial proxy resellers frequently trim contexts, inject stealthy system prompts, or switch models behind the scenes to cut costs. Simple Sub2API strictly forbids context clipping, system-prompt interception, or model emulations.
 
-- fail-fast proxy transport with `socks5h` remote DNS behavior
-- quota states: `available`, `near_limit`, `exhausted`, `unknown`, and `error`
-- explicit routing rules for `document`, `code`, and `default` tasks plus model patterns and tags
-- save-time account checks with bounded probes and credential redaction
-- account pool states: `healthy`, `error`, `disabled`, `cooldown`, and `quota`
-- tier-aware round-robin selection and hot reload that preserves the old pool when candidate validation fails
+* **100% Genuine Responses**: Connects directly to native official endpoints. What you send is exactly what the model receives; what the model responds is streamed back to your IDE (Copilot, Claude, cursor) in absolute fidelity.
 
-Queue D / M3 adds the first OpenAI-compatible gateway closure:
+### 3. 🔒 Isolated Private Security Domains (Anti-Abuse Safeguards)
+> [!WARNING]
+> **Protect your valuable keys from ban-waves.**
+> Sharing credentials globally on shared networks exposes accounts to strict risk scanning, leading to account blocks or suspension.
 
-- upstream compatibility boundary at `internal/upstreamcompat` with a tracked `SYNC_MANIFEST.md`
-- `/v1/chat/completions` non-streaming proxy support
-- `/v1/chat/completions` streaming SSE proxy support
-- gateway key auth, routing decision, accountpool selection, proxy client, quota usage accounting, and upstream-error cooldown wiring
-- OpenAI-compatible error envelopes for local validation and routing failures
+* **Single-Tenant Core**: Keeps your private gateway strictly controlled under same-origin admin keys. Account validation, proxy refs, and local configs never leak external metadata, protecting your subscription accounts from risk tagging and abuse tracking.
 
-Queue E / M4 adds the embedded Dashboard surface:
+### 4. 🔄 Smart Group Routing & Zero-Latency Failover
+* **Concurrence & Quota-Awareness**: Groups accounts dynamically with scheduling algorithms: **Least Connections, P2C (Power of Two Choices), Round-Robin, or Manual Priority**.
+* **3-Strike Circuit Breaker**: If an account changes password, expires, or is locked at source, the gateway intercepts the error, dynamically registers a cooldown lock, triggers a background config toggle (`Enabled = false`), and transparently re-runs the request on a healthy account in seconds—fully invisible to the client.
 
-- `GET /` and `GET /dashboard` serve a Go-embedded single-page Dashboard shell with no external CDN, fonts, or scripts
-- `GET /api/admin/dashboard/state` returns redacted config, account pool, quota, version, and gateway status
-- `POST /api/admin/config/save` saves a full config snapshot with `config_version` conflict handling and redacted-secret preservation
-- `DELETE /api/admin/accounts/{id}` deletes an account through the same validated config update path
-- `POST /api/admin/accounts/{id}/refresh` re-runs account check and refreshes account pool state
-- `POST /api/admin/oauth-sources/{id}/refresh` updates local OAuth source refresh status when credentials exist
-- `POST /api/admin/oauth-sources/{id}/reauth` marks a source as needing external provider authorization
+### 5. 🌐 Zero-Inbound-Open-Port NAT Traversal (Cloudflare Tunnel)
+* **Outbound-Only long connection**: Utilizing `cloudflared`, it securely exposes your local host to the public web without requiring router port-forwarding or public static IPs.
+* **Dual Operation Modes**: One-click **Quick Tunnel** (instant free anonymous URLs) or **Named Tunnel** (custom domains using Zero Trust Tokens) with live terminal logs in the Proxies Tab.
 
-Queue F / M5 adds local observability and release packaging:
+---
 
-- in-memory metrics recorder for QPS, total requests, success/error counts, per-account hit/error counts, cooldown counts, routing decisions, quota switch counts, and recent sanitized errors
-- admin-only `GET /api/admin/metrics`
-- Dashboard metrics tiles and tables backed by the metrics snapshot
-- multi-stage `Dockerfile` with a non-root runtime user
-- `Makefile` targets for tests, local builds, cross-platform release binaries, and Docker image builds
+## 🧭 Design Philosophy Matrix
 
-## Local run
+| Core Vector | Commercial API Middleware | Simple Sub2API (Geek & Solo-Team) |
+| :--- | :--- | :--- |
+| **Primary Goal** | Profit margins, reselling, credits accounting | **Maximized resource utilization, solo-team balance** |
+| **High Fidelity** | Trims contexts, injects prompts to lower costs | **100% transparent high-fidelity native relaying** |
+| **Account Safety** | High-frequency shared IP egress, causing bans | **Isolated local private domain, dedicated proxy ref** |
+| **Exposure Risks** | Exposed TCP listening ports, open to scanners | **NAT-traversable secure Outbound Cloudflare Tunnel** |
+| **Operational Weight** | Heavy databases (Redis/Postgres), complex setups | **Go memory state-machine, single config.json hot updates** |
 
+---
+
+## 🏗️ Architecture & Development Milestones
+
+The project is structured under sequential development milestones:
+
+* **Queue A / M0 (Base Security)**: Standard health/version endpoints, loopback bind, explicit LAN guard with admin password, gateway bearer key auth, and CORS isolation.
+* **Queue B / M1 (Config & Baseline)**: Config schema validation with `config_version` optimistic locking, OAuth source records, and secure redacted previews.
+* **Queue C / M2 (Runtime Engine)**: Fail-fast proxy transport (SOCKS5h remote DNS), Quota state machine (`available`, `exhausted`), and tier-aware hot reloading.
+* **Queue D / M3 (OpenAI Gateway)**: `/v1/chat/completions` non-streaming and streaming SSE proxy support, error envelopes, and automated upstream-error cooldown.
+* **Queue E / M4 (Dashboard Shell)**: Go-embedded single-page Dashboard shell (no external CDNs/scripts), real-time status tiles, and active metrics.
+* **Queue F / M5 (Observability & Packaging)**: In-memory metrics recorders, Dockerfile multi-stage builds, and cross-platform Release Makefile targets.
+
+---
+
+## 🛠️ Getting Started
+
+### Local Development Run
 ```bash
 go run ./cmd/simple-sub2api --config simple_sub2api.config.json
 ```
+*The initial run will generate a local `config.json` containing a secure default `s2a_` gateway key.*
 
-The first run creates a local JSON config with a generated `s2a_` gateway key.
+### LAN Ingress (Fail-Closed Default)
+To expose the server on a local network safely:
+```bash
+go run ./cmd/simple-sub2api --bind 0.0.0.0:8080 --allow-lan --admin-password change-me
+```
+For LAN clients, configure the OpenAI client base URL to `http://<lan-host>:8080/v1` and use the generated `s2a_` gateway key as the Bearer token.
 
-## Local release builds
+### Docker Container Deploy
+Build the local lightweight image:
+```bash
+make docker-image
+```
+Run with config persistence and admin password:
+```bash
+docker run --rm -p 8080:8080 -v simple-sub2api-config:/config -e SIMPLE_SUB2API_ADMIN_PASSWORD=change-me simple-sub2api:local
+```
 
-The Go binary has no database dependency. Release builds can be produced from this directory:
-
+### Cross-Compilation Targets
 ```bash
 make test
 make linux-amd64
@@ -77,88 +98,33 @@ make darwin-amd64
 make darwin-arm64
 make windows-amd64
 ```
+*Artifacts are written under `dist/`.*
 
-Artifacts are written under `dist/`. Version metadata may be injected with `VERSION`, `COMMIT`, and `DATE` make variables.
+---
 
-## Queue B admin APIs
+## 🔌 API Summary Reference
 
-All source and import APIs require the Dashboard admin session cookie, not the gateway bearer key.
+### Admin Portal Endpoints (Dashboard Admin Cookie Required)
+- `GET /api/admin/config` - Get redacted config.
+- `GET/POST /api/admin/oauth-sources` - Manage account source configurations.
+- `GET/POST /api/admin/subscription-sources` - Manage subscription bundles.
+- `GET/POST /api/admin/proxies` - Outbound proxy lists (HTTP, SOCKS5).
+- `GET/POST /api/admin/tunnel/status` - Live Cloudflare Tunnel status and terminal stderr logs.
+- `POST /api/admin/tunnel/config` - Dynamic Cloudflare Tunnel hot reload.
+- `GET /api/admin/account-pool` - View real-time active routing pool.
+- `GET /api/admin/metrics` - Runtime observability QPS, hit rate, and sanitized logs.
 
-- `GET /api/admin/config` returns a redacted config snapshot.
-- `GET/POST /api/admin/oauth-sources` lists or upserts OAuth/token-bundle sources.
-- `GET/DELETE /api/admin/oauth-sources/{id}` previews source impact or disables derived accounts after delete.
-- `GET/POST /api/admin/subscription-sources` lists or upserts subscription sources.
-- `GET/DELETE /api/admin/subscription-sources/{id}` previews source impact or disables derived accounts after delete.
-- `POST /api/admin/import/preview` parses import candidates without mutating the config and redacts credentials.
-- `POST /api/admin/import/apply` validates `config_version`, re-parses raw import content when provided, and then saves candidates.
+### Chat Gateway Endpoint (Bearer `s2a_...` Auth Required)
+- `POST /v1/chat/completions` - High-fidelity streaming/non-streaming chat completions.
+  - *Optional Headers*:
+    - `X-Simple-Task-Type`: set to `document`, `code`, or `default` to drive routing rules.
+    - `X-Simple-Tags`: comma-separated tags for explicit account selection constraints.
 
-## Queue C admin APIs
+---
 
-All runtime APIs require the Dashboard admin session cookie. Mutating APIs use the same optimistic `config_version` rule as Queue B.
-
-- `GET/POST /api/admin/proxies` lists or upserts proxy records.
-- `DELETE /api/admin/proxies/{id}` deletes a proxy and disables accounts that referenced it.
-- `GET/POST /api/admin/quota` reads or replaces quota policy config.
-- `GET /api/admin/quota/state` returns per-account quota runtime state.
-- `GET/POST /api/admin/routing` reads or replaces routing config.
-- `POST /api/admin/routing/decide` previews the routing decision for a task/model/tag request.
-- `GET /api/admin/account-check` probes all configured accounts.
-- `POST /api/admin/account-check` probes one configured account by `account_id`.
-- `GET /api/admin/account-pool` returns current pool state after validation and checks.
-
-## Queue D gateway API
-
-Clients use the generated local gateway key as a Bearer token:
-
-- `POST /v1/chat/completions` forwards OpenAI-compatible chat completion requests to the selected upstream account.
-- `stream: true` responses are proxied as `text/event-stream` and re-emitted as OpenAI `data:` events.
-- `X-Simple-Task-Type` may be set to `document`, `code`, or `default` to drive simple routing.
-- `X-Simple-Tags` may be a comma-separated tag list for explicit routing rules.
-- Upstream HTTP `401`, `403`, `404`, `429`, and `5xx` responses trigger short account cooldown.
-
-## Queue E Dashboard
-
-Open `http://127.0.0.1:8080/dashboard` after starting the service. The Dashboard is a local embedded page that talks only to same-origin admin APIs and does not persist plaintext credentials in frontend storage. The UI includes account add/save, import preview/apply, OAuth refresh/reauth status actions, routing edit/test, proxy config/probe, quota progress bars, gateway reveal/rotate, and live Queue-F metrics for QPS, hit-rate, counters, routing decisions, cooldowns and recent sanitized errors.
-
-## Queue F metrics API
-
-All metrics APIs require the Dashboard admin session cookie and never use the gateway bearer key.
-
-- `GET /api/admin/metrics` returns the in-memory metrics snapshot.
-- `GET /api/admin/dashboard/state` also embeds the same snapshot as `metrics` for Dashboard refresh.
-- Metrics are runtime-only: restarting the binary resets counters.
-- Recent errors are bounded by `metrics.recent_errors_limit` and are sanitized for common secret markers before storage.
-
-## LAN run
-
-LAN bind is fail-closed unless explicitly enabled and protected by an admin password:
-
-```bash
-go run ./cmd/simple-sub2api --bind 0.0.0.0:8080 --allow-lan --admin-password change-me
-```
-
-For LAN clients, configure the OpenAI-compatible client base URL as `http://<lan-host>:8080/v1` and use the generated `s2a_` gateway key as the Bearer token. Dashboard admin login remains separate from the gateway key.
-
-## Docker run
-
-Build the local image from this directory:
-
-```bash
-make docker-image
-```
-
-Run with an explicit admin password and a mounted config directory:
-
-```bash
-docker run --rm -p 8080:8080 -v simple-sub2api-config:/config -e SIMPLE_SUB2API_ADMIN_PASSWORD=change-me simple-sub2api:local
-```
-
-The container uses the same JSON config schema as local runs and stores it at `/config/simple_sub2api.config.json` by default. The image listens on `0.0.0.0:8080` inside the container, so host exposure is controlled by Docker port publishing.
-
-## Proxy configuration
-
-Proxy records live in `proxies` and can be managed from the Dashboard or config file. `socks5://` is normalized to `socks5h://` to avoid local DNS leakage. If an account references a configured proxy and that proxy cannot be used, gateway traffic fails closed instead of silently falling back to direct connections.
-
-## Security non-goals
-
-This project must not add multi-key management, API-key resale, users, groups, billing, IP allow/deny lists, quota plans, or rate-limit systems.
+## 🚫 Security Non-Goals & Absolute Bounds
+To preserve the simplicity and compliance of `simple_sub2api`, the following commercial features **MUST NOT** be added:
+- Multi-user authentication & custom API-key distribution models.
+- Commercial billing, credits ledger, stripe integrations, or paywalls.
+- IP whitelist/blacklist access lists.
+- Public context compression, emulations, or API reselling optimizations.

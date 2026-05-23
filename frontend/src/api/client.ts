@@ -5,6 +5,7 @@ export interface AdminState {
   quota_state?: QuotaState[]
   metrics?: MetricsSnapshot
   recent_usage?: UsageAggregate[]
+  tunnel?: TunnelRuntimeStatus
   gateway: { key_configured: boolean }
 }
 
@@ -20,6 +21,7 @@ export interface AdminConfig {
   groups?: GroupConfig[]
   accounts?: AccountConfig[]
   proxies?: ProxyConfig[]
+  tunnel?: TunnelConfig
   quota?: { policies?: QuotaPolicy[]; [key: string]: unknown }
   [key: string]: unknown
 }
@@ -85,6 +87,18 @@ export interface GroupConfig {
   account_ids?: string[]
   created_at: string
   updated_at: string
+  rotation_policy?: GroupRotationPolicy
+}
+
+export interface GroupRotationPolicy {
+  strategy: 'polling' | 'least_connections' | 'p2c' | 'priority'
+  sticky_sessions_enabled: boolean
+  sticky_header?: string
+  retry_on_errors: boolean
+  rotate_error_codes?: number[]
+  cooldown_duration_seconds?: number
+  enable_quota_protection: boolean
+  min_quota_threshold_percent?: number
 }
 
 export interface GroupSummary {
@@ -113,6 +127,28 @@ export interface ProxyRowConfig extends ProxyConfig {
   status?: 'active' | 'disabled'
 }
 
+export interface TunnelConfig {
+  enabled: boolean
+  mode: 'quick' | 'named'
+  binary_path?: string
+  token?: string
+  log_limit_lines?: number
+}
+
+export interface TunnelRuntimeStatus {
+  status: 'stopped' | 'starting' | 'connected' | 'error'
+  public_url: string
+  error_message?: string
+  active_since?: string
+  recent_logs: string[]
+}
+
+export interface TunnelConfigResponse {
+  config_version: number
+  tunnel: TunnelConfig
+  status: TunnelRuntimeStatus
+}
+
 export interface QuotaPolicy {
   id: string
   source?: string
@@ -134,8 +170,13 @@ export interface AccountSummary {
   health?: AccountHealth
   quota?: Record<string, unknown>
   metrics?: { hits?: number; errors?: number }
+  runtime?: Record<string, unknown>
   source?: string
   references?: Record<string, string>
+  subscription_tier?: string
+  privacy_mode?: string
+  openai_compact_mode?: string
+  usage_info?: Record<string, unknown>
 }
 
 export interface AccountsResponse {
@@ -145,6 +186,12 @@ export interface AccountsResponse {
   groups?: GroupConfig[]
   quota_policies: QuotaPolicy[]
   sources: string[]
+}
+
+export interface AccountRefreshResponse extends AccountHealth {
+  health: AccountHealth
+  account?: AccountSummary
+  accounts?: AccountsResponse
 }
 
 export interface RuntimeAccount {
@@ -314,6 +361,17 @@ export function loadProxies() {
   return api<ProxyConfig[]>('/api/admin/proxies')
 }
 
+export function loadTunnelStatus() {
+  return api<TunnelRuntimeStatus>('/api/admin/tunnel/status')
+}
+
+export function saveTunnelConfig(configVersion: number, tunnel: TunnelConfig) {
+  return api<TunnelConfigResponse>('/api/admin/tunnel/config', {
+    method: 'POST',
+    body: JSON.stringify({ config_version: configVersion, tunnel })
+  })
+}
+
 export function createProxy(configVersion: number, proxy: ProxyConfig) {
   return api<AdminConfig>('/api/admin/proxies', {
     method: 'POST',
@@ -375,11 +433,11 @@ export function testAllAccounts() {
 }
 
 export function refreshAccount(accountID: string) {
-  return api<AccountHealth>(`/api/admin/accounts/${encodeURIComponent(accountID)}/test`, { method: 'POST' })
+  return api<AccountRefreshResponse>(`/api/admin/accounts/${encodeURIComponent(accountID)}/refresh`, { method: 'POST' })
 }
 
 export function deleteAccount(configVersion: number, accountID: string) {
-  return api<AdminState>(`/api/admin/accounts/${encodeURIComponent(accountID)}`, {
+  return api<AdminConfig>(`/api/admin/accounts/${encodeURIComponent(accountID)}`, {
     method: 'DELETE',
     body: JSON.stringify({ config_version: configVersion })
   })

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import { createKey, deleteKey, loadKeys, loadRecentUsage } from '@/api/client'
 import AppShell from '@/components/AppShell.vue'
@@ -11,6 +12,7 @@ import { copyTextToClipboard } from '@/composables/useClipboard'
 import { useAdminState } from '@/composables/useAdminState'
 import type { AccountConfig, GatewayKey, GroupConfig, KeyRoutingPolicy, UsageAggregate } from '@/api/client'
 
+const { t } = useI18n()
 const { state, metrics, loading, error, refresh } = useAdminState()
 const keysConfigVersion = ref(0)
 const gatewayKeys = ref<GatewayKey[]>([])
@@ -29,12 +31,12 @@ const copiedKeyID = ref('')
 const metricCards = computed(() => {
   const snapshot = metrics.value
   return [
-    { label: 'QPS', value: Number(snapshot.qps || 0).toFixed(4), hint: 'Current in-memory rate' },
-    { label: 'Total', value: snapshot.total_requests || 0, hint: 'Gateway requests' },
-    { label: 'Success', value: snapshot.success_requests || 0, hint: 'Forwarded successfully' },
-    { label: 'Errors', value: snapshot.error_requests || 0, hint: 'Sanitized failures' },
-    { label: 'Hit-rate', value: `${Math.round(Number(snapshot.success_rate || 0) * 100)}%`, hint: 'Success ratio' },
-    { label: 'Uptime', value: `${snapshot.uptime_seconds || 0}s`, hint: 'Recorder uptime' }
+    { label: t('dashboard.metrics.qps'), value: Number(snapshot.qps || 0).toFixed(4), hint: t('dashboard.metrics.currentRate') },
+    { label: t('dashboard.metrics.total'), value: snapshot.total_requests || 0, hint: t('dashboard.metrics.gatewayRequests') },
+    { label: t('dashboard.metrics.success'), value: snapshot.success_requests || 0, hint: t('dashboard.metrics.forwarded') },
+    { label: t('dashboard.metrics.errors'), value: snapshot.error_requests || 0, hint: t('dashboard.metrics.failures') },
+    { label: t('dashboard.metrics.hitRate'), value: `${Math.round(Number(snapshot.success_rate || 0) * 100)}%`, hint: t('dashboard.metrics.successRatio') },
+    { label: t('dashboard.metrics.uptime'), value: `${snapshot.uptime_seconds || 0}s`, hint: t('dashboard.metrics.recorderUptime') }
   ]
 })
 
@@ -70,7 +72,7 @@ async function createGatewayKey() {
   }, keyDraft.value.customKey)
   newKeyValue.value = result.key_value
   plaintextKeysByID.value = { ...plaintextKeysByID.value, [result.key.id]: result.key_value }
-  notice.value = 'Gateway key created. The full key remains visible in API Keys for later copying.'
+  notice.value = t('dashboard.keyCreated')
   keyDraft.value.customKey = ''
   await refresh()
   await refreshKeys()
@@ -78,13 +80,13 @@ async function createGatewayKey() {
 
 async function removeGatewayKey(key: GatewayKey) {
   await deleteKey(keysConfigVersion.value, key.id)
-  notice.value = `Key ${key.name} deleted.`
+  notice.value = t('dashboard.keyDeleted', { name: key.name })
   await refreshKeys()
 }
 
 async function copyNewKey() {
   const copied = await copyTextToClipboard(newKeyValue.value)
-  notice.value = copied ? 'Gateway key copied.' : 'Copy failed. Select the key value and copy it manually.'
+  notice.value = copied ? t('dashboard.gatewayKeyCopied') : t('dashboard.copyFailed')
 }
 
 async function copyKeyValue(key: GatewayKey) {
@@ -93,9 +95,9 @@ async function copyKeyValue(key: GatewayKey) {
   copiedKeyID.value = copied ? key.id : ''
   notice.value = copied
     ? key.key_value
-      ? 'API key copied.'
-      : 'Key preview copied. This legacy key has no stored plaintext material.'
-    : 'Copy failed. Select the key value and copy it manually.'
+      ? t('dashboard.apiKeyCopied')
+      : t('dashboard.previewCopied')
+    : t('dashboard.copyFailed')
   if (copied) {
     window.setTimeout(() => {
       if (copiedKeyID.value === key.id) copiedKeyID.value = ''
@@ -161,11 +163,11 @@ function syncSelectedGroup() {
 }
 
 function describePolicy(policy: KeyRoutingPolicy) {
-  if (policy.mode === 'groups') return `groups: ${(policy.group_ids || []).join(', ') || 'any active group'}`
-  if (policy.mode === 'tier_preference') return `tiers: ${(policy.tiers || []).join(', ') || 'routing default'}`
-  if (policy.mode === 'tags') return `tags: ${(policy.tags || []).join(', ') || 'any'}`
-  if (policy.mode === 'account_ids') return `accounts: ${(policy.account_ids || []).join(', ') || 'any'}`
-  return 'all enabled accounts'
+  if (policy.mode === 'groups') return t('dashboard.policy.groups', { value: (policy.group_ids || []).join(', ') || t('dashboard.policy.anyActiveGroup') })
+  if (policy.mode === 'tier_preference') return t('dashboard.policy.tiers', { value: (policy.tiers || []).join(', ') || t('dashboard.policy.routingDefault') })
+  if (policy.mode === 'tags') return t('dashboard.policy.tags', { value: (policy.tags || []).join(', ') || t('dashboard.policy.any') })
+  if (policy.mode === 'account_ids') return t('dashboard.policy.accounts', { value: (policy.account_ids || []).join(', ') || t('dashboard.policy.any') })
+  return t('dashboard.policy.allEnabled')
 }
 
 watch(() => keyDraft.value.mode, syncSelectedGroup)
@@ -185,20 +187,20 @@ onMounted(() => {
         <article class="card lg:col-span-2">
           <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
             <div>
-              <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Gateway Endpoint</h2>
-              <p class="mt-2 font-mono text-sm text-gray-700 dark:text-gray-200">Base URL: same-origin /v1</p>
-              <p class="mt-1 font-mono text-sm text-gray-700 dark:text-gray-200">Authorization: Bearer &lt;gateway key&gt;</p>
+              <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.gatewayEndpoint') }}</h2>
+              <p class="mt-2 font-mono text-sm text-gray-700 dark:text-gray-200">{{ $t('dashboard.baseUrlSameOrigin') }}</p>
+              <p class="mt-1 font-mono text-sm text-gray-700 dark:text-gray-200">{{ $t('dashboard.authorizationBearer') }}</p>
             </div>
             <button class="btn btn-secondary" type="button" :disabled="loading" @click="refresh">
               <Icon name="refresh" />
-              <span class="ml-2">Refresh State</span>
+              <span class="ml-2">{{ $t('dashboard.refreshState') }}</span>
             </button>
           </div>
         </article>
         <article class="card">
-          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Gateway Keys</h2>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.gatewayKeys') }}</h2>
           <p class="mt-2 text-3xl font-semibold text-gray-900 dark:text-white">{{ gatewayKeys.length }}</p>
-          <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">Local hashed bearer keys with per-key routing policy.</p>
+          <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{{ $t('dashboard.gatewayKeysHint') }}</p>
         </article>
       </section>
 
@@ -209,11 +211,11 @@ onMounted(() => {
         <article class="card lg:col-span-2">
           <div class="mb-3 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
             <div>
-          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">API Keys</h2>
-              <p class="text-sm text-gray-500 dark:text-gray-400">Create keys and bind them to existing routing groups configured in Group Management.</p>
-              <p class="mt-1 text-xs text-amber-600 dark:text-amber-300">To prevent account-ban losses caused by cross-client forwarding, simple sub2api does not support mixing subscriptions across client families; for example, Claude Code clients must use Claude subscription API keys only.</p>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.apiKeys') }}</h2>
+              <p class="text-sm text-gray-500 dark:text-gray-400">{{ $t('dashboard.apiKeysHint') }}</p>
+              <p class="mt-1 text-xs text-amber-600 dark:text-amber-300">{{ $t('dashboard.familyWarning') }}</p>
             </div>
-            <button class="btn btn-secondary" type="button" @click="refreshKeys">Refresh Keys</button>
+            <button class="btn btn-secondary" type="button" @click="refreshKeys">{{ $t('dashboard.refreshKeys') }}</button>
           </div>
           <div class="grid gap-3">
             <div v-for="key in gatewayKeys" :key="key.id" class="relative overflow-hidden rounded-2xl border border-gray-200 p-4 pl-5 dark:border-dark-700">
@@ -226,38 +228,38 @@ onMounted(() => {
                   </div>
                   <div class="mt-1 flex flex-wrap items-center gap-2">
                     <p class="font-mono text-xs text-gray-500 dark:text-gray-400">{{ key.key_value || key.preview }}</p>
-                    <button class="inline-flex rounded-lg border border-gray-200 p-1 text-gray-500 transition hover:border-primary-300 hover:text-primary-600 dark:border-dark-700 dark:hover:border-primary-700 dark:hover:text-primary-300" type="button" :title="copiedKeyID === key.id ? 'Copied' : 'Copy API key'" @click="copyKeyValue(key)">
+                    <button class="inline-flex rounded-lg border border-gray-200 p-1 text-gray-500 transition hover:border-primary-300 hover:text-primary-600 dark:border-dark-700 dark:hover:border-primary-700 dark:hover:text-primary-300" type="button" :title="copiedKeyID === key.id ? $t('common.copied') : $t('common.copy')" @click="copyKeyValue(key)">
                       <Icon name="copy" />
                     </button>
                   </div>
                   <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">{{ describePolicy(key.routing_policy) }}</p>
-                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-500">Created {{ key.created_at }} · Last used {{ key.last_used_at || 'never' }}</p>
+                  <p class="mt-1 text-xs text-gray-500 dark:text-gray-500">{{ $t('dashboard.createdLastUsed', { created: key.created_at, lastUsed: key.last_used_at || $t('common.never') }) }}</p>
                   <p v-if="key.note" class="mt-2 text-sm text-gray-500 dark:text-gray-400">{{ key.note }}</p>
                 </div>
                 <div class="flex flex-wrap gap-2">
-                  <button class="btn btn-secondary" type="button" @click="openUsageModal(key)">Usage</button>
-                  <button class="btn btn-danger" type="button" @click="removeGatewayKey(key)">Delete</button>
+                  <button class="btn btn-secondary" type="button" @click="openUsageModal(key)">{{ $t('dashboard.usage') }}</button>
+                  <button class="btn btn-danger" type="button" @click="removeGatewayKey(key)">{{ $t('common.delete') }}</button>
                 </div>
               </div>
             </div>
-            <p v-if="gatewayKeys.length === 0" class="rounded-2xl border border-dashed border-gray-300 p-4 text-sm text-gray-500 dark:border-dark-700 dark:text-gray-400">No keys configured yet.</p>
+            <p v-if="gatewayKeys.length === 0" class="rounded-2xl border border-dashed border-gray-300 p-4 text-sm text-gray-500 dark:border-dark-700 dark:text-gray-400">{{ $t('dashboard.noKeys') }}</p>
           </div>
         </article>
         <article class="card">
-          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Create Key</h2>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.createKey') }}</h2>
           <div class="mt-3 grid gap-3">
-            <label class="grid gap-1 text-sm">Name<input v-model="keyDraft.name" class="input" /></label>
-            <label class="grid gap-1 text-sm">Custom key (optional)<input v-model="keyDraft.customKey" class="input font-mono" placeholder="s2a_..." /></label>
-            <label class="grid gap-1 text-sm">Group<select v-model="keyDraft.groupIds" class="input" :disabled="groupOptions.length === 0"><option v-for="group in groupOptions" :key="group.id" :value="group.id">{{ group.name || group.id }} · {{ group.platform }}</option></select></label>
-            <p v-if="selectedGroup" class="text-xs text-gray-500 dark:text-gray-400">Keys can only be assigned to existing groups. Current group: {{ selectedGroup.id }}.</p>
-            <p v-if="groupOptions.length === 0" class="text-xs text-red-500">No active groups exist. Create or enable a group before creating a grouped key.</p>
-            <label class="grid gap-1 text-sm">Note<textarea v-model="keyDraft.note" class="input min-h-20" /></label>
-            <button class="btn btn-primary" type="button" :disabled="groupOptions.length === 0" @click="createGatewayKey">Create Key</button>
+            <label class="grid gap-1 text-sm">{{ $t('dashboard.name') }}<input v-model="keyDraft.name" class="input" /></label>
+            <label class="grid gap-1 text-sm">{{ $t('dashboard.customKeyOptional') }}<input v-model="keyDraft.customKey" class="input font-mono" placeholder="s2a_..." /></label>
+            <label class="grid gap-1 text-sm">{{ $t('dashboard.group') }}<select v-model="keyDraft.groupIds" class="input" :disabled="groupOptions.length === 0"><option v-for="group in groupOptions" :key="group.id" :value="group.id">{{ group.name || group.id }} · {{ group.platform }}</option></select></label>
+            <p v-if="selectedGroup" class="text-xs text-gray-500 dark:text-gray-400">{{ $t('dashboard.currentGroup', { group: selectedGroup.id }) }}</p>
+            <p v-if="groupOptions.length === 0" class="text-xs text-red-500">{{ $t('dashboard.noActiveGroups') }}</p>
+            <label class="grid gap-1 text-sm">{{ $t('dashboard.note') }}<textarea v-model="keyDraft.note" class="input min-h-20" /></label>
+            <button class="btn btn-primary" type="button" :disabled="groupOptions.length === 0" @click="createGatewayKey">{{ $t('dashboard.createKey') }}</button>
           </div>
           <div v-if="newKeyValue" class="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/30">
-            <p class="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-200">Copy now</p>
+            <p class="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-200">{{ $t('dashboard.copyNow') }}</p>
             <p class="mt-2 break-all font-mono text-xs text-amber-900 dark:text-amber-100">{{ newKeyValue }}</p>
-            <button class="btn btn-secondary mt-3" type="button" @click="copyNewKey">Copy</button>
+            <button class="btn btn-secondary mt-3" type="button" @click="copyNewKey">{{ $t('common.copy') }}</button>
           </div>
         </article>
       </section>
@@ -278,7 +280,7 @@ onMounted(() => {
       <section class="grid gap-4 lg:grid-cols-3">
         <RecentUsageCard :rows="recentUsage" :loading="recentUsageLoading" :error="recentUsageError" @refresh="refreshRecentUsage" />
         <article class="card">
-          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Runtime Status</h2>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.runtimeStatus') }}</h2>
           <pre class="mt-3 overflow-auto rounded-xl bg-gray-100 p-3 text-xs text-gray-600 dark:bg-dark-800 dark:text-gray-300">{{ JSON.stringify({ version: state?.version, config_version: state?.config.config_version, gateway_key_configured: state?.gateway.key_configured }, null, 2) }}</pre>
         </article>
       </section>

@@ -1,10 +1,16 @@
 package gateway
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +26,12 @@ import (
 type Store interface {
 	Snapshot() config.Config
 	TouchGatewayKeyLastUsed(id string, usedAt string) error
+	DisableAccount(accountID string) (bool, error)
 }
+
+const permanentFailureStrikeLimit = 3
+
+var cooldownCountdownPattern = regexp.MustCompile(`(?i)(?:try again|retry|available|reset)[^\n\r]{0,80}\b(?:in|after)\s+(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:ute)?s?)?)?\s*(?:(\d+)\s*s(?:ec(?:ond)?s?)?)?`)
 
 type Handler struct {
 	Store   Store
@@ -55,44 +66,88 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	taskType := taskTypeFromRequest(r, parsed)
 	decision := routing.Decide(cfg.Routing, routing.Request{TaskType: taskType, Model: parsed.Model, Tags: tagsFromRequest(r)})
-	account, state, err := h.Pool.SelectWithPolicy(decision, matchedKey.RoutingPolicy)
-	if err != nil {
-		h.recordRouting(decision, accountpool.AccountState{}, "no eligible account")
-		h.recordRequest("", matchedKey, parsed.Model, taskType, http.StatusServiceUnavailable, false, "no eligible upstream account")
-		writeOpenAIError(w, http.StatusServiceUnavailable, "no eligible upstream account", "server_error", "no_eligible_account")
-		return
-	}
 	h.touchKey(matchedKey)
-	h.recordRouting(decision, state, "")
-	client, err := clientForAccount(cfg, account)
-	if err != nil {
-		h.cooldown(account.ID)
-		h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "configured proxy is unavailable")
-		writeOpenAIError(w, http.StatusBadGateway, "configured proxy is unavailable", "api_error", "proxy_unavailable")
+	group := h.resolveGroup(cfg, matchedKey.RoutingPolicy)
+	sessionID := extractSessionID(r, group)
+	excluded := map[string]bool{}
+	maxAttempts := maxGatewayAttempts(group)
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		account, state, err := h.Pool.SelectWithPolicyOptions(decision, matchedKey.RoutingPolicy, group, accountpool.SelectOptions{SessionID: sessionID, Excluded: excluded})
+		if err != nil {
+			h.recordRouting(decision, accountpool.AccountState{}, "no eligible account")
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
+		h.recordRouting(decision, state, "")
+		activeAccountID := account.ID
+		h.Pool.IncrementActiveConn(activeAccountID)
+		active := true
+		defer func() {
+			if active {
+				h.Pool.DecrementActiveConn(activeAccountID)
+			}
+		}()
+		resp, err := h.forwardAttempt(r, cfg, account, body)
+		if err != nil {
+			h.Pool.DecrementActiveConn(activeAccountID)
+			active = false
+			excluded[account.ID] = true
+			h.cooldownWithGroup(account.ID, group, 0)
+			h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "upstream request failed")
+			lastErr = err
+			continue
+		}
+		rotateOnStatus := shouldRotateOnStatusCode(resp.StatusCode, group)
+		if rotateOnStatus {
+			cooldownOverride := retryAfterDuration(resp.Header)
+			var replayBody []byte
+			if cooldownOverride <= 0 {
+				replayBody, cooldownOverride = readCooldownBody(resp.Body)
+				resp.Body = io.NopCloser(bytes.NewReader(replayBody))
+			}
+			excluded[account.ID] = true
+			h.cooldownWithGroup(account.ID, group, cooldownOverride)
+			h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, resp.StatusCode, false, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
+			lastErr = errors.New("upstream returned HTTP " + http.StatusText(resp.StatusCode))
+			if attempt < maxAttempts {
+				h.recordFailureAndMaybeDisable(account.ID, resp.StatusCode)
+				h.Pool.DecrementActiveConn(activeAccountID)
+				active = false
+				_ = resp.Body.Close()
+				continue
+			}
+		}
+		if !rotateOnStatus && upstreamcompat.IsOpenAIErrorStatus(resp.StatusCode) && !isPermanentCredentialFailure(resp.StatusCode) {
+			h.cooldownWithGroup(account.ID, group, retryAfterDuration(resp.Header))
+		}
+		w.Header().Set("X-Simple-Sub2API-Attempts", strconv.Itoa(attempt))
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			h.Pool.MarkSuccess(account.ID)
+		} else {
+			h.recordFailureAndMaybeDisable(account.ID, resp.StatusCode)
+		}
+		if parsed.Stream {
+			h.writeStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
+			h.Pool.DecrementActiveConn(activeAccountID)
+			active = false
+			_ = resp.Body.Close()
+			return
+		}
+		h.writeNonStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
+		h.Pool.DecrementActiveConn(activeAccountID)
+		active = false
+		_ = resp.Body.Close()
 		return
 	}
-	upstreamReq, err := upstreamcompat.BuildUpstreamRequest(r, account, body)
-	if err != nil {
-		h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadRequest, false, "invalid upstream account configuration")
-		writeOpenAIError(w, http.StatusBadRequest, "invalid upstream account configuration", "invalid_request_error", "invalid_upstream")
-		return
+	message := "no eligible upstream account"
+	if lastErr != nil {
+		message = "group pool exhausted: " + lastErr.Error()
 	}
-	resp, err := client.Do(upstreamReq)
-	if err != nil {
-		h.cooldown(account.ID)
-		h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "upstream request failed")
-		writeOpenAIError(w, http.StatusBadGateway, "upstream request failed", "api_error", "upstream_request_failed")
-		return
-	}
-	defer resp.Body.Close()
-	if upstreamcompat.IsOpenAIErrorStatus(resp.StatusCode) {
-		h.cooldown(account.ID)
-	}
-	if parsed.Stream {
-		h.writeStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
-		return
-	}
-	h.writeNonStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
+	h.recordRequest("", matchedKey, parsed.Model, taskType, http.StatusServiceUnavailable, false, message)
+	writeOpenAIError(w, http.StatusServiceUnavailable, message, "server_error", "group_exhausted")
 }
 
 func clientForAccount(cfg config.Config, account config.Account) (*http.Client, error) {
@@ -106,6 +161,167 @@ func clientForAccount(cfg config.Config, account config.Account) (*http.Client, 
 		timeout = 60 * time.Second
 	}
 	return proxyclient.HTTPClient(spec, timeout)
+}
+
+func (h Handler) forwardAttempt(r *http.Request, cfg config.Config, account config.Account, body []byte) (*http.Response, error) {
+	if h.Pool == nil {
+		return nil, errors.New("account pool unavailable")
+	}
+	client, err := clientForAccount(cfg, account)
+	if err != nil {
+		return nil, err
+	}
+	upstreamReq, err := upstreamcompat.BuildUpstreamRequest(r, account, body)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(upstreamReq)
+}
+
+func (h Handler) resolveGroup(cfg config.Config, policy config.KeyRoutingPolicy) *config.Group {
+	if policy.Mode == "groups" && len(policy.GroupIDs) > 0 {
+		for _, groupID := range policy.GroupIDs {
+			if group := findActiveGroup(cfg.Groups, groupID); group != nil {
+				return group
+			}
+		}
+	}
+	for i := range cfg.Groups {
+		if cfg.Groups[i].Status == "active" && len(cfg.Groups[i].AccountIDs) > 0 {
+			return &cfg.Groups[i]
+		}
+	}
+	return nil
+}
+
+func findActiveGroup(groups []config.Group, groupID string) *config.Group {
+	for i := range groups {
+		if groups[i].ID == groupID && groups[i].Status == "active" {
+			return &groups[i]
+		}
+	}
+	return nil
+}
+
+func maxGatewayAttempts(group *config.Group) int {
+	maxAttempts := 1
+	if group != nil && group.RotationPolicy.RetryOnErrors {
+		maxAttempts = len(group.AccountIDs)
+		if maxAttempts > 3 {
+			maxAttempts = 3
+		}
+		if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+	}
+	return maxAttempts
+}
+
+func shouldRotateOnStatusCode(status int, group *config.Group) bool {
+	if group == nil || !group.RotationPolicy.RetryOnErrors {
+		return false
+	}
+	for _, code := range group.RotationPolicy.RotateErrorCodes {
+		if code == status {
+			return true
+		}
+	}
+	return false
+}
+
+func extractSessionID(r *http.Request, group *config.Group) string {
+	if group == nil || !group.RotationPolicy.StickySessionsEnabled {
+		return ""
+	}
+	header := strings.TrimSpace(group.RotationPolicy.StickyHeader)
+	if header == "" {
+		header = "X-Session-ID"
+	}
+	if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+		return value
+	}
+	if authorization := strings.TrimSpace(r.Header.Get("Authorization")); authorization != "" {
+		sum := sha256.Sum256([]byte(authorization))
+		return "auth:" + hex.EncodeToString(sum[:])
+	}
+	return ""
+}
+
+func retryAfterDuration(header http.Header) time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value != "" {
+		if duration := parseCooldownTime(value, false); duration > 0 {
+			return duration
+		}
+	}
+	reset := strings.TrimSpace(header.Get("X-RateLimit-Reset"))
+	if reset != "" {
+		if duration := parseCooldownTime(reset, true); duration > 0 {
+			return duration
+		}
+	}
+	return 0
+}
+
+func TestRetryAfterDuration(header http.Header) time.Duration {
+	return retryAfterDuration(header)
+}
+
+func parseCooldownTime(value string, allowUnixTimestamp bool) time.Duration {
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		if allowUnixTimestamp && seconds > 86400 {
+			duration := time.Until(time.Unix(int64(seconds), 0))
+			if duration > 0 {
+				return duration
+			}
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if unix, err := strconv.ParseInt(value, 10, 64); err == nil && allowUnixTimestamp && unix > 0 {
+		duration := time.Until(time.Unix(unix, 0))
+		if duration > 0 {
+			return duration
+		}
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		duration := time.Until(at)
+		if duration > 0 {
+			return duration
+		}
+	}
+	return 0
+}
+
+func readCooldownBody(body io.Reader) ([]byte, time.Duration) {
+	payload, err := io.ReadAll(io.LimitReader(body, 64<<10))
+	if err != nil {
+		return payload, 0
+	}
+	return payload, parseCooldownCountdown(string(payload))
+}
+
+func TestReadCooldownBody(body io.Reader) ([]byte, time.Duration) {
+	return readCooldownBody(body)
+}
+
+func parseCooldownCountdown(text string) time.Duration {
+	match := cooldownCountdownPattern.FindStringSubmatch(text)
+	if len(match) == 0 {
+		return 0
+	}
+	hours := atoiDefault(match[1])
+	minutes := atoiDefault(match[2])
+	seconds := atoiDefault(match[3])
+	duration := time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute + time.Duration(seconds)*time.Second
+	return duration
+}
+
+func atoiDefault(value string) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
 }
 
 func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
@@ -155,8 +371,19 @@ func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, account
 }
 
 func (h Handler) cooldown(accountID string) {
+	h.cooldownWithGroup(accountID, nil, 0)
+}
+
+func (h Handler) cooldownWithGroup(accountID string, group *config.Group, override time.Duration) {
+	duration := 30 * time.Second
+	if group != nil {
+		duration = time.Duration(group.RotationPolicy.CooldownDurationSeconds) * time.Second
+	}
+	if override > 0 {
+		duration = override
+	}
 	if h.Pool != nil && accountID != "" {
-		h.Pool.Cooldown(accountID, time.Now().UTC().Add(30*time.Second))
+		h.Pool.Cooldown(accountID, time.Now().UTC().Add(duration))
 	}
 	if h.Metrics != nil {
 		h.Metrics.RecordCooldown(accountID)
@@ -164,6 +391,33 @@ func (h Handler) cooldown(accountID string) {
 	if h.Logger != nil {
 		h.Logger.Warn("gateway upstream account cooldown", "account_id", accountID)
 	}
+}
+
+func (h Handler) recordFailureAndMaybeDisable(accountID string, statusCode int) {
+	if h.Pool == nil || h.Store == nil || !isPermanentCredentialFailure(statusCode) {
+		return
+	}
+	strikes := h.Pool.RecordFailure(accountID, true)
+	if strikes < permanentFailureStrikeLimit {
+		return
+	}
+	disabled, err := h.Store.DisableAccount(accountID)
+	if err != nil {
+		if h.Logger != nil {
+			h.Logger.Warn("gateway account auto-disable failed", "account_id", accountID, "error", err.Error())
+		}
+		return
+	}
+	if disabled && h.Logger != nil {
+		h.Logger.Warn("gateway account auto-disabled after permanent failures", "account_id", accountID, "strikes", strikes)
+	}
+	if disabled {
+		h.Pool.DisableAccount(accountID)
+	}
+}
+
+func isPermanentCredentialFailure(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
 
 func (h Handler) touchKey(key config.GatewayKey) {

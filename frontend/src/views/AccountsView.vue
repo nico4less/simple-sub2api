@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 
 import {
   applyImport,
@@ -13,7 +14,7 @@ import {
   testAllAccounts,
   updateAccount,
   type AccountConfig,
-  type AccountHealth,
+  type AccountRefreshResponse,
   type AccountSummary,
   type AccountsResponse,
   type GroupConfig,
@@ -29,12 +30,30 @@ import { useAdminState } from '@/composables/useAdminState'
 import { allModels, getModelsByPlatform } from '@/composables/useModelWhitelist'
 import type { Column } from '@/types/ui'
 
+const { t } = useI18n()
+
 interface AccountRow extends Record<string, unknown> {
   id: string
   label: string
+  platform: string
+  platformType: string
   type: string
   tier: string
+  tierLabel: string
   tags: string[]
+  customLabel: string
+  proxyDisabled: boolean
+  validationBlocked: boolean
+  validationBlockedLabel: string
+  forbidden: boolean
+  lastUsedDate: string
+  lastUsedTime: string
+  lastUsedTitle: string
+  quotaModels: QuotaModelRow[]
+  displayModels: QuotaModelRow[]
+  protectedModels: string[]
+  accountBadges: BadgeChip[]
+  failureState: AccountFailureState | null
   source: string
   proxy: string
   model: string
@@ -47,7 +66,44 @@ interface AccountRow extends Record<string, unknown> {
   quotaStatus: string
   hits: number
   errors: number
+  capacityCurrent: number
+  capacityLimit: number
+  priority: number
+  expiresAt: string
+  usageWindows: UsageWindow[]
   summary: AccountSummary
+}
+
+interface QuotaModelRow {
+  id: string
+  label: string
+  percentage: number
+  resetTime: string
+  isProtected: boolean
+  usedLabel?: string
+}
+
+interface BadgeChip {
+  key: string
+  label: string
+  className: string
+  icon: 'circle' | 'diamond' | 'gem' | 'lock' | 'clock'
+  title?: string
+}
+
+interface AccountFailureState {
+  tone: 'red' | 'amber'
+  icon: 'ban' | 'lock' | 'clock'
+  label: string
+  detail: string
+}
+
+interface UsageWindow {
+  label: string
+  used: number
+  limit: number
+  percent: number
+  status: string
 }
 
 const { refresh } = useAdminState()
@@ -56,6 +112,7 @@ const error = ref('')
 const notice = ref('')
 const accountsState = ref<AccountsResponse | null>(null)
 const groupsState = ref<GroupsResponse | null>(null)
+const completingAccount = ref(false)
 const search = ref('')
 const statusFilter = ref('all')
 const typeFilter = ref('all')
@@ -63,7 +120,7 @@ const importOpen = ref(false)
 const importContent = ref('')
 const importKind = ref<'line_tokens' | 'json_bundle' | 'inline_bundle'>('line_tokens')
 const operationOutput = ref('')
-const testResult = ref<AccountHealth | null>(null)
+const testResult = ref<AccountRefreshResponse | null>(null)
 const editorOpen = ref(false)
 const editorMode = ref<'create' | 'edit'>('create')
 const editorStep = ref<1 | 2>(1)
@@ -76,6 +133,11 @@ const showGeminiHelpDialog = ref(false)
 const modelSearchQuery = ref('')
 const customModelInput = ref('')
 const isCustomModelComposing = ref(false)
+const selectedAccountIds = ref<Set<string>>(new Set())
+const refreshingAccountIds = ref<Set<string>>(new Set())
+const deletingAccountIds = ref<Set<string>>(new Set())
+const editingLabelAccountId = ref('')
+const labelDraft = ref('')
 
 const computedAuthUrl = ref('')
 const copiedUrl = ref(false)
@@ -243,7 +305,7 @@ watch(editorOpen, (isOpen: boolean) => {
 })
 
 
-function t(key: string, params?: Record<string, string | number>) {
+function translateFallback(key: string, params?: Record<string, string | number>) {
   const messages: Record<string, string> = {
     'admin.accounts.createAccount': 'Create Account',
     'admin.accounts.accountName': 'Account Name',
@@ -579,39 +641,616 @@ const form = reactive({
   model_mappings: [] as ModelMapping[]
 })
 
-const accountColumns: Column<AccountRow>[] = [
-  { key: 'label', label: 'Account' },
-  { key: 'status', label: 'Health' },
-  { key: 'type', label: 'Type' },
-  { key: 'tier', label: 'Tier / Tags' },
-  { key: 'source', label: 'Source / Proxy' },
-  { key: 'baseURL', label: 'Model / Base URL' },
-  { key: 'actions', label: 'Actions' }
-]
+const accountColumns = computed<Column<AccountRow>[]>(() => [
+  {
+    key: 'select',
+    label: '',
+    mobileLabel: 'Select',
+    headerClass: 'w-[44px] pl-2 pr-1 text-center',
+    cellClass: 'w-[44px] pl-2 pr-1'
+  },
+  {
+    key: 'label',
+    label: 'Account Core',
+    headerClass: 'w-[320px] min-w-[280px] whitespace-nowrap',
+    cellClass: 'w-[320px] min-w-[280px]'
+  },
+  {
+    key: 'quota',
+    label: 'Quota & Error Block',
+    headerClass: 'min-w-[420px] whitespace-nowrap',
+    cellClass: 'min-w-[420px]'
+  },
+  {
+    key: 'lastUsed',
+    label: 'Last Used',
+    headerClass: 'w-[112px] whitespace-nowrap',
+    cellClass: 'w-[112px]'
+  },
+  {
+    key: 'actions',
+    label: t('common.actions'),
+    headerClass: 'sticky right-0 z-20 w-[196px] bg-gray-50/95 text-center shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.2)] backdrop-blur dark:bg-dark-800/95',
+    cellClass: 'sticky right-0 z-10 w-[196px] bg-white/95 text-center shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.18)] backdrop-blur dark:bg-dark-900/95'
+  }
+])
+
+function metadataOf(account: AccountConfig): Record<string, unknown> {
+  return account.metadata || {}
+}
+
+function stringMetadata(metadata: Record<string, unknown>, key: string, fallback = ''): string {
+  const value = metadata[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : fallback
+}
+
+function numberMetadata(metadata: Record<string, unknown>, key: string, fallback = 0): number {
+  const value = metadata[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
+}
+
+function booleanMetadata(metadata: Record<string, unknown>, key: string, fallback = false): boolean {
+  const value = metadata[key]
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') return ['true', '1', 'yes', 'enabled'].includes(value.trim().toLowerCase())
+  if (typeof value === 'number') return value !== 0
+  return fallback
+}
+
+function numberRecordValue(record: Record<string, unknown> | undefined, key: string, fallback = 0): number {
+  const value = record?.[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
+}
+
+function booleanRecordValue(record: Record<string, unknown> | undefined, key: string, fallback = false): boolean {
+  const value = record?.[key]
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') return ['true', '1', 'yes', 'enabled'].includes(value.trim().toLowerCase())
+  if (typeof value === 'number') return value !== 0
+  return fallback
+}
+
+function stringRecordValue(record: Record<string, unknown> | undefined, key: string, fallback = ''): string {
+  const value = record?.[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : fallback
+}
+
+function nestedRecord(record: Record<string, unknown> | undefined, key: string): Record<string, unknown> | undefined {
+  const value = record?.[key]
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
+}
+
+function firstStringValue(records: Array<Record<string, unknown> | undefined>, keys: string[], fallback = ''): string {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = stringRecordValue(record, key)
+      if (value) return value
+    }
+  }
+  return fallback
+}
+
+function firstNumberValue(records: Array<Record<string, unknown> | undefined>, keys: string[], fallback = 0): number {
+  for (const record of records) {
+    for (const key of keys) {
+      const raw = record?.[key]
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        const parsed = Number(raw)
+        if (Number.isFinite(parsed)) return parsed
+      }
+    }
+  }
+  return fallback
+}
+
+function inferPlatform(account: AccountConfig): string {
+  const metadata = metadataOf(account)
+  const platform = stringMetadata(metadata, 'platform')
+  if (platform) return platform
+  const type = account.type || ''
+  if (type.startsWith('anthropic')) return 'anthropic'
+  if (type.startsWith('gemini')) return 'gemini'
+  if (type.startsWith('openai')) return 'openai'
+  return type === 'oauth' ? 'oauth' : 'openai'
+}
+
+function formatTierLabel(summary: AccountSummary): string {
+  const tier = summary.subscription_tier || stringRecordValue(summary.quota, 'subscription_tier', summary.config.tier || 'simple')
+  return tier.replace(/_/g, ' ')
+}
+
+function titleizeLabel(raw: string): string {
+  return raw
+    .split(/[\s_-]+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(' ')
+}
+
+function platformDisplayName(platform: string): string {
+  switch (platform) {
+    case 'anthropic':
+      return 'Anthropic'
+    case 'openai':
+      return 'OpenAI'
+    case 'gemini':
+      return 'Gemini'
+    case 'antigravity':
+      return 'Antigravity'
+    default:
+      return titleizeLabel(platform || 'Platform')
+  }
+}
+
+function accountTypeDisplayName(type: string): string {
+  switch (type) {
+    case 'oauth':
+      return 'OAuth'
+    case 'setup-token':
+      return 'Setup Token'
+    case 'apikey':
+    case 'openai_api_key':
+    case 'anthropic_api_key':
+    case 'gemini_api_key':
+      return 'API Key'
+    case 'service_account':
+      return 'Service Account'
+    case 'bedrock':
+      return 'Bedrock'
+    case 'upstream':
+      return 'Upstream'
+    default:
+      return titleizeLabel(type || 'Account')
+  }
+}
+
+function makeBadgeChip(key: string, label: string, className: string, icon: BadgeChip['icon'], title?: string): BadgeChip {
+  return { key, label, className, icon, title }
+}
+
+function subscriptionTierBadge(tier: 'ultra' | 'pro' | 'free'): BadgeChip {
+  if (tier === 'ultra') {
+    return makeBadgeChip(
+      'subscription:ultra',
+      'Ultra',
+      'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105',
+      'gem',
+      'Subscription tier: Ultra'
+    )
+  }
+  if (tier === 'pro') {
+    return makeBadgeChip(
+      'subscription:pro',
+      'Pro',
+      'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105',
+      'diamond',
+      'Subscription tier: Pro'
+    )
+  }
+  return makeBadgeChip(
+    'subscription:free',
+    'Free',
+    'inline-flex items-center gap-1 rounded-md border border-gray-200 bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-600 shadow-sm dark:border-white/10 dark:bg-white/10 dark:text-gray-300',
+    'circle',
+    'Subscription tier: Free'
+  )
+}
+
+function openAIPlanBadge(summary: AccountSummary, metadata: Record<string, unknown>, fallbackTier: string): BadgeChip | null {
+  const raw = summary.subscription_tier || stringRecordValue(summary.quota, 'subscription_tier', fallbackTier)
+  const lower = raw.toLowerCase()
+  if (!lower) return null
+  if (lower.includes('ultra')) {
+    return makeBadgeChip('openai-plan:ultra', 'Ultra', 'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105', 'gem', `OpenAI plan: ${raw}`)
+  }
+  if (lower.includes('plus')) {
+    return makeBadgeChip('openai-plan:plus', 'Plus', 'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105', 'diamond', `OpenAI plan: ${raw}`)
+  }
+  if (lower.includes('pro') || lower.includes('paid') || lower.includes('enterprise') || lower.includes('standard') || lower.includes('team')) {
+    const label = lower.includes('team') ? 'Team' : lower.includes('enterprise') ? 'Enterprise' : lower.includes('standard') ? 'Standard' : 'Pro'
+    return makeBadgeChip(`openai-plan:${label.toLowerCase()}`, label, 'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105', 'diamond', `OpenAI plan: ${raw}`)
+  }
+  if (lower.includes('free') || lower.includes('simple')) {
+    return makeBadgeChip('openai-plan:free', 'Free', 'inline-flex items-center gap-1 rounded-md border border-gray-200 bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-600 shadow-sm dark:border-white/10 dark:bg-white/10 dark:text-gray-300', 'circle', `OpenAI plan: ${raw}`)
+  }
+  return makeBadgeChip(`openai-plan:${lower}`, titleizeLabel(raw), 'inline-flex items-center gap-1 rounded-md border border-gray-200 bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-600 shadow-sm dark:border-white/10 dark:bg-white/10 dark:text-gray-300', 'circle', `OpenAI plan: ${raw}`)
+}
+
+function openAIPrivacyBadge(summary: AccountSummary): BadgeChip | null {
+  const raw = summary.privacy_mode || stringRecordValue(summary.quota, 'privacy_mode', '')
+  const lower = raw.toLowerCase()
+  if (!lower) return null
+  if (lower.includes('off') || lower.includes('private') || lower === 'training_off' || lower === 'privacy_set') {
+    return makeBadgeChip('openai-privacy:private', 'Private', 'inline-flex items-center gap-1 rounded-md bg-green-100 px-2 py-0.5 text-[10px] font-bold text-green-700 shadow-sm dark:bg-green-900/30 dark:text-green-300', 'lock', `OpenAI privacy: ${raw}`)
+  }
+  if (lower.includes('cf')) {
+    return makeBadgeChip('openai-privacy:cf', 'CF', 'inline-flex items-center gap-1 rounded-md bg-yellow-100 px-2 py-0.5 text-[10px] font-bold text-yellow-700 shadow-sm dark:bg-yellow-900/30 dark:text-yellow-300', 'clock', `OpenAI privacy: ${raw}`)
+  }
+  if (lower.includes('fail')) {
+    return makeBadgeChip('openai-privacy:fail', 'Fail', 'inline-flex items-center gap-1 rounded-md bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700 shadow-sm dark:bg-red-900/30 dark:text-red-300', 'lock', `OpenAI privacy: ${raw}`)
+  }
+  return null
+}
+
+function openAICompactBadge(summary: AccountSummary): BadgeChip | null {
+  const raw = summary.openai_compact_mode || stringRecordValue(summary.quota, 'openai_compact_mode', '')
+  if (!raw) return null
+  const lower = raw.toLowerCase()
+  if (lower === 'auto') {
+    return makeBadgeChip('openai-compact:auto', 'Compact Auto', 'inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600 shadow-sm dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-300', 'circle', 'OpenAI compact mode: auto')
+  }
+  if (lower === 'off' || lower === 'force_off') {
+    return makeBadgeChip('openai-compact:off', 'Compact Off', 'inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600 shadow-sm dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-300', 'circle', 'OpenAI compact mode: off')
+  }
+  if (lower === 'force' || lower === 'force_on') {
+    return makeBadgeChip('openai-compact:on', 'Compact On', 'inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600 shadow-sm dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-300', 'circle', 'OpenAI compact mode: on')
+  }
+  return makeBadgeChip(`openai-compact:${lower}`, `Compact ${titleizeLabel(raw)}`, 'inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-600 shadow-sm dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-300', 'circle', `OpenAI compact mode: ${raw}`)
+}
+
+function buildAccountBadges(account: AccountConfig, summary: AccountSummary, metadata: Record<string, unknown>, platform: string): BadgeChip[] {
+  const badges: BadgeChip[] = [
+    makeBadgeChip(
+      'platform',
+      platformDisplayName(platform),
+      'inline-flex items-center gap-1 rounded-md border border-emerald-200/70 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300',
+      'circle',
+      `Platform: ${platformDisplayName(platform)}`
+    ),
+    makeBadgeChip(
+      'type',
+      accountTypeDisplayName(account.type || 'openai_api_key'),
+      'inline-flex items-center gap-1 rounded-md border border-emerald-200/70 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300',
+      'circle',
+      `Type: ${accountTypeDisplayName(account.type || 'openai_api_key')}`
+    )
+  ]
+
+  if (platform === 'openai') {
+    const planBadge = openAIPlanBadge(summary, metadata, account.tier || '')
+    if (planBadge) badges.push(planBadge)
+    const privacyBadge = openAIPrivacyBadge(summary)
+    if (privacyBadge) badges.push(privacyBadge)
+    const compactBadge = openAICompactBadge(summary)
+    if (compactBadge) badges.push(compactBadge)
+    return badges
+  }
+
+  badges.push(subscriptionTierBadge(normalizedSubscriptionTier({ tier: account.tier, tierLabel: formatTierLabel(summary), summary })))
+  return badges
+}
+
+function normalizedSubscriptionTier(row: { tier?: string; tierLabel?: string; summary?: AccountSummary }): 'ultra' | 'pro' | 'free' {
+  const raw = row.summary?.subscription_tier || stringRecordValue(row.summary?.quota, 'subscription_tier', `${row.tierLabel || row.tier || ''}`)
+  const lower = raw.toLowerCase()
+  if (lower.includes('ultra')) return 'ultra'
+  if (lower.includes('pro') || lower.includes('paid') || lower.includes('standard') || lower.includes('enterprise')) return 'pro'
+  return 'free'
+}
+
+function formatValidationBlockedLabel(summary: AccountSummary, metadata: Record<string, unknown>): string {
+  const cooldownUntil = stringRecordValue(summary.runtime, 'cooldown_until') || stringMetadata(metadata, 'validation_blocked_until')
+  if (!cooldownUntil) return 'Validation Blocked'
+  const until = Date.parse(cooldownUntil)
+  if (!Number.isFinite(until)) return 'Validation Blocked'
+  const seconds = Math.max(0, Math.ceil((until - Date.now()) / 1000))
+  if (seconds <= 0) return 'Validation cooling down'
+  if (seconds >= 3600) return `Validation blocked · ${Math.ceil(seconds / 3600)}h`
+  if (seconds >= 60) return `Validation blocked · ${Math.ceil(seconds / 60)}m`
+  return `Validation blocked · ${seconds}s`
+}
+
+function buildLastUsed(summary: AccountSummary): { date: string; time: string; title: string } {
+  const raw = stringRecordValue(summary.runtime, 'last_selected_at') || stringRecordValue(summary.metrics as Record<string, unknown> | undefined, 'last_used_at')
+  const timestamp = raw ? Date.parse(raw) : NaN
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return { date: 'Never', time: '—', title: 'Never used' }
+  }
+  const value = new Date(timestamp)
+  return {
+    date: value.toLocaleDateString(),
+    time: value.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    title: raw
+  }
+}
+
+function normalizeModelLabel(modelID: string): string {
+  const normalized = modelID.replace(/[_-]+/g, ' ').trim()
+  if (!normalized) return 'Model'
+  if (normalized.toLowerCase().includes('gemini') && normalized.toLowerCase().includes('flash')) return 'Gemini Flash'
+  if (normalized.toLowerCase().includes('gemini') && normalized.toLowerCase().includes('pro')) return 'Gemini Pro'
+  if (normalized.toLowerCase().includes('claude')) return 'Claude'
+  return normalized
+    .split(' ')
+    .map((item) => item.charAt(0).toUpperCase() + item.slice(1))
+    .join(' ')
+}
+
+function protectedModelList(metadata: Record<string, unknown>): string[] {
+  const value = metadata.protected_models
+  if (Array.isArray(value)) return value.map(String).map((item) => item.toLowerCase())
+  if (typeof value === 'string') return splitList(value).map((item) => item.toLowerCase())
+  return []
+}
+
+function isModelProtected(protectedModels: string[], modelID: string, label: string): boolean {
+  const candidates = [modelID, label].map((item) => item.toLowerCase())
+  if (candidates.some((item) => protectedModels.includes(item))) return true
+  if (label.toLowerCase().includes('gemini pro')) return protectedModels.some((item) => item.includes('gemini') && item.includes('pro'))
+  if (label.toLowerCase().includes('gemini flash')) return protectedModels.some((item) => item.includes('gemini') && item.includes('flash'))
+  if (label.toLowerCase().includes('claude')) return protectedModels.some((item) => item.includes('claude'))
+  return false
+}
+
+function resetLabel(raw: string): string {
+  if (!raw) return 'rolling'
+  const parsed = Date.parse(raw)
+  if (!Number.isFinite(parsed)) return raw
+  const seconds = Math.max(0, Math.ceil((parsed - Date.now()) / 1000))
+  if (seconds <= 0) return 'now'
+  if (seconds >= 86400) return `${Math.ceil(seconds / 86400)}d`
+  if (seconds >= 3600) return `${Math.ceil(seconds / 3600)}h`
+  if (seconds >= 60) return `${Math.ceil(seconds / 60)}m`
+  return `${seconds}s`
+}
+
+function secondsResetLabel(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  if (seconds >= 86400) return `${Math.ceil(seconds / 86400)}d`
+  if (seconds >= 3600) return `${Math.ceil(seconds / 3600)}h`
+  if (seconds >= 60) return `${Math.ceil(seconds / 60)}m`
+  return `${Math.ceil(seconds)}s`
+}
+
+function usageProgressRow(id: string, label: string, usage: Record<string, unknown> | undefined, fallbackReset = ''): QuotaModelRow | null {
+  if (!usage) return null
+  const utilization = firstNumberValue([usage], ['utilization', 'used_percent', 'percentage'], Number.NaN)
+  if (!Number.isFinite(utilization)) return null
+  const resetRaw = firstStringValue([usage], ['resets_at', 'reset_at', 'reset_time'], '')
+  const remaining = firstNumberValue([usage], ['remaining_seconds', 'reset_after_seconds'], 0)
+  const stats = nestedRecord(usage, 'window_stats')
+  const usedCost = firstNumberValue([stats, usage], ['cost', 'standard_cost', 'used', 'used_cost'], Number.NaN)
+  const usedLabel = Number.isFinite(usedCost) ? `$${usedCost.toFixed(3)}` : undefined
+  return {
+    id,
+    label,
+    percentage: Math.max(0, Math.min(100, utilization)),
+    resetTime: resetRaw ? resetLabel(resetRaw) : secondsResetLabel(remaining) || fallbackReset,
+    isProtected: false,
+    usedLabel
+  }
+}
+
+function quotaWindowRows(summary: AccountSummary, metadata: Record<string, unknown>): QuotaModelRow[] {
+  const usageInfo = summary.usage_info || nestedRecord(summary.quota, 'usage_info') || {}
+  const rowsFromUsage = [
+    usageProgressRow('five-hour', '5h', nestedRecord(usageInfo, 'five_hour'), '5h'),
+    usageProgressRow('seven-day', '7d', nestedRecord(usageInfo, 'seven_day'), '7d')
+  ].filter((row): row is QuotaModelRow => row !== null)
+  if (rowsFromUsage.length > 0) return rowsFromUsage
+
+  const codex5h = firstNumberValue([metadata, summary.quota], ['codex_5h_used_percent'], Number.NaN)
+  const codex7d = firstNumberValue([metadata, summary.quota], ['codex_7d_used_percent'], Number.NaN)
+  const codexRows: QuotaModelRow[] = []
+  if (Number.isFinite(codex5h)) {
+    codexRows.push({
+      id: 'five-hour',
+      label: '5h',
+      percentage: Math.max(0, Math.min(100, codex5h)),
+      resetTime: resetLabel(firstStringValue([metadata, summary.quota], ['codex_5h_reset_at'])) || secondsResetLabel(firstNumberValue([metadata, summary.quota], ['codex_5h_reset_after_seconds'])),
+      isProtected: false
+    })
+  }
+  if (Number.isFinite(codex7d)) {
+    codexRows.push({
+      id: 'seven-day',
+      label: '7d',
+      percentage: Math.max(0, Math.min(100, codex7d)),
+      resetTime: resetLabel(firstStringValue([metadata, summary.quota], ['codex_7d_reset_at'])) || secondsResetLabel(firstNumberValue([metadata, summary.quota], ['codex_7d_reset_after_seconds'])),
+      isProtected: false
+    })
+  }
+  if (codexRows.length > 0) return codexRows
+
+  const fiveHourUsed = firstNumberValue([metadata, summary.quota], ['window_cost_used', 'session_window_cost_used'], 0)
+  const fiveHourLimit = firstNumberValue([metadata, summary.quota], ['window_cost_limit', 'session_window_cost_limit'], 0)
+  const weeklyUsed = firstNumberValue([metadata, summary.quota], ['weekly_used_tokens', 'quota_weekly_used'], 0)
+  const weeklyLimit = firstNumberValue([metadata, summary.quota], ['weekly_limit_tokens', 'quota_weekly_limit'], 0)
+  return [
+    {
+      id: 'five-hour',
+      label: '5h',
+      percentage: clampPercent(fiveHourUsed, fiveHourLimit),
+      resetTime: resetLabel(firstStringValue([metadata, summary.quota], ['session_window_reset_at', 'window_cost_reset_at'])) || '5h',
+      isProtected: false,
+      usedLabel: fiveHourLimit > 0 ? `$${fiveHourUsed.toFixed(3)}/$${fiveHourLimit.toFixed(2)}` : '$0/∞'
+    },
+    {
+      id: 'seven-day',
+      label: '7d',
+      percentage: clampPercent(weeklyUsed, weeklyLimit),
+      resetTime: resetLabel(firstStringValue([metadata, summary.quota], ['quota_weekly_reset_at', 'weekly_reset_at'])) || '7d',
+      isProtected: false,
+      usedLabel: weeklyLimit > 0 ? `${formatUsageValue(weeklyUsed)}/${formatUsageValue(weeklyLimit)}` : '0/∞'
+    }
+  ]
+}
+
+function quotaModelRows(summary: AccountSummary, metadata: Record<string, unknown>): QuotaModelRow[] {
+  const quota = summary.quota || {}
+  const windowRows = quotaWindowRows(summary, metadata)
+  if (windowRows.length > 0) return windowRows
+  const protectedModels = protectedModelList(metadata)
+  const quotaModels = quota.models
+  const models = Array.isArray(quotaModels)
+    ? quotaModels
+        .filter((model): model is Record<string, unknown> => typeof model === 'object' && model !== null)
+        .map((model) => {
+          const id = stringRecordValue(model, 'name') || stringRecordValue(model, 'id') || 'model'
+          const label = stringRecordValue(model, 'display_name') || normalizeModelLabel(id)
+          return {
+            id,
+            label,
+            percentage: Math.max(0, Math.min(100, numberRecordValue(model, 'percentage', numberRecordValue(model, 'usage_ratio', 0) * 100))),
+            resetTime: stringRecordValue(model, 'reset_time') || stringRecordValue(model, 'reset_at'),
+            isProtected: isModelProtected(protectedModels, id, label)
+          }
+        })
+    : []
+
+  if (models.length > 0) return models.slice(0, 6)
+
+  const weeklyRatio = numberRecordValue(quota, 'usage_ratio', 0)
+  const weeklyPercent = weeklyRatio > 1 ? weeklyRatio : weeklyRatio * 100
+  return [
+    { id: 'gemini-pro', label: 'Gemini Pro', percentage: Math.max(0, Math.min(100, weeklyPercent)), resetTime: '7d', isProtected: isModelProtected(protectedModels, 'gemini-pro', 'Gemini Pro') },
+    { id: 'gemini-flash', label: 'Gemini Flash', percentage: Math.max(0, Math.min(100, weeklyPercent * 0.55)), resetTime: '5h', isProtected: isModelProtected(protectedModels, 'gemini-flash', 'Gemini Flash') },
+    { id: 'claude', label: 'Claude', percentage: Math.max(0, Math.min(100, weeklyPercent * 0.75)), resetTime: 'rolling', isProtected: isModelProtected(protectedModels, 'claude', 'Claude') }
+  ]
+}
+
+function buildFailureState(row: {
+  enabled: boolean
+  forbidden: boolean
+  validationBlocked: boolean
+  validationBlockedLabel: string
+  lastError: string
+  quotaStatus: string
+}): AccountFailureState | null {
+  if (row.validationBlocked) {
+    return { tone: 'amber', icon: 'clock', label: row.validationBlockedLabel, detail: row.lastError || 'Risk cooldown is active. Validation requests are temporarily blocked.' }
+  }
+  if (row.forbidden) {
+    return { tone: 'red', icon: 'lock', label: 'Forbidden', detail: row.lastError || `Quota guard blocked this account with status ${row.quotaStatus}.` }
+  }
+  if (!row.enabled) {
+    return { tone: 'red', icon: 'ban', label: 'Disabled', detail: row.lastError || 'This account is disabled in the local JSON config.' }
+  }
+  return null
+}
+
+function clampPercent(used: number, limit: number): number {
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return 0
+  return Math.max(0, Math.min(100, (used / limit) * 100))
+}
+
+function buildUsageWindows(summary: AccountSummary, metadata: Record<string, unknown>): UsageWindow[] {
+  const quota = summary.quota || {}
+  const windowLimit = numberMetadata(metadata, 'window_cost_limit')
+  const weeklyUsed = numberRecordValue(quota, 'weekly_used_tokens')
+  const weeklyLimit = numberRecordValue(quota, 'weekly_limit_tokens')
+  return [
+    {
+      label: '5h',
+      used: 0,
+      limit: windowLimit,
+      percent: clampPercent(0, windowLimit),
+      status: windowLimit > 0 ? 'configured' : 'unlimited'
+    },
+    {
+      label: '7d',
+      used: weeklyUsed,
+      limit: weeklyLimit,
+      percent: clampPercent(weeklyUsed, weeklyLimit),
+      status: String(quota.status || 'unknown')
+    }
+  ]
+}
+
+function formatUsageValue(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0'
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return String(Math.round(value))
+}
+
+function inferCategoryFromAccount(account: AccountConfig, metadata: Record<string, unknown>): AccountCategory {
+  const saved = String(metadata.account_category || '') as AccountCategory
+  const platform = String(metadata.platform || inferPlatform(account)) as PlatformOption
+  if (saved && (categoryCards[platform] || []).some((item) => item.value === saved)) return saved
+  if (account.type === 'oauth') return 'oauth-based'
+  if (account.type === 'openai_compatible') return 'upstream'
+  if (account.type.includes('bedrock')) return 'bedrock'
+  if (account.type.includes('vertex') || account.type.includes('service_account')) return 'service_account'
+  return 'apikey'
+}
 
 const rows = computed<AccountRow[]>(() =>
   (accountsState.value?.accounts || []).map((summary) => {
     const account = summary.config
     const health = summary.health
+    const metadata = metadataOf(account)
     const quotaStatus = String(summary.quota?.status || 'unknown')
+    const platform = inferPlatform(account)
+    const capacityLimit = Math.max(1, Math.round(numberMetadata(metadata, 'concurrency', 1)))
+    const capacityCurrent = Math.max(0, Math.round(numberRecordValue(summary.runtime, 'active_conns', 0)))
+    const customLabel = stringMetadata(metadata, 'custom_label') || stringMetadata(metadata, 'label_tag') || stringMetadata(metadata, 'display_tag')
+    const proxyDisabled = booleanRecordValue(summary.runtime, 'proxy_disabled') || booleanMetadata(metadata, 'proxy_disabled') || Boolean(stringMetadata(metadata, 'proxy_ref_backup'))
+    const forbidden = booleanRecordValue(summary.quota, 'is_forbidden') || ['blocked', 'forbidden'].includes(quotaStatus.toLowerCase())
+    const validationBlocked = Boolean(stringRecordValue(summary.runtime, 'cooldown_until')) || booleanMetadata(metadata, 'validation_blocked') || summary.runtime_status === 'cooldown'
+    const validationBlockedLabel = formatValidationBlockedLabel(summary, metadata)
+    const lastUsed = buildLastUsed(summary)
+    const quotaModels = quotaModelRows(summary, metadata)
+    const protectedModels = protectedModelList(metadata)
+    const baseRow = {
+      enabled: account.enabled !== false,
+      forbidden,
+      validationBlocked,
+      validationBlockedLabel,
+      lastError: health?.message || stringRecordValue(summary.quota, 'error'),
+      quotaStatus
+    }
     return {
       id: account.id,
       label: account.label || account.id,
+      platform,
+      platformType: `${platform} / ${account.type || 'openai_api_key'}`,
       type: account.type || 'openai_api_key',
       tier: account.tier || 'simple',
+      tierLabel: formatTierLabel(summary),
       tags: account.tags || [],
+      customLabel,
+      proxyDisabled,
+      validationBlocked,
+      validationBlockedLabel,
+      forbidden,
+      lastUsedDate: lastUsed.date,
+      lastUsedTime: lastUsed.time,
+      lastUsedTitle: lastUsed.title,
+      quotaModels,
+      displayModels: quotaModels.slice(0, 6),
+      protectedModels,
+      failureState: buildFailureState(baseRow),
       source: account.source_id || summary.source || 'manual',
       proxy: account.proxy_ref || 'direct',
       model: account.model || 'default',
       baseURL: account.base_url || 'same gateway default',
-      enabled: account.enabled !== false,
+      enabled: baseRow.enabled,
       status: summary.runtime_status || (account.enabled === false ? 'disabled' : 'unknown'),
       healthStatus: health?.status || 'unknown',
       lastChecked: health?.checked_at || '',
-      lastError: health?.message || '',
+      lastError: baseRow.lastError,
       quotaStatus,
       hits: Number(summary.metrics?.hits || 0),
       errors: Number(summary.metrics?.errors || 0),
+      capacityCurrent,
+      capacityLimit,
+      priority: Math.round(numberMetadata(metadata, 'priority', 1)),
+      expiresAt: stringMetadata(metadata, 'expires_at'),
+      usageWindows: buildUsageWindows(summary, metadata),
+      accountBadges: buildAccountBadges(account, summary, metadata, platform),
       summary
     }
   })
@@ -631,6 +1270,8 @@ const filteredRows = computed(() => {
     return matchesQuery && matchesStatus && matchesType
   })
 })
+
+const allVisibleSelected = computed(() => filteredRows.value.length > 0 && filteredRows.value.every((row) => selectedAccountIds.value.has(row.id)))
 
 const statusOptions = computed(() => ['all', ...Array.from(new Set(rows.value.flatMap((row) => [row.status, row.healthStatus]).filter(Boolean))).sort()])
 const typeOptions = computed(() => ['all', ...Array.from(new Set(rows.value.map((row) => row.type))).sort()])
@@ -674,11 +1315,18 @@ const showGeminiAdvanced = computed(() => form.platform === 'gemini')
 const showAntigravityAdvanced = computed(() => form.platform === 'antigravity')
 const isClaudeOAuthFlow = computed(() => form.platform === 'anthropic' && form.category === 'oauth-based')
 const showClaudeQuotaControls = computed(() => form.platform === 'anthropic' && form.category === 'oauth-based')
+const oauthCredentialStatus = computed(() => {
+  if (!isOAuthFlow.value) return ''
+  const credential = buildCredential().trim()
+  if (credential) return t('accounts.oauthFlow.credentialReady')
+  if (activeOAuthTab.value === 'manual') return t('accounts.oauthFlow.pasteCodeToEnableSave')
+  return t('accounts.oauthFlow.enterCredentialToEnableSave')
+})
 const authorizationStepTitle = computed(() => {
-  if (form.platform === 'anthropic') return 'Claude Account Authorization'
-  if (form.platform === 'openai') return 'OpenAI Account Authorization'
-  if (form.platform === 'gemini') return 'Gemini Account Authorization'
-  return 'Antigravity Account Authorization'
+  if (form.platform === 'anthropic') return t('accounts.oauth.title')
+  if (form.platform === 'openai') return t('accounts.oauth.openai.title')
+  if (form.platform === 'gemini') return t('accounts.oauth.gemini.title')
+  return t('accounts.oauth.antigravity.title')
 })
 const canContinueAccountSetup = computed(() => true)
 const canSubmit = computed(() => canContinueAccountSetup.value && buildCredential().trim() !== '')
@@ -1027,9 +1675,10 @@ function openCreate() {
 
 function openEdit(row: AccountRow) {
   const account = row.summary.config
+  const metadata = metadataFromAccount(account)
   editorMode.value = 'edit'
-  showAdvancedAccountOptions.value = false
-  showAdvancedOAuth.value = false
+  showAdvancedAccountOptions.value = true
+  showAdvancedOAuth.value = true
   showGeminiHelpDialog.value = false
   form.id = account.id
   form.label = account.label || account.id
@@ -1044,7 +1693,18 @@ function openEdit(row: AccountRow) {
   form.quota_policy = account.quota_policy || ''
   form.enabled = account.enabled !== false
   applyCredentialEnvelope(account.credential || '')
-  applyMetadata(metadataFromAccount(account))
+  applyMetadata(metadata)
+  form.platform = String(metadata.platform || row.platform || inferPlatform(account)) as PlatformOption
+  form.category = inferCategoryFromAccount(account, metadata)
+  form.type = account.type || form.type || 'openai_api_key'
+  form.tier = account.tier || form.tier || 'simple'
+  form.tags = (account.tags || []).join(', ')
+  form.source_id = account.source_id || ''
+  form.base_url = account.base_url || ''
+  form.model = account.model || ''
+  form.proxy_ref = account.proxy_ref || stringMetadata(metadata, 'proxy_ref_backup') || ''
+  form.quota_policy = account.quota_policy || ''
+  form.enabled = account.enabled !== false
   editorStep.value = 1
   editorOpen.value = true
 }
@@ -1149,14 +1809,17 @@ function extractOAuthCallbackParam(raw: string, param: 'code' | 'state'): string
 }
 
 watch(authCodeInput, (newVal: string) => {
-  if (form.platform !== 'openai' && form.platform !== 'gemini' && form.platform !== 'antigravity') return
+  if (!isOAuthFlow.value) return
   const trimmed = newVal.trim()
   const code = extractOAuthCallbackParam(trimmed, 'code')
-  if (code) {
+  const captured = code || trimmed
+  if (code && authCodeInput.value !== code) {
     authCodeInput.value = code
-    form.refresh_token = code
+  }
+  if (form.add_method === 'setup-token') {
+    form.setup_token = captured
   } else {
-    form.refresh_token = trimmed
+    form.refresh_token = captured
   }
 })
 
@@ -1243,6 +1906,7 @@ async function handleCopyAuthUrl() {
 }
 
 function handlePrimaryAccountAction() {
+  if (completingAccount.value) return
   if (!validateStep1()) {
     return
   }
@@ -1250,6 +1914,16 @@ function handlePrimaryAccountAction() {
     ensureAccountID()
     applyDurableFieldAliases()
     editorStep.value = 2
+    return
+  }
+  if (isOAuthFlow.value && editorStep.value === 2) {
+    completeOAuthAccount().catch((err) => {
+      error.value = err instanceof Error ? err.message : String(err)
+    })
+    return
+  }
+  if (!canSubmit.value) {
+    error.value = oauthCredentialStatus.value || t('accounts.credentialRequired')
     return
   }
   saveAccount().catch((err) => {
@@ -1260,6 +1934,17 @@ function handlePrimaryAccountAction() {
 function goBackToAccountSetup() {
   editorStep.value = 1
   resetOAuthAssistantState()
+}
+
+function closeEditor() {
+  editorOpen.value = false
+  error.value = ''
+}
+
+async function refreshAccountsSnapshot(): Promise<AccountsResponse> {
+  const latest = await loadAccounts()
+  accountsState.value = latest
+  return latest
 }
 
 
@@ -1440,44 +2125,208 @@ function buildAccount(): AccountConfig {
 }
 
 async function saveAccount() {
-  if (!accountsState.value || !canSubmit.value) return
+  error.value = ''
+  notice.value = ''
+  if (!accountsState.value) {
+    error.value = t('accounts.stateNotLoaded')
+    return
+  }
+  if (!canSubmit.value) {
+    error.value = oauthCredentialStatus.value || t('accounts.credentialRequired')
+    return
+  }
   const account = buildAccount()
+  const latest = await refreshAccountsSnapshot()
   if (editorMode.value === 'create') {
-    await createAccount(accountsState.value.config_version, account)
-    notice.value = `Created ${account.id}.`
+    await createAccount(latest.config_version, account)
+    notice.value = t('accounts.created', { id: account.id })
   } else {
-    await updateAccount(accountsState.value.config_version, account)
-    notice.value = `Updated ${account.id}.`
+    await updateAccount(latest.config_version, account)
+    notice.value = t('accounts.updated', { id: account.id })
   }
   editorOpen.value = false
   await loadAll()
+}
+
+async function completeOAuthAccount() {
+  error.value = ''
+  notice.value = ''
+  completingAccount.value = true
+  const rawInput = authCodeInput.value.trim()
+  try {
+    const capturedCode = extractOAuthCallbackParam(rawInput, 'code') || rawInput || form.refresh_token.trim() || form.setup_token.trim()
+    if (!capturedCode) {
+      error.value = oauthCredentialStatus.value || t('accounts.credentialRequired')
+      return
+    }
+    if (form.add_method === 'setup-token') {
+      form.setup_token = capturedCode
+    } else {
+      form.refresh_token = capturedCode
+    }
+    if (!canSubmit.value) {
+      error.value = oauthCredentialStatus.value || t('accounts.credentialRequired')
+      return
+    }
+    const account = buildAccount()
+    const latest = await refreshAccountsSnapshot()
+    if (editorMode.value === 'create') {
+      await createAccount(latest.config_version, account)
+      notice.value = t('accounts.created', { id: account.id })
+    } else {
+      await updateAccount(latest.config_version, account)
+      notice.value = t('accounts.updated', { id: account.id })
+    }
+    const validation = await refreshAccount(account.id)
+    testResult.value = validation
+    operationOutput.value = JSON.stringify(validation, null, 2)
+    if (validation.accounts) accountsState.value = validation.accounts
+    notice.value = `${notice.value} Complete validation: ${validation.status}.`
+    closeEditor()
+    if (!validation.accounts) await loadAll()
+  } finally {
+    completingAccount.value = false
+  }
 }
 
 async function toggleAccount(row: AccountRow) {
   if (!accountsState.value) return
   const account = structuredClone(row.summary.config)
   account.enabled = !row.enabled
-  await updateAccount(accountsState.value.config_version, account)
+  const latest = await refreshAccountsSnapshot()
+  await updateAccount(latest.config_version, account)
   notice.value = `${account.enabled ? 'Enabled' : 'Disabled'} ${account.id}.`
   await loadAll()
+}
+
+function toggleSelectAccount(row: AccountRow) {
+  const next = new Set(selectedAccountIds.value)
+  if (next.has(row.id)) next.delete(row.id)
+  else next.add(row.id)
+  selectedAccountIds.value = next
+}
+
+function toggleSelectAllAccounts() {
+  const next = new Set(selectedAccountIds.value)
+  if (allVisibleSelected.value) {
+    filteredRows.value.forEach((row) => next.delete(row.id))
+  } else {
+    filteredRows.value.forEach((row) => next.add(row.id))
+  }
+  selectedAccountIds.value = next
+}
+
+function startLabelEdit(row: AccountRow) {
+  editingLabelAccountId.value = row.id
+  labelDraft.value = row.customLabel || row.label
+}
+
+function cancelLabelEdit() {
+  editingLabelAccountId.value = ''
+  labelDraft.value = ''
+}
+
+async function saveLabelEdit(row: AccountRow) {
+  if (!accountsState.value) return
+  const account = structuredClone(row.summary.config)
+  const metadata = { ...(account.metadata || {}) }
+  const nextLabel = labelDraft.value.trim()
+  if (nextLabel) metadata.custom_label = nextLabel
+  else delete metadata.custom_label
+  account.metadata = metadata
+  const latest = await refreshAccountsSnapshot()
+  await updateAccount(latest.config_version, account)
+  notice.value = nextLabel ? `Updated label tag for ${row.id}.` : `Cleared label tag for ${row.id}.`
+  cancelLabelEdit()
+  await loadAll()
+}
+
+function handleLabelKeydown(event: KeyboardEvent, row: AccountRow) {
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    saveLabelEdit(row).catch(() => undefined)
+  } else if (event.key === 'Escape') {
+    event.preventDefault()
+    cancelLabelEdit()
+  }
 }
 
 async function runAccountTest(accountID?: string) {
   testResult.value = null
   if (accountID) {
-    testResult.value = await refreshAccount(accountID)
-    operationOutput.value = JSON.stringify(testResult.value, null, 2)
+    refreshingAccountIds.value = new Set([...refreshingAccountIds.value, accountID])
+    try {
+      testResult.value = await refreshAccount(accountID)
+      operationOutput.value = JSON.stringify(testResult.value, null, 2)
+      if (testResult.value.accounts) accountsState.value = testResult.value.accounts
+    } finally {
+      const next = new Set(refreshingAccountIds.value)
+      next.delete(accountID)
+      refreshingAccountIds.value = next
+    }
   } else {
     operationOutput.value = JSON.stringify(await testAllAccounts(), null, 2)
+    await loadAll()
   }
+}
+
+function viewAccountError(row: AccountRow) {
+  operationOutput.value = JSON.stringify(
+    {
+      account_id: row.id,
+      status: row.status,
+      health: row.summary.health,
+      quota: row.summary.quota,
+      runtime: row.summary.runtime,
+      last_error: row.lastError || row.failureState?.detail || 'No error detail available.'
+    },
+    null,
+    2
+  )
+  notice.value = `Expanded error detail for ${row.id}.`
+}
+
+async function toggleProxyMode(row: AccountRow) {
+  if (!accountsState.value) return
+  const account = structuredClone(row.summary.config)
+  const metadata = { ...(account.metadata || {}) }
+  if (row.proxyDisabled) {
+    const backupProxy = stringMetadata(metadata, 'proxy_ref_backup')
+    if (backupProxy) account.proxy_ref = backupProxy
+    metadata.proxy_disabled = false
+    delete metadata.proxy_ref_backup
+  } else {
+    if (account.proxy_ref) metadata.proxy_ref_backup = account.proxy_ref
+    metadata.proxy_disabled = true
+    account.proxy_ref = ''
+  }
+  account.metadata = metadata
+  const latest = await refreshAccountsSnapshot()
+  await updateAccount(latest.config_version, account)
+  notice.value = `${metadata.proxy_disabled ? 'Proxy disabled' : 'Proxy enabled'} for ${row.id}.`
   await loadAll()
 }
 
 async function removeAccount(row: AccountRow) {
-  if (!accountsState.value) return
-  await deleteAccount(accountsState.value.config_version, row.id)
-  notice.value = `Deleted ${row.id}.`
-  await loadAll()
+  if (!accountsState.value || deletingAccountIds.value.has(row.id)) return
+  const nextDeleting = new Set(deletingAccountIds.value)
+  nextDeleting.add(row.id)
+  deletingAccountIds.value = nextDeleting
+  try {
+    const updated = await deleteAccount(accountsState.value.config_version, row.id)
+    selectedAccountIds.value = new Set([...selectedAccountIds.value].filter((id) => id !== row.id))
+    accountsState.value = {
+      ...accountsState.value,
+      config_version: updated.config_version,
+      accounts: accountsState.value.accounts.filter((account) => account.config.id !== row.id)
+    }
+    notice.value = `Deleted ${row.id}.`
+    await refreshAccountsSnapshot()
+  } finally {
+    const remainingDeleting = new Set(deletingAccountIds.value)
+    remainingDeleting.delete(row.id)
+    deletingAccountIds.value = remainingDeleting
+  }
 }
 
 async function preview() {
@@ -1486,7 +2335,8 @@ async function preview() {
 
 async function apply() {
   if (!accountsState.value) return
-  operationOutput.value = JSON.stringify(await applyImport(accountsState.value.config_version, importContent.value, importKind.value), null, 2)
+  const latest = await refreshAccountsSnapshot()
+  operationOutput.value = JSON.stringify(await applyImport(latest.config_version, importContent.value, importKind.value), null, 2)
   importOpen.value = false
   notice.value = 'Import applied to local JSON config.'
   await loadAll()
@@ -1515,23 +2365,23 @@ onMounted(() => {
       <section class="card">
         <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <div class="grid flex-1 gap-3 sm:grid-cols-3">
-            <input v-model="search" class="input" placeholder="Search ID, label, type, tier, tags, source, proxy" />
+            <input v-model="search" class="input" :placeholder="$t('accounts.searchPlaceholder')" />
             <select v-model="statusFilter" class="input">
-              <option v-for="item in statusOptions" :key="item" :value="item">status: {{ item }}</option>
+              <option v-for="item in statusOptions" :key="item" :value="item">{{ $t('accounts.statusPrefix', { value: item }) }}</option>
             </select>
             <select v-model="typeFilter" class="input">
-              <option v-for="item in typeOptions" :key="item" :value="item">type: {{ item }}</option>
+              <option v-for="item in typeOptions" :key="item" :value="item">{{ $t('accounts.typePrefix', { value: item }) }}</option>
             </select>
           </div>
           <div class="flex flex-wrap gap-2">
             <button class="btn btn-secondary" type="button" :disabled="loading" @click="loadAll">
               <Icon name="refresh" />
-              <span class="ml-2">Refresh</span>
+              <span class="ml-2">{{ $t('common.refresh') }}</span>
             </button>
-            <button class="btn btn-secondary" type="button" @click="runAccountTest()">Test All</button>
-            <button class="btn btn-secondary" type="button" @click="importOpen = true">Import</button>
-            <button class="btn btn-secondary" type="button" @click="exportLocalJSON">Export JSON</button>
-            <button class="btn btn-primary" type="button" @click="openCreate">Create Account</button>
+            <button class="btn btn-secondary" type="button" @click="runAccountTest()">{{ $t('accounts.testAll') }}</button>
+            <button class="btn btn-secondary" type="button" @click="importOpen = true">{{ $t('accounts.import') }}</button>
+            <button class="btn btn-secondary" type="button" @click="exportLocalJSON">{{ $t('accounts.exportJson') }}</button>
+            <button class="btn btn-primary" type="button" @click="openCreate">{{ $t('accounts.createAccount') }}</button>
           </div>
         </div>
       </section>
@@ -1541,55 +2391,146 @@ onMounted(() => {
 
       <section class="card">
         <div class="mb-3 flex items-center justify-between gap-3">
-          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Accounts Core</h2>
-          <span class="badge badge-primary">{{ filteredRows.length }} / {{ rows.length }} shown</span>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('accounts.accountsCore') }}</h2>
+          <span class="badge badge-primary">{{ filteredRows.length }} / {{ rows.length }} {{ $t('common.shown') }}</span>
         </div>
-        <DataTable :columns="accountColumns" :rows="filteredRows" empty-text="No accounts match the current filter.">
+        <DataTable :columns="accountColumns" :rows="filteredRows" :empty-text="$t('accounts.noMatch')">
+          <template #header-select>
+            <div class="flex items-center justify-center">
+              <input
+                class="h-4 w-4 rounded border-2 border-gray-400 accent-primary-600"
+                type="checkbox"
+                :checked="allVisibleSelected"
+                :aria-label="'Select all accounts'"
+                @change="toggleSelectAllAccounts"
+              />
+            </div>
+          </template>
+          <template #cell-select="{ row }">
+            <div class="flex items-center justify-center">
+              <input
+                class="h-4 w-4 rounded border-2 border-gray-400 accent-primary-600"
+                type="checkbox"
+                :checked="selectedAccountIds.has(String(row.id))"
+                :aria-label="`Select ${row.label}`"
+                @change="toggleSelectAccount(row)"
+              />
+            </div>
+          </template>
           <template #cell-label="{ row }">
-            <div class="space-y-1">
-              <p class="font-semibold text-gray-950 dark:text-white">{{ row.label }}</p>
-              <p class="font-mono text-xs text-gray-500 dark:text-gray-400">{{ row.id }}</p>
-              <StatusBadge :status="row.enabled ? 'enabled' : 'disabled'" />
-            </div>
-          </template>
-          <template #cell-status="{ row }">
-            <div class="space-y-1">
-              <StatusBadge :status="String(row.status)" />
-              <p class="text-xs text-gray-500 dark:text-gray-400">{{ row.lastChecked || 'not checked' }}</p>
-              <p v-if="row.lastError" class="max-w-xs text-xs text-red-500">{{ row.lastError }}</p>
-            </div>
-          </template>
-          <template #cell-type="{ row }">
-            <span class="badge badge-primary">{{ row.type }}</span>
-          </template>
-          <template #cell-tier="{ row }">
-            <div class="space-y-2">
-              <span class="font-semibold">{{ row.tier }}</span>
-              <div class="flex flex-wrap gap-1">
-                <span v-for="tag in row.tags" :key="tag" class="badge bg-gray-100 text-gray-700 dark:bg-dark-800 dark:text-gray-200">{{ tag }}</span>
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span class="max-w-[280px] break-all text-sm font-semibold text-gray-950 transition-colors dark:text-white" :title="row.id">
+                {{ row.label || row.id }}
+              </span>
+              <span v-if="row.label !== row.id" class="break-all font-mono text-[11px] text-gray-500 dark:text-gray-400">{{ row.id }}</span>
+              <div class="flex flex-wrap items-center gap-1.5">
+                <span v-if="!row.enabled" class="inline-flex items-center gap-1 rounded-md border border-rose-200/70 bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700 shadow-sm dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-300">
+                  <Icon name="ban" />
+                  Disabled
+                </span>
+                <span v-if="row.proxyDisabled" class="inline-flex items-center gap-1 rounded-md border border-orange-200/70 bg-orange-100 px-2 py-0.5 text-[10px] font-bold text-orange-700 shadow-sm dark:border-orange-900/50 dark:bg-orange-950/40 dark:text-orange-300">
+                  <Icon name="ban" />
+                  Proxy Disabled
+                </span>
+                <span v-if="row.forbidden" class="inline-flex items-center gap-1 rounded-md border border-red-200/70 bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700 shadow-sm dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300">
+                  <Icon name="lock" />
+                  Forbidden
+                </span>
+                <span v-if="row.validationBlocked" class="inline-flex items-center gap-1 rounded-md border border-amber-200/70 bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 shadow-sm dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-300">
+                  <Icon name="clock" />
+                  {{ row.validationBlockedLabel }}
+                </span>
+                <span
+                  v-for="badge in row.accountBadges"
+                  :key="badge.key"
+                  :class="badge.className"
+                  :title="badge.title || badge.label"
+                >
+                  <Icon :name="badge.icon" />
+                  {{ badge.label }}
+                </span>
+                <button
+                  v-if="row.customLabel && editingLabelAccountId !== row.id"
+                  class="inline-flex items-center gap-1 rounded-md border border-orange-200/70 bg-orange-100 px-2 py-0.5 text-[10px] font-bold text-orange-700 shadow-sm transition hover:border-orange-300 hover:bg-orange-200/80 dark:border-orange-900/50 dark:bg-orange-950/40 dark:text-orange-300"
+                  type="button"
+                  @click="startLabelEdit(row)"
+                >
+                  <Icon name="tag" />
+                  {{ row.customLabel }}
+                </button>
+                <div v-if="editingLabelAccountId === row.id" class="inline-flex items-center gap-1 rounded-lg border border-orange-200 bg-white/80 px-1 py-0.5 shadow-sm ring-2 ring-orange-100 transition-all dark:border-orange-900/60 dark:bg-dark-800/90 dark:ring-orange-950/40">
+                  <input
+                    v-model="labelDraft"
+                    class="w-28 rounded-md border border-orange-200 bg-white px-2 py-1 text-[11px] font-semibold text-gray-900 outline-none transition focus:border-orange-400 dark:border-orange-900 dark:bg-dark-900 dark:text-gray-100"
+                    maxlength="32"
+                    placeholder="Label"
+                    @keydown="handleLabelKeydown($event, row)"
+                  />
+                  <button class="rounded-md p-1 text-emerald-600 transition hover:bg-emerald-50 dark:hover:bg-emerald-950/40" type="button" title="Save label" @click="saveLabelEdit(row)">
+                    <Icon name="check" />
+                  </button>
+                  <button class="rounded-md p-1 text-gray-400 transition hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/40" type="button" title="Cancel" @click="cancelLabelEdit">
+                    <Icon name="x" />
+                  </button>
+                </div>
               </div>
-              <p class="text-xs text-gray-500">quota: {{ row.quotaStatus }}</p>
             </div>
           </template>
-          <template #cell-source="{ row }">
-            <div class="space-y-1 text-xs">
-              <p><span class="text-gray-500">source</span> {{ row.source }}</p>
-              <p><span class="text-gray-500">proxy</span> {{ row.proxy }}</p>
-              <p><span class="text-gray-500">hits</span> {{ row.hits }} / errors {{ row.errors }}</p>
+          <template #cell-quota="{ row }">
+            <div v-if="row.failureState" :class="['flex items-center justify-center gap-3 rounded-xl border px-4 py-2 shadow-sm', row.failureState.tone === 'amber' ? 'border-amber-200/70 bg-amber-50/70 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-300' : 'border-red-200/70 bg-red-50/70 text-red-700 dark:border-red-900/50 dark:bg-red-950/20 dark:text-red-300']">
+              <div class="flex min-w-0 items-center gap-1.5">
+                <Icon :name="row.failureState.icon" />
+                <span class="truncate text-[11px] font-bold">{{ row.failureState.label }}</span>
+              </div>
+              <div :class="['h-4 w-px', row.failureState.tone === 'amber' ? 'bg-amber-200 dark:bg-amber-800' : 'bg-red-200 dark:bg-red-800']"></div>
+              <button class="text-[10px] font-semibold text-blue-600 transition hover:underline dark:text-blue-400" type="button" @click="viewAccountError(row)">View Error</button>
+            </div>
+            <div v-else class="grid gap-x-4 gap-y-1 py-0" :class="row.displayModels.length === 1 ? 'grid-cols-1' : 'grid-cols-2'">
+              <div v-for="model in row.displayModels" :key="model.id" class="min-w-0 space-y-1">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="truncate text-[11px] font-bold text-gray-700 dark:text-gray-200">{{ model.label }}</span>
+                  <span class="inline-flex items-center gap-1 font-mono text-[10px] text-gray-500 dark:text-gray-400">
+                    <Icon v-if="model.isProtected" name="lock" />
+                    {{ model.usedLabel || `${Math.round(model.percentage)}%` }}
+                  </span>
+                </div>
+                <div class="h-1 overflow-hidden rounded-full bg-gray-200 dark:bg-dark-700">
+                  <div :class="['h-full rounded-full shadow-[0_0_8px_currentColor]', model.percentage >= 90 ? 'bg-red-500 text-red-500' : model.percentage >= 70 ? 'bg-amber-500 text-amber-500' : 'bg-cyan-500 text-cyan-500']" :style="{ width: `${Math.max(2, model.percentage)}%` }"></div>
+                </div>
+                <p class="text-right font-mono text-[9px] text-gray-400 dark:text-gray-500">reset {{ model.resetTime || 'rolling' }}</p>
+              </div>
             </div>
           </template>
-          <template #cell-baseURL="{ row }">
-            <div class="max-w-xs space-y-1 text-xs">
-              <p><span class="text-gray-500">model</span> {{ row.model }}</p>
-              <p class="break-all"><span class="text-gray-500">base</span> {{ row.baseURL }}</p>
+          <template #cell-lastUsed="{ row }">
+            <div class="flex flex-col" :title="row.lastUsedTitle">
+              <span class="whitespace-nowrap font-mono text-xs font-semibold text-gray-600 dark:text-gray-300">{{ row.lastUsedDate }}</span>
+              <span class="whitespace-nowrap font-mono text-[10px] leading-tight text-gray-400 dark:text-gray-500">{{ row.lastUsedTime }}</span>
             </div>
           </template>
           <template #cell-actions="{ row }">
-            <div class="flex flex-wrap justify-end gap-2 md:justify-start">
-              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="openEdit(row)">Edit</button>
-              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="toggleAccount(row)">{{ row.enabled ? 'Disable' : 'Enable' }}</button>
-              <button class="btn btn-secondary px-3 py-1.5" type="button" @click="runAccountTest(String(row.id))">Test</button>
-              <button class="btn btn-danger px-3 py-1.5" type="button" @click="removeAccount(row)">Delete</button>
+            <div class="mx-auto flex max-w-[180px] flex-wrap items-center justify-center gap-1 opacity-70 transition-opacity group-hover:opacity-100">
+              <button class="rounded-lg p-1.5 text-gray-500 transition hover:bg-sky-50 hover:text-sky-600 dark:text-gray-400 dark:hover:bg-sky-950/30 dark:hover:text-sky-300" type="button" title="Details" @click="openEdit(row)">
+                <Icon name="info" />
+              </button>
+              <button :class="['rounded-lg p-1.5 transition', row.customLabel ? 'text-orange-500 hover:bg-orange-50 hover:text-orange-600 dark:hover:bg-orange-950/30' : 'text-gray-500 hover:bg-orange-50 hover:text-orange-500 dark:text-gray-400 dark:hover:bg-orange-950/30']" type="button" title="Edit label" @click="startLabelEdit(row)">
+                <Icon name="tag" />
+              </button>
+              <button :class="['rounded-lg p-1.5 transition', refreshingAccountIds.has(String(row.id)) || !row.enabled ? 'cursor-not-allowed bg-green-50 text-green-600 dark:bg-green-950/20 dark:text-green-300' : 'text-gray-500 hover:bg-green-50 hover:text-green-600 dark:text-gray-400 dark:hover:bg-green-950/30 dark:hover:text-green-300']" type="button" title="Refresh account" :disabled="refreshingAccountIds.has(String(row.id)) || !row.enabled" @click="runAccountTest(String(row.id))">
+                <span :class="refreshingAccountIds.has(String(row.id)) ? 'inline-flex animate-spin' : 'inline-flex'">
+                  <Icon name="refresh" />
+                </span>
+              </button>
+              <button :class="['rounded-lg p-1.5 transition', row.proxyDisabled ? 'text-gray-500 hover:bg-green-50 hover:text-green-600 dark:text-gray-400 dark:hover:bg-green-950/30' : 'text-gray-500 hover:bg-orange-50 hover:text-orange-600 dark:text-gray-400 dark:hover:bg-orange-950/30']" type="button" :title="row.proxyDisabled ? 'Enable proxy' : 'Disable proxy'" @click="toggleProxyMode(row)">
+                <Icon :name="row.proxyDisabled ? 'toggle-right' : 'toggle-left'" />
+              </button>
+              <button :class="['rounded-lg p-1.5 transition', row.enabled ? 'text-gray-500 hover:bg-rose-50 hover:text-rose-600 dark:text-gray-400 dark:hover:bg-rose-950/30' : 'text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/30']" type="button" :title="row.enabled ? 'Disable account' : 'Enable account'" @click="toggleAccount(row)">
+                <Icon :name="row.enabled ? 'ban' : 'check'" />
+              </button>
+              <button :class="['rounded-lg p-1.5 text-gray-500 transition hover:bg-red-50 hover:text-red-600 dark:text-gray-400 dark:hover:bg-red-950/30 dark:hover:text-red-300', deletingAccountIds.has(String(row.id)) ? 'cursor-not-allowed opacity-60' : '']" type="button" title="Delete" :disabled="deletingAccountIds.has(String(row.id))" @click.stop="removeAccount(row)">
+                <span :class="deletingAccountIds.has(String(row.id)) ? 'inline-flex animate-spin' : 'inline-flex'">
+                  <Icon :name="deletingAccountIds.has(String(row.id)) ? 'refresh' : 'trash'" />
+                </span>
+              </button>
             </div>
           </template>
         </DataTable>
@@ -1597,27 +2538,27 @@ onMounted(() => {
 
       <section class="card">
         <div class="mb-2 flex items-center justify-between">
-          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Operation Output</h2>
+          <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('accounts.operationOutput') }}</h2>
           <StatusBadge v-if="testResult" :status="testResult.status" />
         </div>
-        <pre class="max-h-96 overflow-auto rounded-xl bg-gray-100 p-3 text-xs text-gray-600 dark:bg-dark-800 dark:text-gray-300">{{ operationOutput || 'No operation output yet.' }}</pre>
+        <pre class="max-h-96 overflow-auto rounded-xl bg-gray-100 p-3 text-xs text-gray-600 dark:bg-dark-800 dark:text-gray-300">{{ operationOutput || $t('accounts.noOperationOutput') }}</pre>
       </section>
 
       <div v-if="editorOpen" class="xforce-modal-backdrop fixed inset-0 z-50 grid place-items-center">
         <section class="card xforce-modal-panel max-h-[92vh] w-full max-w-6xl overflow-auto">
           <div class="flex items-center justify-between gap-3">
             <div>
-              <h2 class="text-lg font-black">{{ editorMode === 'create' ? 'Create Account' : 'Edit Account' }}</h2>
-              <p class="text-xs text-gray-500 dark:text-gray-400">Upstream-inspired account creation surface. Values are persisted into the local JSON account config and metadata.</p>
+              <h2 class="text-lg font-black">{{ editorMode === 'create' ? $t('accounts.createAccount') : $t('accounts.editAccount') }}</h2>
+              <p class="text-xs text-gray-500 dark:text-gray-400">{{ $t('accounts.editorSubtitle') }}</p>
             </div>
-            <button class="btn btn-secondary" type="button" @click="editorOpen = false">Close</button>
+            <button class="btn btn-secondary" type="button" @click="closeEditor">{{ $t('common.close') }}</button>
           </div>
           <div class="mt-4">
             <div v-if="isOAuthFlow" class="mb-6 flex items-center justify-center">
               <div class="flex items-center space-x-4">
                 <div class="flex items-center">
                   <span :class="['flex h-8 w-8 items-center justify-center rounded-full text-sm font-semibold', step >= 1 ? 'bg-primary-500 text-white' : 'bg-gray-200 text-gray-500 dark:bg-dark-600']">1</span>
-                  <span class="ml-2 text-sm font-medium text-gray-700 dark:text-gray-300">Authorization Method</span>
+                  <span class="ml-2 text-sm font-medium text-gray-700 dark:text-gray-300">{{ $t('accounts.authorizationMethod') }}</span>
                 </div>
                 <div class="h-0.5 w-8 bg-gray-300 dark:bg-dark-600"></div>
                 <div class="flex items-center">
@@ -1722,16 +2663,16 @@ onMounted(() => {
                 <div class="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <button type="button" :class="['flex items-center gap-3 rounded-lg border-2 p-3 text-left transition-all', form.gemini_oauth_type === 'google_one' ? 'border-purple-500 bg-purple-50 dark:bg-purple-900/20' : 'border-gray-200 hover:border-purple-300 dark:border-dark-600 dark:hover:border-purple-700']" @click="form.gemini_oauth_type = 'google_one'; form.gemini_tier = 'google_one_free'">
                     <span>
-                      <span class="block text-sm font-medium text-gray-900 dark:text-white">Google One</span>
-                      <span class="text-xs text-gray-500 dark:text-gray-400">个人账号，享受 Google One 订阅配额</span>
-                      <span class="mt-2 flex flex-wrap gap-1"><span class="rounded bg-purple-100 px-2 py-0.5 text-[10px] font-semibold text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">推荐个人用户</span><span class="rounded bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">无需 GCP</span></span>
+                      <span class="block text-sm font-medium text-gray-900 dark:text-white">{{ $t('accounts.gemini.oauthType.googleOneTitle') }}</span>
+                      <span class="text-xs text-gray-500 dark:text-gray-400">{{ $t('accounts.gemini.oauthType.googleOneDesc') }}</span>
+                      <span class="mt-2 flex flex-wrap gap-1"><span class="rounded bg-purple-100 px-2 py-0.5 text-[10px] font-semibold text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">{{ $t('accounts.gemini.oauthType.badges.personal') }}</span><span class="rounded bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">{{ $t('accounts.gemini.oauthType.badges.noGcp') }}</span></span>
                     </span>
                   </button>
                   <button type="button" :class="['flex items-center gap-3 rounded-lg border-2 p-3 text-left transition-all', form.gemini_oauth_type === 'code_assist' ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20' : 'border-gray-200 hover:border-blue-300 dark:border-dark-600 dark:hover:border-blue-700']" @click="form.gemini_oauth_type = 'code_assist'; form.gemini_tier = 'gcp_standard'">
                     <span>
-                      <span class="block text-sm font-medium text-gray-900 dark:text-white">GCP Code Assist</span>
-                      <span class="text-xs text-gray-500 dark:text-gray-400">企业级，需要 GCP 项目</span>
-                      <span class="mt-2 flex flex-wrap gap-1"><span class="rounded bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">企业用户</span><span class="rounded bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">高并发</span></span>
+                      <span class="block text-sm font-medium text-gray-900 dark:text-white">{{ $t('accounts.gemini.oauthType.codeAssistTitle') }}</span>
+                      <span class="text-xs text-gray-500 dark:text-gray-400">{{ $t('accounts.gemini.oauthType.codeAssistDesc') }}</span>
+                      <span class="mt-2 flex flex-wrap gap-1"><span class="rounded bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">{{ $t('accounts.gemini.oauthType.badges.enterprise') }}</span><span class="rounded bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">{{ $t('accounts.gemini.oauthType.badges.highConcurrency') }}</span></span>
                     </span>
                   </button>
                 </div>
@@ -1744,11 +2685,11 @@ onMounted(() => {
                 <div v-if="showAdvancedOAuth" class="mt-3 group relative">
                   <button type="button" :disabled="!geminiAIStudioOAuthEnabled" :class="['flex w-full items-center gap-3 rounded-lg border-2 p-3 text-left transition-all', !geminiAIStudioOAuthEnabled ? 'cursor-not-allowed opacity-60' : '', form.gemini_oauth_type === 'ai_studio' ? 'border-amber-500 bg-amber-50 dark:bg-amber-900/20' : 'border-gray-200 hover:border-amber-300 dark:border-dark-600 dark:hover:border-amber-700']" @click="form.gemini_oauth_type = 'ai_studio'; form.gemini_tier = 'aistudio_free'">
                     <span>
-                      <span class="block text-sm font-medium text-gray-900 dark:text-white">Custom AI Studio</span>
+                      <span class="block text-sm font-medium text-gray-900 dark:text-white">{{ t('admin.accounts.gemini.oauthType.customTitle') }}</span>
                       <span class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.gemini.oauthType.customDesc') }}</span>
                       <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.gemini.oauthType.customRequirement') }}</span>
                       <span class="mt-2 flex flex-wrap gap-1"><span class="rounded bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">{{ t('admin.accounts.gemini.oauthType.badges.orgManaged') }}</span><span class="rounded bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">{{ t('admin.accounts.gemini.oauthType.badges.adminRequired') }}</span></span>
-                      <span v-if="!geminiAIStudioOAuthEnabled" class="ml-2 rounded bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">{{ 'Not Configured' }}</span>
+                      <span v-if="!geminiAIStudioOAuthEnabled" class="ml-2 rounded bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">{{ t('admin.accounts.oauth.gemini.aiStudioNotConfiguredShort') }}</span>
                     </span>
                   </button>
                 </div>
@@ -1812,13 +2753,13 @@ onMounted(() => {
 
                 <div v-if="showServiceAccount" class="space-y-4">
                   <div>
-                    <label class="input-label">Service Account JSON</label>
-                    <textarea v-model="form.service_account_json" class="input min-h-36 font-mono normal-case" placeholder="Paste service account JSON"></textarea>
-                    <p class="input-hint">Project ID is preserved separately below for local JSON durability.</p>
+                    <label class="input-label">{{ $t('accounts.serviceAccountJson') }}</label>
+                    <textarea v-model="form.service_account_json" class="input min-h-36 font-mono normal-case" :placeholder="$t('accounts.serviceAccountJsonPlaceholder')"></textarea>
+                    <p class="input-hint">{{ $t('accounts.projectIdHint') }}</p>
                   </div>
                   <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    <label class="grid gap-1"><span class="input-label">Project ID</span><input v-model="form.vertex_project_id" class="input font-mono normal-case" placeholder="project-id" /></label>
-                    <label class="grid gap-1"><span class="input-label">Location</span><input v-model="form.vertex_location" required class="input font-mono normal-case" placeholder="us-central1" /></label>
+                    <label class="grid gap-1"><span class="input-label">{{ $t('accounts.projectId') }}</span><input v-model="form.vertex_project_id" class="input font-mono normal-case" placeholder="project-id" /></label>
+                    <label class="grid gap-1"><span class="input-label">{{ $t('accounts.location') }}</span><input v-model="form.vertex_location" required class="input font-mono normal-case" placeholder="us-central1" /></label>
                   </div>
                 </div>
 
@@ -1841,31 +2782,31 @@ onMounted(() => {
                 </div>
 
                 <div class="mt-4 grid gap-3 sm:grid-cols-2">
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Simple Type
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ $t('accounts.simpleType') }}
                     <select v-model="form.type" class="input normal-case">
                       <option value="openai_api_key">openai_api_key</option>
                       <option value="openai_compatible">openai_compatible</option>
                       <option value="oauth">oauth</option>
                     </select>
                   </label>
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Tier<input v-model="form.tier" class="input normal-case" placeholder="simple / pro / ultra" /></label>
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Source ID<input v-model="form.source_id" class="input normal-case" placeholder="optional imported source" /></label>
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Default Model<input v-model="form.model" class="input normal-case" placeholder="optional" /></label>
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ $t('accounts.tier') }}<input v-model="form.tier" class="input normal-case" placeholder="simple / pro / ultra" /></label>
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ $t('accounts.sourceId') }}<input v-model="form.source_id" class="input normal-case" :placeholder="$t('accounts.optionalImportedSource')" /></label>
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ $t('accounts.defaultModel') }}<input v-model="form.model" class="input normal-case" :placeholder="$t('accounts.optional')" /></label>
                   <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ t('admin.accounts.proxy') }}
                     <select v-model="form.proxy_ref" class="input normal-case">
-                      <option value="">direct</option>
+                      <option value="">{{ $t('common.direct') }}</option>
                       <option v-for="proxy in proxyOptions" :key="proxy.id" :value="proxy.id">{{ proxyLabel(proxy) }}</option>
                     </select>
                   </label>
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Quota Policy
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ $t('accounts.quotaPolicy') }}
                     <select v-model="form.quota_policy" class="input normal-case">
-                      <option value="">none</option>
+                      <option value="">{{ $t('common.none') }}</option>
                       <option v-for="policy in accountsState?.quota_policies || []" :key="policy.id" :value="policy.id">{{ policy.id }}</option>
                     </select>
                   </label>
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Tags<input v-model="form.tags" class="input normal-case" placeholder="comma separated" /></label>
-                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500 sm:col-span-2">Raw Credential Envelope<textarea v-model="form.credential" class="input min-h-20 font-mono normal-case" placeholder="Optional fallback or redacted value; structured fields above build credential automatically"></textarea></label>
-                  <label class="flex items-center gap-2 text-sm font-semibold"><input v-model="form.enabled" type="checkbox" /> Enabled for gateway pool</label>
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ $t('accounts.tags') }}<input v-model="form.tags" class="input normal-case" :placeholder="$t('accounts.commaSeparated')" /></label>
+                  <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500 sm:col-span-2">{{ $t('accounts.rawCredentialEnvelope') }}<textarea v-model="form.credential" class="input min-h-20 font-mono normal-case" :placeholder="$t('accounts.rawCredentialPlaceholder')"></textarea></label>
+                  <label class="flex items-center gap-2 text-sm font-semibold"><input v-model="form.enabled" type="checkbox" /> {{ $t('accounts.enabledForPool') }}</label>
                 </div>
               </div>
             </div>
@@ -1883,7 +2824,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'manual' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'manual'"
                 >
-                  Manual Authorization
+                  {{ $t('accounts.oauthFlow.manualAuthorization') }}
                 </button>
                 <button
                   v-if="isClaudeOAuthFlow"
@@ -1891,7 +2832,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'cookie' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'cookie'"
                 >
-                  Claude Cookie Auto-Auth
+                  {{ $t('accounts.oauthFlow.claudeCookieAutoAuth') }}
                 </button>
                 <button
                   v-if="form.platform === 'openai' || form.platform === 'antigravity'"
@@ -1899,7 +2840,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'refresh_token' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'refresh_token'"
                 >
-                  Refresh Token
+                  {{ $t('accounts.oauthFlow.refreshToken') }}
                 </button>
                 <button
                   v-if="form.platform === 'openai'"
@@ -1907,7 +2848,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'mobile_refresh_token' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'mobile_refresh_token'"
                 >
-                  Mobile RT
+                  {{ $t('accounts.oauthFlow.mobileRt') }}
                 </button>
                 <button
                   v-if="form.platform === 'openai'"
@@ -1915,7 +2856,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'session_token' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'session_token'"
                 >
-                  Session Token
+                  {{ $t('accounts.oauthFlow.sessionToken') }}
                 </button>
                 <button
                   v-if="form.platform === 'openai'"
@@ -1923,7 +2864,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'access_token' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'access_token'"
                 >
-                  Access Token
+                  {{ $t('accounts.oauthFlow.accessToken') }}
                 </button>
                 <button
                   v-if="form.platform === 'openai'"
@@ -1931,7 +2872,7 @@ onMounted(() => {
                   :class="['px-3 py-1.5 text-xs font-semibold rounded-lg transition', activeOAuthTab === 'codex_session' ? 'bg-primary-500 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-dark-800 dark:text-gray-300 dark:hover:bg-dark-700']"
                   @click="activeOAuthTab = 'codex_session'"
                 >
-                  Codex Session JSON
+                  {{ $t('accounts.oauthFlow.codexSessionJson') }}
                 </button>
               </div>
 
@@ -2018,6 +2959,9 @@ onMounted(() => {
                       </div>
                     </div>
                   </div>
+                  <p :class="['rounded-lg border px-3 py-2 text-xs font-semibold', buildCredential().trim() ? 'border-primary-200 bg-primary-50 text-primary-700 dark:border-primary-900 dark:bg-primary-950/30 dark:text-primary-200' : 'border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300']">
+                    {{ oauthCredentialStatus }}
+                  </p>
                 </div>
 
                 <!-- 2. CLAUDE COOKIE AUTO-AUTH -->
@@ -2514,13 +3458,13 @@ onMounted(() => {
                 </div>
               </div>
             </section>
-            <button v-else class="btn btn-secondary" type="button" @click="showAdvancedAccountOptions = true">Show Advanced Create Account Options</button>
+            <button v-else class="btn btn-secondary" type="button" @click="showAdvancedAccountOptions = true">{{ $t('accounts.showAdvanced') }}</button>
           </div>
           <div class="mt-4 flex flex-wrap justify-end gap-2">
-            <button v-if="isOAuthFlow && step === 2" class="btn btn-secondary" type="button" @click="goBackToAccountSetup">Back</button>
-            <button class="btn btn-secondary" type="button" @click="editorOpen = false">Cancel</button>
-            <button class="btn btn-primary" type="button" :disabled="isOAuthFlow && step === 1 ? false : !canSubmit" @click="handlePrimaryAccountAction">
-              {{ isOAuthFlow && step === 1 ? 'Next' : 'Save Account' }}
+            <button v-if="isOAuthFlow && step === 2" class="btn btn-secondary" type="button" @click="goBackToAccountSetup">{{ $t('common.back') }}</button>
+            <button class="btn btn-secondary" type="button" @click="closeEditor">{{ $t('common.cancel') }}</button>
+            <button class="btn btn-primary" type="button" :disabled="completingAccount" @click="handlePrimaryAccountAction">
+              {{ completingAccount ? 'Completing...' : isOAuthFlow && step === 1 ? $t('common.next') : isOAuthFlow && step === 2 ? 'Complete' : $t('accounts.saveAccount') }}
             </button>
           </div>
         </section>
@@ -2529,20 +3473,20 @@ onMounted(() => {
       <div v-if="importOpen" class="xforce-modal-backdrop fixed inset-0 z-50 grid place-items-center">
         <section class="card xforce-modal-panel max-h-[92vh] w-full max-w-3xl overflow-auto">
           <div class="flex items-center justify-between gap-3">
-            <h2 class="text-lg font-black">Import Accounts</h2>
-            <button class="btn btn-secondary" type="button" @click="importOpen = false">Close</button>
+            <h2 class="text-lg font-black">{{ $t('accounts.importAccounts') }}</h2>
+            <button class="btn btn-secondary" type="button" @click="importOpen = false">{{ $t('common.close') }}</button>
           </div>
           <div class="mt-4 grid gap-3">
             <select v-model="importKind" class="input">
-              <option value="line_tokens">Line tokens</option>
-              <option value="json_bundle">sub2api JSON bundle</option>
-              <option value="inline_bundle">Inline JSON bundle</option>
+              <option value="line_tokens">{{ $t('accounts.lineTokens') }}</option>
+              <option value="json_bundle">{{ $t('accounts.jsonBundle') }}</option>
+              <option value="inline_bundle">{{ $t('accounts.inlineBundle') }}</option>
             </select>
-            <textarea v-model="importContent" class="input min-h-56 font-mono" placeholder="Paste one token per line or a sub2api JSON bundle" />
+            <textarea v-model="importContent" class="input min-h-56 font-mono" :placeholder="$t('accounts.importPlaceholder')" />
           </div>
           <div class="mt-4 flex flex-wrap justify-end gap-2">
-            <button class="btn btn-secondary" type="button" @click="preview">Preview Import</button>
-            <button class="btn btn-primary" type="button" @click="apply">Apply Import</button>
+            <button class="btn btn-secondary" type="button" @click="preview">{{ $t('accounts.previewImport') }}</button>
+            <button class="btn btn-primary" type="button" @click="apply">{{ $t('accounts.applyImport') }}</button>
           </div>
         </section>
       </div>
@@ -2550,15 +3494,15 @@ onMounted(() => {
       <div v-if="showGeminiHelpDialog" class="xforce-modal-backdrop fixed inset-0 z-50 grid place-items-center">
         <section class="card xforce-modal-panel max-h-[92vh] w-full max-w-3xl overflow-auto">
           <div class="flex items-center justify-between gap-3">
-            <h2 class="text-lg font-black">Gemini Help</h2>
-            <button class="btn btn-secondary" type="button" @click="showGeminiHelpDialog = false">Close</button>
+            <h2 class="text-lg font-black">{{ $t('accounts.gemini.helpDialog.title') }}</h2>
+            <button class="btn btn-secondary" type="button" @click="showGeminiHelpDialog = false">{{ $t('common.close') }}</button>
           </div>
           <div class="mt-4 space-y-3 text-sm text-gray-600 dark:text-gray-300">
             <p>Google One, GCP Code Assist, and AI Studio OAuth variants are preserved here as upstream-compatible create flows.</p>
             <p>Use the help options to guide project activation, OAuth client setup, and tier selection before saving the account into local JSON.</p>
           </div>
           <div class="mt-4 flex justify-end">
-            <button @click="showGeminiHelpDialog = false" type="button" class="btn btn-primary">Close</button>
+            <button @click="showGeminiHelpDialog = false" type="button" class="btn btn-primary">{{ $t('common.close') }}</button>
           </div>
         </section>
       </div>

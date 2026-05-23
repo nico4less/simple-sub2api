@@ -2,6 +2,7 @@ import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 
 import App from './App.vue'
+import i18n from './i18n'
 import './styles.css'
 import AccountsView from './views/AccountsView.vue'
 import DashboardView from './views/DashboardView.vue'
@@ -23,4 +24,4 @@ const router = createRouter({
   ]
 })
 
-createApp(App).use(router).mount('#app')
+createApp(App).use(router).use(i18n).mount('#app')

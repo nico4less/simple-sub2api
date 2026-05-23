@@ -1,5 +1,27 @@
 <script setup lang="ts">
-type IconName = 'dashboard' | 'accounts' | 'key' | 'refresh' | 'logout' | 'copy' | 'trash' | 'play'
+type IconName =
+  | 'dashboard'
+  | 'accounts'
+  | 'key'
+  | 'refresh'
+  | 'logout'
+  | 'copy'
+  | 'trash'
+  | 'play'
+  | 'grip'
+  | 'ban'
+  | 'lock'
+  | 'clock'
+  | 'gem'
+  | 'diamond'
+  | 'circle'
+  | 'tag'
+  | 'check'
+  | 'x'
+  | 'info'
+  | 'download'
+  | 'toggle-left'
+  | 'toggle-right'
 
 defineProps<{ name: IconName }>()
 
@@ -11,7 +33,21 @@ const paths: Record<IconName, string> = {
   logout: 'M10 17v-3H3v-4h7V7l5 5-5 5Zm2-14h9v18h-9v-2h7V5h-7V3Z',
   copy: 'M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1Zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2Zm0 16H8V7h11v14Z',
   trash: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12ZM8 9h8v10H8V9Zm7.5-5-1-1h-5l-1 1H5v2h14V4h-3.5Z',
-  play: 'M8 5v14l11-7L8 5Z'
+  play: 'M8 5v14l11-7L8 5Z',
+  grip: 'M9 4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Zm0 8a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Zm-1.5 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM18 4a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Zm-1.5 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm1.5 6.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z',
+  ban: 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 3a7 7 0 0 1 4.12 12.66L6.34 7.88A6.97 6.97 0 0 1 12 5ZM5 12c0-.9.17-1.76.49-2.55l9.06 9.06A7 7 0 0 1 5 12Z',
+  lock: 'M7 10V7a5 5 0 0 1 10 0v3h1a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h1Zm2 0h6V7a3 3 0 0 0-6 0v3Zm4 4.73V18h-2v-3.27a2 2 0 1 1 2 0Z',
+  clock: 'M12 2a10 10 0 1 0 .01 0H12Zm1 5v5.1l4 2.4-1 1.65-5-3V7h2Z',
+  gem: 'M6.2 3h11.6L22 8.5 12 21 2 8.5 6.2 3Zm1 2-2.4 3h4.4l1.1-3H7.2Zm6.5 0 1.1 3h4.4l-2.4-3h-3.1ZM12 16.9 15.7 10H8.3L12 16.9Z',
+  diamond: 'M12 2 22 8.5 12 22 2 8.5 12 2Zm0 3.1L6 9l6 8.1L18 9l-6-3.9Z',
+  circle: 'M12 2a10 10 0 1 0 .01 0H12Zm0 3a7 7 0 1 1-.01 14A7 7 0 0 1 12 5Z',
+  tag: 'M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V4h9l8.6 8.6a2 2 0 0 1 0 2.8ZM7.5 9A1.5 1.5 0 1 0 7.5 6 1.5 1.5 0 0 0 7.5 9Z',
+  check: 'M9.2 16.6 4.9 12.3 3.5 13.7l5.7 5.7L21 7.6 19.6 6.2 9.2 16.6Z',
+  x: 'M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3 1.4 1.4Z',
+  info: 'M11 17h2v-6h-2v6Zm0-8h2V7h-2v2Zm1-7a10 10 0 1 0 .01 0H12Z',
+  download: 'M5 20h14v-2H5v2ZM13 4h-2v8.2L7.4 8.6 6 10l6 6 6-6-1.4-1.4-3.6 3.6V4Z',
+  'toggle-left': 'M8 7a5 5 0 0 0 0 10h8a5 5 0 0 0 0-10H8Zm0 2a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z',
+  'toggle-right': 'M8 7a5 5 0 0 0 0 10h8a5 5 0 0 0 0-10H8Zm8 2a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z'
 }
 </script>
 

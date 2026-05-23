@@ -108,6 +108,13 @@
   "metrics": {
     "recent_errors_limit": 100
   },
+  "tunnel": {
+    "enabled": false,
+    "mode": "quick",
+    "binary_path": "",
+    "token": "",
+    "log_limit_lines": 100
+  },
   "upstreamcompat": {
     "enabled": true,
     "manifest_path": "internal/upstreamcompat/SYNC_MANIFEST.md"

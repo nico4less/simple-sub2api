@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -20,8 +23,10 @@ import (
 	"github.com/0xForce-Network/simple-sub2api/internal/gateway"
 	"github.com/0xForce-Network/simple-sub2api/internal/gatewayauth"
 	"github.com/0xForce-Network/simple-sub2api/internal/metrics"
+	"github.com/0xForce-Network/simple-sub2api/internal/proxyclient"
 	"github.com/0xForce-Network/simple-sub2api/internal/routing"
 	subscriptionimport "github.com/0xForce-Network/simple-sub2api/internal/subscription_import"
+	"github.com/0xForce-Network/simple-sub2api/internal/tunnel"
 	"github.com/0xForce-Network/simple-sub2api/internal/version"
 )
 
@@ -31,11 +36,13 @@ type Server struct {
 	sessions       *dashboard.SessionManager
 	pool           *accountpool.Manager
 	metrics        *metrics.Recorder
+	tunnel         tunnel.Controller
 	debugDashboard bool
 }
 
 type Options struct {
 	DebugDashboard bool
+	TunnelManager  tunnel.Controller
 }
 
 func New(store *config.Store, logger *slog.Logger) *Server {
@@ -48,14 +55,23 @@ func NewWithOptions(store *config.Store, logger *slog.Logger, options Options) *
 	if err != nil && logger != nil {
 		logger.Error("account pool init failed", "error", err)
 	}
-	return &Server{
+	tunnelManager := options.TunnelManager
+	if tunnelManager == nil {
+		tunnelManager = tunnel.NewManager()
+	}
+	s := &Server{
 		store:          store,
 		logger:         logger,
 		sessions:       dashboard.NewSessionManager(time.Duration(cfg.Dashboard.SessionTTLSeconds) * time.Second),
 		pool:           pool,
 		metrics:        metrics.NewRecorder(cfg.Metrics.RecentErrorsLimit),
+		tunnel:         tunnelManager,
 		debugDashboard: options.DebugDashboard,
 	}
+	if err := s.applyTunnelConfig(cfg); err != nil && logger != nil {
+		logger.Error("tunnel init failed", "error", err)
+	}
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -97,6 +113,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/admin/import/apply", s.adminOnly(http.HandlerFunc(s.importApply)))
 	mux.Handle("/api/admin/proxies", s.adminOnly(http.HandlerFunc(s.proxies)))
 	mux.Handle("/api/admin/proxies/", s.adminOnly(http.HandlerFunc(s.proxyByID)))
+	mux.Handle("/api/admin/tunnel/status", s.adminOnly(http.HandlerFunc(s.tunnelStatus)))
+	mux.Handle("/api/admin/tunnel/config", s.adminOnly(http.HandlerFunc(s.tunnelConfig)))
 	mux.Handle("/api/admin/quota", s.adminOnly(http.HandlerFunc(s.quotaConfig)))
 	mux.Handle("/api/admin/quota/state", s.adminOnly(http.HandlerFunc(s.quotaState)))
 	mux.Handle("/api/admin/routing", s.adminOnly(http.HandlerFunc(s.routingConfig)))
@@ -107,6 +125,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/admin/metrics/recent-usage", s.adminOnly(http.HandlerFunc(s.recentUsage)))
 	mux.Handle("/api/admin/debug/snapshot", s.adminOnly(http.HandlerFunc(s.debugSnapshot)))
 	return s.cors(mux)
+}
+
+func (s *Server) StopTunnel() error {
+	if s.tunnel == nil {
+		return nil
+	}
+	return s.tunnel.Stop()
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -259,6 +284,7 @@ func (s *Server) dashboardState(w http.ResponseWriter, r *http.Request) {
 		"account_pool": pool,
 		"quota_state":  quotaState,
 		"metrics":      s.metrics.Snapshot(),
+		"tunnel":       s.tunnelStatusSnapshot(),
 		"recent_usage": s.recentUsageItems(12),
 		"gateway":      map[string]any{"key_configured": s.store.GatewayKey() != "", "keys_count": len(cfg.GatewayKeys)},
 	})
@@ -618,6 +644,38 @@ func (s *Server) configSave(w http.ResponseWriter, r *http.Request) {
 	s.writeUpdateResult(w, updated, err)
 }
 
+func (s *Server) tunnelStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.tunnelStatusSnapshot())
+}
+
+func (s *Server) tunnelConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req tunnelConfigRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+		candidate := req.Tunnel
+		if isMasked(candidate.Token) {
+			candidate.Token = cfg.Tunnel.Token
+		}
+		cfg.Tunnel = candidate
+		return nil
+	})
+	if err != nil {
+		s.writeUpdateResult(w, updated, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"config_version": updated.ConfigVersion, "tunnel": config.Redacted(updated).Tunnel, "status": s.tunnelStatusSnapshot()})
+}
+
 func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -711,12 +769,32 @@ func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id strin
 	for _, account := range cfg.Accounts {
 		if account.ID == id {
 			result := accountcheck.New(cfg.Probe).Check(r.Context(), cfg, account)
+			displaySync := s.syncAccountDisplayState(r.Context(), cfg, &account)
+			if displaySync.Synced {
+				cfg = replaceAccountInConfig(cfg, account)
+			}
 			if s.pool != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Probe.TimeoutSeconds)*time.Second)
 				defer cancel()
 				_ = s.pool.ApplyConfig(ctx, cfg)
 			}
-			writeJSON(w, http.StatusOK, result)
+			accounts := s.accountsResponseFromConfig(cfg)
+			response := accountRefreshResponse{
+				AccountID: result.AccountID,
+				Status:    result.Status,
+				Message:   joinRefreshMessages(result.Message, displaySync.Message),
+				CheckedAt: result.CheckedAt,
+				ProxyID:   result.ProxyID,
+				Health:    result,
+				Accounts:  &accounts,
+			}
+			for i := range accounts.Accounts {
+				if accounts.Accounts[i].Config.ID == id {
+					response.Account = &accounts.Accounts[i]
+					break
+				}
+			}
+			writeJSON(w, http.StatusOK, response)
 			return
 		}
 	}
@@ -1223,7 +1301,24 @@ func (s *Server) updateConfig(expectedVersion int, mutate func(*config.Config) e
 		}
 	}
 	s.metrics.ApplyRecentErrorsLimit(updated.Metrics.RecentErrorsLimit)
+	if err := s.applyTunnelConfig(updated); err != nil {
+		return config.Config{}, err
+	}
 	return updated, nil
+}
+
+func (s *Server) applyTunnelConfig(cfg config.Config) error {
+	if s.tunnel == nil {
+		return nil
+	}
+	return s.tunnel.Apply(cfg.Tunnel, cfg.Server.Bind)
+}
+
+func (s *Server) tunnelStatusSnapshot() tunnel.RuntimeStatus {
+	if s.tunnel == nil {
+		return tunnel.RuntimeStatus{Status: tunnel.StatusStopped}
+	}
+	return s.tunnel.Status()
 }
 
 func (s *Server) cors(next http.Handler) http.Handler {
@@ -1294,6 +1389,11 @@ type keyMutationRequest struct {
 	Key           string            `json:"key_value,omitempty"`
 }
 
+type tunnelConfigRequest struct {
+	ConfigVersion int                 `json:"config_version"`
+	Tunnel        config.TunnelConfig `json:"tunnel"`
+}
+
 type recentUsageItem struct {
 	Rank              int     `json:"rank"`
 	AccountID         string  `json:"account_id"`
@@ -1327,13 +1427,18 @@ type groupSummary struct {
 }
 
 type accountSummary struct {
-	Config        config.Account       `json:"config"`
-	RuntimeStatus string               `json:"runtime_status"`
-	Health        *accountcheck.Result `json:"health,omitempty"`
-	Quota         map[string]any       `json:"quota,omitempty"`
-	Metrics       map[string]uint64    `json:"metrics,omitempty"`
-	Source        string               `json:"source,omitempty"`
-	References    map[string]string    `json:"references,omitempty"`
+	Config            config.Account       `json:"config"`
+	RuntimeStatus     string               `json:"runtime_status"`
+	Health            *accountcheck.Result `json:"health,omitempty"`
+	Quota             map[string]any       `json:"quota,omitempty"`
+	Metrics           map[string]uint64    `json:"metrics,omitempty"`
+	Runtime           map[string]any       `json:"runtime,omitempty"`
+	Source            string               `json:"source,omitempty"`
+	References        map[string]string    `json:"references,omitempty"`
+	SubscriptionTier  string               `json:"subscription_tier,omitempty"`
+	PrivacyMode       string               `json:"privacy_mode,omitempty"`
+	OpenAICompactMode string               `json:"openai_compact_mode,omitempty"`
+	UsageInfo         map[string]any       `json:"usage_info,omitempty"`
 }
 
 type accountsResponse struct {
@@ -1345,8 +1450,27 @@ type accountsResponse struct {
 	Sources       []string             `json:"sources"`
 }
 
+type accountRefreshResponse struct {
+	AccountID string              `json:"account_id"`
+	Status    string              `json:"status"`
+	Message   string              `json:"message,omitempty"`
+	CheckedAt string              `json:"checked_at"`
+	ProxyID   string              `json:"proxy_id,omitempty"`
+	Health    accountcheck.Result `json:"health"`
+	Account   *accountSummary     `json:"account,omitempty"`
+	Accounts  *accountsResponse   `json:"accounts,omitempty"`
+}
+
+type accountDisplaySyncResult struct {
+	Message string
+	Synced  bool
+}
+
 func (s *Server) accountsResponse() accountsResponse {
-	cfg := s.store.Snapshot()
+	return s.accountsResponseFromConfig(s.store.Snapshot())
+}
+
+func (s *Server) accountsResponseFromConfig(cfg config.Config) accountsResponse {
 	redacted := config.Redacted(cfg)
 	poolByID := map[string]accountpool.AccountState{}
 	if s.pool != nil {
@@ -1379,10 +1503,19 @@ func (s *Server) accountsResponse() accountsResponse {
 			health := state.Check
 			summary.RuntimeStatus = state.Status
 			summary.Health = &health
+			summary.Runtime = map[string]any{
+				"active_conns":      state.ActiveConns,
+				"cooldown_until":    state.CooldownUntil,
+				"last_selected_at":  state.LastSelectedAt,
+				"last_selected_seq": state.LastSelectedSeq,
+				"tier":              state.Tier,
+				"tags":              state.Tags,
+			}
 		}
 		if quotaState, ok := quotaByID[account.ID]; ok {
 			summary.Quota = quotaState
 		}
+		applyDisplayState(&summary, account)
 		summary.Metrics = map[string]uint64{
 			"hits":   metricSnapshot.PerAccountHits[account.ID],
 			"errors": metricSnapshot.PerAccountErrors[account.ID],
@@ -1401,6 +1534,403 @@ func (s *Server) accountsResponse() accountsResponse {
 		sources = append(sources, source.ID)
 	}
 	return accountsResponse{ConfigVersion: redacted.ConfigVersion, Accounts: summaries, Proxies: redacted.Proxies, Groups: redacted.Groups, QuotaPolicies: redacted.Quota.Policies, Sources: sources}
+}
+
+func applyDisplayState(summary *accountSummary, account config.Account) {
+	metadata := account.Metadata
+	usageInfo := mapFromMetadata(metadata, "usage_info", "usage")
+	if len(usageInfo) > 0 {
+		summary.UsageInfo = cloneDisplayMap(usageInfo)
+	}
+	summary.SubscriptionTier = normalizeSubscriptionTier(firstMetadataString(metadata, []string{"subscription_tier", "subscriptionTier", "paid_tier", "current_tier", "plan_type", "tier"}, account.Tier))
+	summary.PrivacyMode = firstMetadataString(metadata, []string{"privacy_mode", "privacyMode", "openai_privacy_mode", "training_mode"}, "")
+	if summary.PrivacyMode == "" && metadataBool(metadata, "openai_passthrough") {
+		summary.PrivacyMode = "private"
+	}
+	summary.OpenAICompactMode = firstMetadataString(metadata, []string{"openai_compact_mode", "compact_mode", "compactMode"}, "")
+	if summary.OpenAICompactMode == "" && config.AccountPlatform(account) == "openai" {
+		summary.OpenAICompactMode = "auto"
+	}
+	if summary.Quota == nil {
+		summary.Quota = map[string]any{}
+	}
+	if summary.SubscriptionTier != "" {
+		summary.Quota["subscription_tier"] = summary.SubscriptionTier
+	}
+	if summary.PrivacyMode != "" {
+		summary.Quota["privacy_mode"] = summary.PrivacyMode
+	}
+	if summary.OpenAICompactMode != "" {
+		summary.Quota["openai_compact_mode"] = summary.OpenAICompactMode
+	}
+	if summary.UsageInfo == nil {
+		summary.UsageInfo = usageInfoFromQuotaAndMetadata(summary.Quota, metadata)
+	}
+	if len(summary.UsageInfo) > 0 {
+		summary.Quota["usage_info"] = summary.UsageInfo
+	}
+}
+
+func replaceAccountInConfig(cfg config.Config, account config.Account) config.Config {
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == account.ID {
+			cfg.Accounts[i] = account
+			return cfg
+		}
+	}
+	return cfg
+}
+
+func (s *Server) syncAccountDisplayState(ctx context.Context, cfg config.Config, account *config.Account) accountDisplaySyncResult {
+	if account == nil || config.AccountPlatform(*account) != "openai" {
+		return accountDisplaySyncResult{}
+	}
+	accessToken := credentialValue(account.Credential, "access_token")
+	if accessToken == "" {
+		accessToken = credentialValue(account.Credential, "api_key")
+	}
+	if accessToken == "" && strings.HasPrefix(strings.TrimSpace(account.Credential), "sk-") {
+		accessToken = strings.TrimSpace(account.Credential)
+	}
+	if accessToken == "" {
+		return accountDisplaySyncResult{Message: "display sync skipped: access token or API key is required"}
+	}
+	client, err := displaySyncHTTPClient(cfg, *account)
+	if err != nil {
+		return accountDisplaySyncResult{Message: "display sync skipped: " + err.Error()}
+	}
+	metadata := cloneDisplayMap(account.Metadata)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if tier, err := fetchOpenAISubscriptionTier(ctx, client, accessToken); err == nil && tier != "" {
+		metadata["subscription_tier"] = tier
+	} else if err != nil {
+		metadata["display_sync_subscription_error"] = sanitizeDisplaySyncError(err)
+	}
+	if usageInfo, err := fetchOpenAIUsageInfo(ctx, client, accessToken); err == nil && len(usageInfo) > 0 {
+		metadata["usage_info"] = usageInfo
+	} else if err != nil {
+		metadata["display_sync_usage_error"] = sanitizeDisplaySyncError(err)
+	}
+	account.Metadata = metadata
+	return accountDisplaySyncResult{Message: "display sync completed", Synced: true}
+}
+
+func displaySyncHTTPClient(cfg config.Config, account config.Account) (*http.Client, error) {
+	specs := proxyclient.SpecsFromConfig(cfg)
+	spec, _, err := proxyclient.Resolve(account, specs)
+	if err != nil {
+		return nil, err
+	}
+	timeout := time.Duration(cfg.Probe.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	return proxyclient.HTTPClient(spec, timeout)
+}
+
+func fetchOpenAISubscriptionTier(ctx context.Context, client *http.Client, accessToken string) (string, error) {
+	body, err := postJSONWithBearer(ctx, client, "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist", accessToken, map[string]any{"metadata": map[string]any{"ideType": "ANTIGRAVITY"}})
+	if err != nil {
+		return "", err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	return normalizeSubscriptionTier(subscriptionTierFromPayload(payload)), nil
+}
+
+func fetchOpenAIUsageInfo(ctx context.Context, client *http.Client, accessToken string) (map[string]any, error) {
+	body, err := postJSONWithBearer(ctx, client, "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels", accessToken, map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	return usageInfoFromQuotaModels(payload), nil
+}
+
+func postJSONWithBearer(ctx context.Context, client *http.Client, url string, token string, payload any) ([]byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("User-Agent", "Antigravity/1.0 simple-sub2api")
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", response.StatusCode)
+	}
+	return responseBody, nil
+}
+
+func subscriptionTierFromPayload(payload map[string]any) string {
+	for _, key := range []string{"paidTier", "currentTier"} {
+		if tier := tierName(payload[key]); tier != "" {
+			return tier
+		}
+	}
+	if tiers, ok := payload["allowedTiers"].([]any); ok {
+		for _, candidate := range tiers {
+			item, ok := candidate.(map[string]any)
+			if !ok {
+				continue
+			}
+			if metadataBool(item, "isDefault") {
+				return tierName(item)
+			}
+		}
+	}
+	return ""
+}
+
+func tierName(value any) string {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"name", "id", "slug", "quotaTier"} {
+		if text, ok := item[key].(string); ok && strings.TrimSpace(text) != "" {
+			return strings.TrimSpace(text)
+		}
+	}
+	return ""
+}
+
+func usageInfoFromQuotaModels(payload map[string]any) map[string]any {
+	models, ok := payload["models"].(map[string]any)
+	if !ok || len(models) == 0 {
+		return nil
+	}
+	lowestFiveHour := 100.0
+	lowestSevenDay := 100.0
+	var fiveHourReset string
+	var sevenDayReset string
+	for name, raw := range models {
+		model, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		quotaInfo, ok := model["quotaInfo"].(map[string]any)
+		if !ok {
+			continue
+		}
+		percentage := firstFloatFromMaps([]map[string]any{quotaInfo}, []string{"remainingFraction"}) * 100
+		if percentage <= 0 {
+			continue
+		}
+		resetAt := firstMetadataString(quotaInfo, []string{"resetTime"}, "")
+		lowerName := strings.ToLower(name)
+		if strings.Contains(lowerName, "flash") || strings.Contains(lowerName, "5h") {
+			if percentage < lowestFiveHour {
+				lowestFiveHour = percentage
+				fiveHourReset = resetAt
+			}
+			continue
+		}
+		if percentage < lowestSevenDay {
+			lowestSevenDay = percentage
+			sevenDayReset = resetAt
+		}
+	}
+	usageInfo := map[string]any{}
+	if lowestFiveHour < 100 {
+		usageInfo["five_hour"] = remainingWindow("5h", lowestFiveHour, fiveHourReset)
+	}
+	if lowestSevenDay < 100 {
+		usageInfo["seven_day"] = remainingWindow("7d", lowestSevenDay, sevenDayReset)
+	}
+	return usageInfo
+}
+
+func remainingWindow(label string, remainingPercent float64, resetAt string) map[string]any {
+	usedPercent := 100 - remainingPercent
+	if usedPercent < 0 {
+		usedPercent = 0
+	}
+	window := map[string]any{"label": label, "utilization": usedPercent, "remaining_percent": remainingPercent}
+	if resetAt != "" {
+		window["reset_at"] = resetAt
+		window["reset_time"] = resetAt
+	}
+	return window
+}
+
+func credentialValue(credential string, key string) string {
+	for _, part := range strings.FieldsFunc(credential, func(r rune) bool { return r == ';' || r == '\n' || r == '\r' }) {
+		name, value, ok := strings.Cut(part, "=")
+		if ok && strings.TrimSpace(name) == key {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func joinRefreshMessages(healthMessage string, syncMessage string) string {
+	if syncMessage == "" {
+		return healthMessage
+	}
+	if healthMessage == "" {
+		return syncMessage
+	}
+	return healthMessage + "; " + syncMessage
+}
+
+func sanitizeDisplaySyncError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	for _, marker := range []string{"Bearer ", "sk-", "access_token=", "refresh_token="} {
+		if strings.Contains(message, marker) {
+			return "display sync failed"
+		}
+	}
+	return message
+}
+
+func usageInfoFromQuotaAndMetadata(quotaState map[string]any, metadata map[string]any) map[string]any {
+	fiveHourUsed := firstFloatFromMaps([]map[string]any{metadata, quotaState}, []string{"window_cost_used", "session_window_cost_used"})
+	fiveHourLimit := firstFloatFromMaps([]map[string]any{metadata, quotaState}, []string{"window_cost_limit", "session_window_cost_limit"})
+	weeklyUsed := firstFloatFromMaps([]map[string]any{quotaState, metadata}, []string{"weekly_used_tokens", "quota_weekly_used"})
+	weeklyLimit := firstFloatFromMaps([]map[string]any{quotaState, metadata}, []string{"weekly_limit_tokens", "quota_weekly_limit"})
+	usageInfo := map[string]any{}
+	if fiveHourUsed > 0 || fiveHourLimit > 0 {
+		usageInfo["five_hour"] = usageWindow("5h", fiveHourUsed, fiveHourLimit, firstMetadataString(metadata, []string{"session_window_reset_at", "window_cost_reset_at"}, ""))
+	}
+	if weeklyUsed > 0 || weeklyLimit > 0 {
+		usageInfo["seven_day"] = usageWindow("7d", weeklyUsed, weeklyLimit, firstMetadataString(metadata, []string{"quota_weekly_reset_at", "weekly_reset_at"}, ""))
+	}
+	return usageInfo
+}
+
+func usageWindow(label string, used float64, limit float64, resetAt string) map[string]any {
+	window := map[string]any{
+		"label":       label,
+		"used":        used,
+		"limit":       limit,
+		"utilization": usageUtilization(used, limit),
+	}
+	if resetAt != "" {
+		window["reset_at"] = resetAt
+		window["reset_time"] = resetAt
+	}
+	return window
+}
+
+func usageUtilization(used float64, limit float64) float64 {
+	if used <= 0 || limit <= 0 {
+		return 0
+	}
+	percent := used / limit * 100
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func mapFromMetadata(metadata map[string]any, keys ...string) map[string]any {
+	for _, key := range keys {
+		if value, ok := metadata[key].(map[string]any); ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func cloneDisplayMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func firstMetadataString(metadata map[string]any, keys []string, fallback string) string {
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func metadataBool(metadata map[string]any, key string) bool {
+	switch value := metadata[key].(type) {
+	case bool:
+		return value
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "1", "yes", "enabled":
+			return true
+		}
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	}
+	return false
+}
+
+func firstFloatFromMaps(maps []map[string]any, keys []string) float64 {
+	for _, values := range maps {
+		for _, key := range keys {
+			switch value := values[key].(type) {
+			case int:
+				return float64(value)
+			case int64:
+				return float64(value)
+			case float64:
+				return value
+			case json.Number:
+				parsed, err := value.Float64()
+				if err == nil {
+					return parsed
+				}
+			case string:
+				parsed, err := json.Number(strings.TrimSpace(value)).Float64()
+				if err == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func normalizeSubscriptionTier(raw string) string {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	switch {
+	case strings.Contains(lower, "ultra"):
+		return "ultra"
+	case strings.Contains(lower, "pro") || strings.Contains(lower, "paid") || strings.Contains(lower, "standard") || strings.Contains(lower, "enterprise") || strings.Contains(lower, "team") || strings.Contains(lower, "plus"):
+		return "pro"
+	default:
+		return "free"
+	}
 }
 
 func (s *Server) keysResponse() keysResponse {
@@ -1743,6 +2273,9 @@ func preserveRedactedSecrets(candidate *config.Config, current config.Config) {
 		if isMasked(candidate.SubscriptionSources[i].InlineBundle) {
 			candidate.SubscriptionSources[i].InlineBundle = currentSubs[candidate.SubscriptionSources[i].ID].InlineBundle
 		}
+	}
+	if isMasked(candidate.Tunnel.Token) {
+		candidate.Tunnel.Token = current.Tunnel.Token
 	}
 }
 
