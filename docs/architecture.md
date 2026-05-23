@@ -1,59 +1,65 @@
-# Simple Sub2API 架构设计与协议兼容性规范
+# Simple Sub2API Architecture Design and Protocol Compatibility Specification
 
-本文件记录了 `Simple Sub2API`（极简个人订阅网关）的核心设计决策、去商业化定位、以及面向多厂商 API 的协议兼容性（Protocol Compatibility）与数据防泄漏（Data Leak Prevention）架构规约。它作为指导后续系统维护、功能对齐和可审计合规开发的最高技术准则。
-
----
-
-## 一、 项目定位：纯自用与去商业化 (De-commercialization)
-
-传统 API 代理网关为了多商户转售，集成了复杂的计费、在线支付、多租户划转等商业功能，这引入了极高的系统复杂性与无意数据泄露风险。
-
-`Simple Sub2API` 走**完全去商业化、单用户隔离**的个人工具路线：
-1. **去商业化设计**：彻底移除了多租户注册、在线支付、多级分账和商业明细账单系统。
-2. **极简数据存储**：废弃了重型关系型数据库，全量配置存储于单文件 JSON (`config.json`)。系统运行时 counters、cooldowns 及最近请求状态保持内存态，实现轻量级冷启动与高便携性。
-3. **消除转售漏洞**：仅限个人或内部测试使用，从产品边界上消除了分销和商用倒卖的漏洞，大幅缩减了系统的安全攻击面与合规性审查边界。
+This document records the core design decisions, de-commercialized positioning, protocol compatibility, and data-leak-prevention architecture rules for `Simple Sub2API`, the minimal personal subscription gateway. It is the highest-level technical standard for future maintenance, feature alignment, and auditable compliance-oriented development.
 
 ---
 
-## 二、 保障数据高保真与消除模拟混淆 (No Emulation Adulteration)
+## 1. Project Positioning: Personal Use and De-Commercialization
 
-商业中转系统为了绕过限额，常存在“模型掺水”或“伪造仿真”行为（即修改 Prompt 混淆调用、压缩上下文或伪造特定的私有 Client 请求），这严重损害了数据完整性。
+Traditional API proxy gateways integrate complex billing, online payment, multi-tenant balance transfer, and other commercial functions for reseller scenarios. That adds significant system complexity and increases the risk of unintended data leakage.
 
-`Simple Sub2API` 秉承**数据透明与协议高保真**的合规准则：
-1. **透明代理，无损转发**：只做标准协议的透明路由分发，严禁任何形式的上下文缩减或模型静默替换。
-2. **拒绝模拟伪造行为**：彻底剔除并禁止移植任何用于模拟、仿真特定客户端（如 Claude Code 或专用 IDE 插件专属接口）的混淆代码。所有接口与响应严格遵循原生 API 规范，保持高度可审计性。
-3. **模型白名单（Allowed Models）物理限制**：通过提供 `allowed_models` 机制，让用户自主且显式地限定特定通道的可用模型范围，从底层设计上确保模型调用的精确性。
+`Simple Sub2API` follows a fully de-commercialized, single-user-isolated personal-tool model:
+
+1. **De-commercialized design**: Multi-tenant registration, online payment, multi-level revenue sharing, and commercial detailed billing systems are completely removed.
+2. **Minimal data storage**: Heavy relational databases are discarded. All configuration is stored in a single JSON file (`config.json`). Runtime counters, cooldowns, and recent request state remain in memory, enabling lightweight cold starts and high portability.
+3. **Resale loophole elimination**: The product boundary is limited to personal or internal test usage, removing distribution and commercial resale loopholes by design while greatly reducing the security attack surface and compliance review boundary.
 
 ---
 
-## 三、 协议兼容性与隐私泄露防护 (Protocol Compatibility & Data Leak Prevention)
+## 2. High-Fidelity Data and No Emulation Adulteration
 
-在分布式 API 代理场景下，保持请求的原始协议规范，并防止网关内部管理元数据“误发送”给上游，是保障数据隐私与合规的基础。
+Commercial relay systems often use "model dilution" or "forged emulation" to bypass limits, such as modifying prompts, compressing context, or pretending to be a private client request. These behaviors seriously damage data integrity.
 
-`Simple Sub2API` 实施了以下标准的代理透明性与网络边界保护设计：
+`Simple Sub2API` follows a compliance principle of data transparency and protocol fidelity:
+
+1. **Transparent proxying, lossless forwarding**: The gateway only performs transparent routing for standard protocols and strictly forbids any form of context reduction or silent model substitution.
+2. **No simulated or forged behavior**: Any obfuscation code used to emulate specific clients, such as Claude Code or proprietary IDE plugin interfaces, is removed and must not be ported. All interfaces and responses follow native API specifications and remain highly auditable.
+3. **Physical restriction through allowed models**: The `allowed_models` mechanism lets users explicitly constrain which models are available on a channel, ensuring exact model invocation from the foundation.
+
+---
+
+## 3. Protocol Compatibility and Privacy Leak Prevention
+
+In distributed API proxy scenarios, preserving the original request protocol and preventing gateway management metadata from being sent upstream are fundamental to privacy and compliance.
+
+`Simple Sub2API` implements the following proxy-transparency and network-boundary protections:
 
 ```
-[本地客户端] ──(原生请求)──> [Simple Sub2API] ──(协议对齐/SOCKS5h)──> [上游 API 节点]
+[Local Client] --(Native Request)--> [Simple Sub2API] --(Protocol-Aligned/SOCKS5h)--> [Upstream API Node]
 ```
 
-### 1. 规范的 User-Agent 兼容性与 Header 净化
-* **规范的 User-Agent 透传**：不依赖 Go 语言默认的 `Go-http-client`（该默认 UA 常因无法表达客户端真实身份而被某些防护节点拒绝）。网关透明且如实地向上传递本地客户端发送的真实 UA 指纹，或者在缺失时采用明确、可识别的通用规范客户端标识。
-* **原生 Header 协议完整性保护**：高保真透传所有标准客户端发送的特异性头部（例如 Anthropic 协议必需的 `anthropic-version`、OpenAI 协议所需的 `OpenAI-Beta` 等），防止因头部信息残缺导致协议级请求校验失败。
-* **防管理信息误发 (No Metadata Leakage)**：确保发往上游 API 的请求中，**绝对不包含**任何本地网关特有的调试或管理 Header（例如 `X-Simple-Sub2API-*`）。这些网关特有字段仅允许在网关响应给本地 Client 时使用，在发往上游时自动剥离以防止无意的信息泄露。
+### 3.1 Standards-Compliant User-Agent Compatibility and Header Sanitization
 
-### 2. 原始请求体高保真流转 (Raw Body Pass-Through)
-* **避免重序列化损耗 (No Re-Serialization)**：标准的 JSON 解析与重包装过程会重新排列 JSON 的 Key 顺序（例如 Go 的 `json.Marshal` 强制按字母表重排序），这会造成非必要的 CPU 序列化损耗，并破坏原始请求的哈希完整性。
-* **高保真透传**：`Simple Sub2API` 直接透传客户端发送的原始 `body []byte`。既提升了高并发下的处理效率，又完美保留了本地调用端发出的原生 JSON 数据结构完整性，便于上游进行最精准的签名校验。
+- **Standards-compliant User-Agent passthrough**: The gateway does not rely on Go's default `Go-http-client` User-Agent, which can fail to express the actual client identity and may be rejected by some protection layers. It transparently forwards the real UA fingerprint sent by the local client, or uses an explicit, recognizable generic client identifier when missing.
+- **Native header protocol integrity**: All protocol-specific headers sent by standard clients are forwarded with high fidelity, such as Anthropic's required `anthropic-version` and OpenAI's `OpenAI-Beta`, preventing protocol-level validation failures caused by missing headers.
+- **No management metadata leakage**: Requests sent to upstream APIs must never contain local gateway debug or management headers such as `X-Simple-Sub2API-*`. These gateway-specific fields may only appear in responses returned to the local client and are automatically stripped from upstream requests.
 
-### 3. SOCKS5h 域名解析隐私边界控制 (DNS Leak Prevention)
-* **代理端解析域名**：对于配置了 SOCKS5 代理的通道，网关强制使用 `socks5h` 协议规范。
-* **防止本地 DNS 泄露**：所有的域名解析（如 `api.openai.com`）必须在远端代理节点进行，防止在网关本地触发非加密的本地 DNS 泄露，保障企业/个人网络的域名访问隐私。
+### 3.2 Raw Body Pass-Through
+
+- **No re-serialization loss**: Standard JSON parsing and repackaging can reorder keys, for example Go's `json.Marshal` sorts keys alphabetically. This causes unnecessary CPU serialization overhead and breaks original request hash integrity.
+- **High-fidelity pass-through**: `Simple Sub2API` directly forwards the raw `body []byte` sent by the client. This improves high-concurrency efficiency and preserves the native JSON structure emitted by the local caller, allowing upstream systems to perform the most precise signature validation.
+
+### 3.3 SOCKS5h Domain-Resolution Privacy Boundary
+
+- **Remote DNS resolution**: For channels configured with SOCKS5 proxies, the gateway requires the `socks5h` protocol behavior.
+- **Local DNS leak prevention**: All domain resolution, such as `api.openai.com`, must happen on the remote proxy node. This prevents unencrypted local DNS leakage from the gateway host and protects enterprise or personal network access privacy.
 
 ---
 
-## 四、 架构维护与审计规范
+## 4. Architecture Maintenance and Audit Rules
 
-为了确保 `Simple Sub2API` 的协议兼容性与隐私边界控制在长期迭代中不被破坏，所有开发者与 AI 辅助助手在协作开发时必须遵守以下规范：
-1. **防泄露审计**：定期通过调试日志，验证发往上游 API 节点的 HTTP 头部，确保已剔除所有不必要的网关本地识别信息。
-2. **轻量化兼容边界**：保持 `compat_shim.go` 作为唯一的上游通道数据兼容层，仅用于标准的字段对齐与透传，不在此添加任何具有攻击性、规避性或混淆性的字段改写逻辑。
-3. **状态持久化隔离**：任何新增的持久化配置属性，必须能以扁平的方式存入单文件 JSON 配置中，并严格遵守 `config_version` 乐观锁冲突处理规范。
+To ensure that protocol compatibility and privacy boundaries are not broken during long-term iteration, all developers and AI assistants must follow these rules:
+
+1. **Leak-prevention audit**: Periodically verify outbound HTTP headers sent to upstream API nodes through debug logs and ensure all unnecessary local gateway identifiers are removed.
+2. **Lightweight compatibility boundary**: Keep `compat_shim.go` as the only upstream-channel data compatibility layer. It should only perform standard field alignment and passthrough, and must not add aggressive, evasive, or obfuscating field rewrite logic.
+3. **State persistence isolation**: Any new persistent configuration attribute must be representable in the single-file JSON config and must strictly follow the `config_version` optimistic-lock conflict handling contract.
