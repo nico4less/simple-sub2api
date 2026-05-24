@@ -106,6 +106,8 @@ interface UsageWindow {
   status: string
 }
 
+type OAuthCompleteLogLevel = 'info' | 'warn' | 'error'
+
 const { refresh } = useAdminState()
 const loading = ref(false)
 const error = ref('')
@@ -1587,6 +1589,43 @@ function parseCredentialEnvelope(credential: string): Record<string, string> {
   return out
 }
 
+function oauthCompleteLog(level: OAuthCompleteLogLevel, stage: string, detail: Record<string, unknown> = {}) {
+  const payload = {
+    event: 'simple_sub2api_oauth_complete',
+    stage,
+    timestamp: new Date().toISOString(),
+    ...detail
+  }
+  if (level === 'error') {
+    console.error('[simple-sub2api][oauth-complete]', payload)
+    return
+  }
+  if (level === 'warn') {
+    console.warn('[simple-sub2api][oauth-complete]', payload)
+    return
+  }
+  console.info('[simple-sub2api][oauth-complete]', payload)
+}
+
+function safeCredentialKeys(credential: string): string[] {
+  return Object.keys(parseCredentialEnvelope(credential)).sort()
+}
+
+function summarizeCompleteAccount(account: AccountConfig) {
+  const metadata = metadataFromAccount(account)
+  return {
+    id: account.id,
+    type: account.type,
+    platform: metadata.platform,
+    category: metadata.account_category,
+    add_method: metadata.add_method,
+    enabled: account.enabled,
+    has_base_url: Boolean(account.base_url),
+    credential_keys: safeCredentialKeys(account.credential || ''),
+    group_count: Array.isArray(metadata.group_ids) ? metadata.group_ids.length : 0
+  }
+}
+
 function applyCredentialEnvelope(credential: string) {
   const envelope = parseCredentialEnvelope(credential)
   form.api_key = envelope.api_key || ''
@@ -1907,19 +1946,22 @@ async function handleCopyAuthUrl() {
 
 function handlePrimaryAccountAction() {
   if (completingAccount.value) return
-  if (!validateStep1()) {
-    return
-  }
-  if (isOAuthFlow.value && editorStep.value === 1) {
-    ensureAccountID()
-    applyDurableFieldAliases()
-    editorStep.value = 2
-    return
-  }
-  if (isOAuthFlow.value && editorStep.value === 2) {
+  if (isOAuthFlow.value) {
+    if (editorStep.value === 1) {
+      if (!validateStep1()) {
+        return
+      }
+      ensureAccountID()
+      applyDurableFieldAliases()
+      editorStep.value = 2
+      return
+    }
     completeOAuthAccount().catch((err) => {
       error.value = err instanceof Error ? err.message : String(err)
     })
+    return
+  }
+  if (!validateStep1()) {
     return
   }
   if (!canSubmit.value) {
@@ -2153,39 +2195,100 @@ async function completeOAuthAccount() {
   notice.value = ''
   completingAccount.value = true
   const rawInput = authCodeInput.value.trim()
+  oauthCompleteLog('info', 'start', {
+    editor_mode: editorMode.value,
+    account_id: form.id || '(pending)',
+    platform: form.platform,
+    category: form.category,
+    add_method: form.add_method,
+    raw_input_length: rawInput.length,
+    has_refresh_token: Boolean(form.refresh_token.trim()),
+    has_setup_token: Boolean(form.setup_token.trim()),
+    config_version: accountsState.value?.config_version ?? null
+  })
   try {
     const capturedCode = extractOAuthCallbackParam(rawInput, 'code') || rawInput || form.refresh_token.trim() || form.setup_token.trim()
     if (!capturedCode) {
+      oauthCompleteLog('warn', 'missing_code', {
+        account_id: form.id || '(pending)',
+        credential_status: oauthCredentialStatus.value
+      })
       error.value = oauthCredentialStatus.value || t('accounts.credentialRequired')
       return
     }
+    oauthCompleteLog('info', 'captured_code', {
+      account_id: form.id || '(pending)',
+      source: extractOAuthCallbackParam(rawInput, 'code') ? 'callback_url' : rawInput ? 'manual_input' : form.refresh_token.trim() ? 'refresh_token_field' : 'setup_token_field',
+      code_length: capturedCode.length
+    })
     if (form.add_method === 'setup-token') {
       form.setup_token = capturedCode
     } else {
       form.refresh_token = capturedCode
     }
     if (!canSubmit.value) {
+      oauthCompleteLog('warn', 'cannot_submit', {
+        account_id: form.id || '(pending)',
+        credential_status: oauthCredentialStatus.value,
+        credential_keys: safeCredentialKeys(buildCredential())
+      })
       error.value = oauthCredentialStatus.value || t('accounts.credentialRequired')
       return
     }
     const account = buildAccount()
+    oauthCompleteLog('info', 'built_account', summarizeCompleteAccount(account))
     const latest = await refreshAccountsSnapshot()
+    oauthCompleteLog('info', 'snapshot_loaded', {
+      account_id: account.id,
+      config_version: latest.config_version,
+      account_count: latest.accounts.length
+    })
     if (editorMode.value === 'create') {
+      oauthCompleteLog('info', 'create_request', { account_id: account.id, config_version: latest.config_version })
       await createAccount(latest.config_version, account)
       notice.value = t('accounts.created', { id: account.id })
+      oauthCompleteLog('info', 'create_success', { account_id: account.id })
     } else {
+      oauthCompleteLog('info', 'update_request', { account_id: account.id, config_version: latest.config_version })
       await updateAccount(latest.config_version, account)
       notice.value = t('accounts.updated', { id: account.id })
+      oauthCompleteLog('info', 'update_success', { account_id: account.id })
     }
+    oauthCompleteLog('info', 'refresh_request', { account_id: account.id })
     const validation = await refreshAccount(account.id)
+    oauthCompleteLog('info', 'refresh_success', {
+      account_id: account.id,
+      status: validation.status,
+      message: validation.message,
+      checked_at: validation.checked_at,
+      has_account: Boolean(validation.account),
+      has_accounts_snapshot: Boolean(validation.accounts),
+      subscription_tier: validation.account?.subscription_tier,
+      privacy_mode: validation.account?.privacy_mode,
+      usage_info_keys: validation.account?.usage_info ? Object.keys(validation.account.usage_info).sort() : []
+    })
     testResult.value = validation
     operationOutput.value = JSON.stringify(validation, null, 2)
     if (validation.accounts) accountsState.value = validation.accounts
     notice.value = `${notice.value} Complete validation: ${validation.status}.`
     closeEditor()
+    oauthCompleteLog('info', 'closed_editor', {
+      account_id: account.id,
+      loaded_from_refresh_snapshot: Boolean(validation.accounts)
+    })
     if (!validation.accounts) await loadAll()
+  } catch (err) {
+    oauthCompleteLog('error', 'failed', {
+      account_id: form.id || '(pending)',
+      error: err instanceof Error ? err.message : String(err)
+    })
+    throw err
   } finally {
     completingAccount.value = false
+    oauthCompleteLog('info', 'finished', {
+      account_id: form.id || '(pending)',
+      editor_open: editorOpen.value
+    })
   }
 }
 
@@ -2895,24 +2998,22 @@ onMounted(() => {
                         </div>
                         
                         <div class="mt-3">
-                          <button
-                            v-if="!computedAuthUrl"
-                            type="button"
-                            class="btn btn-primary px-4 py-2 text-sm"
-                            @click="handleGenerateAuthLink"
-                          >
-                            Generate Authorization URL
-                          </button>
-                          <div v-else class="space-y-3">
+                          <div class="space-y-3">
+                            <button
+                              type="button"
+                              class="btn btn-primary px-4 py-2 text-sm"
+                              @click="handleGenerateAuthLink"
+                            >
+                              {{ computedAuthUrl ? 'Regenerate Authorization URL' : 'Generate Authorization URL' }}
+                            </button>
+                          </div>
+                          <div v-if="computedAuthUrl" class="mt-3 space-y-3">
                             <div class="flex items-center gap-2">
                               <input :value="computedAuthUrl" readonly class="input flex-1 bg-gray-50 font-mono text-xs normal-case dark:bg-gray-700" />
                               <button type="button" class="btn btn-secondary px-3 py-1.5 text-xs" @click="handleCopyAuthUrl">
                                 {{ copiedUrl ? 'Copied!' : 'Copy' }}
                               </button>
                             </div>
-                            <button type="button" class="text-xs text-blue-600 hover:underline dark:text-blue-400" @click="computedAuthUrl = ''">
-                              Regenerate Link
-                            </button>
                           </div>
                         </div>
                       </div>

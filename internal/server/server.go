@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -765,11 +766,45 @@ func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id strin
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.logger != nil {
+		s.logger.Info("account_refresh_start", slog.String("account_id", id))
+	}
 	cfg := s.store.Snapshot()
 	for _, account := range cfg.Accounts {
 		if account.ID == id {
+			if s.logger != nil {
+				s.logger.Info(
+					"account_refresh_account_found",
+					slog.String("account_id", id),
+					slog.String("type", account.Type),
+					slog.String("platform", config.AccountPlatform(account)),
+					slog.Bool("enabled", account.Enabled),
+				)
+			}
 			result := accountcheck.New(cfg.Probe).Check(r.Context(), cfg, account)
+			if s.logger != nil {
+				s.logger.Info(
+					"account_refresh_health_checked",
+					slog.String("account_id", id),
+					slog.String("status", result.Status),
+					slog.String("message", result.Message),
+					slog.String("proxy_id", result.ProxyID),
+				)
+			}
 			displaySync := s.syncAccountDisplayState(r.Context(), cfg, &account)
+			if s.logger != nil {
+				s.logger.Info(
+					"account_refresh_display_sync_result",
+					slog.String("account_id", id),
+					slog.Bool("synced", displaySync.Synced),
+					slog.String("message", displaySync.Message),
+					slog.String("credential_source", displaySync.CredentialSource),
+					slog.String("subscription_tier", displaySync.Tier),
+					slog.Any("usage_info_keys", displaySync.UsageInfoKeys),
+					slog.String("subscription_error", displaySync.SubscriptionErr),
+					slog.String("usage_error", displaySync.UsageErr),
+				)
+			}
 			if displaySync.Synced {
 				cfg = replaceAccountInConfig(cfg, account)
 			}
@@ -795,8 +830,20 @@ func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id strin
 				}
 			}
 			writeJSON(w, http.StatusOK, response)
+			if s.logger != nil {
+				s.logger.Info(
+					"account_refresh_response_written",
+					slog.String("account_id", id),
+					slog.String("status", response.Status),
+					slog.Bool("has_account", response.Account != nil),
+					slog.Bool("has_accounts_snapshot", response.Accounts != nil),
+				)
+			}
 			return
 		}
+	}
+	if s.logger != nil {
+		s.logger.Warn("account_refresh_not_found", slog.String("account_id", id))
 	}
 	http.Error(w, "account not found", http.StatusNotFound)
 }
@@ -1462,8 +1509,13 @@ type accountRefreshResponse struct {
 }
 
 type accountDisplaySyncResult struct {
-	Message string
-	Synced  bool
+	Message          string
+	Synced           bool
+	Tier             string
+	UsageInfoKeys    []string
+	SubscriptionErr  string
+	UsageErr         string
+	CredentialSource string
 }
 
 func (s *Server) accountsResponse() accountsResponse {
@@ -1586,35 +1638,52 @@ func (s *Server) syncAccountDisplayState(ctx context.Context, cfg config.Config,
 		return accountDisplaySyncResult{}
 	}
 	accessToken := credentialValue(account.Credential, "access_token")
+	credentialSource := "access_token"
 	if accessToken == "" {
 		accessToken = credentialValue(account.Credential, "api_key")
+		credentialSource = "api_key"
 	}
 	if accessToken == "" && strings.HasPrefix(strings.TrimSpace(account.Credential), "sk-") {
 		accessToken = strings.TrimSpace(account.Credential)
+		credentialSource = "raw_api_key"
 	}
 	if accessToken == "" {
 		return accountDisplaySyncResult{Message: "display sync skipped: access token or API key is required"}
 	}
 	client, err := displaySyncHTTPClient(cfg, *account)
 	if err != nil {
-		return accountDisplaySyncResult{Message: "display sync skipped: " + err.Error()}
+		return accountDisplaySyncResult{Message: "display sync skipped: " + err.Error(), CredentialSource: credentialSource}
 	}
 	metadata := cloneDisplayMap(account.Metadata)
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
+	result := accountDisplaySyncResult{Message: "display sync completed", Synced: true, CredentialSource: credentialSource}
 	if tier, err := fetchOpenAISubscriptionTier(ctx, client, accessToken); err == nil && tier != "" {
 		metadata["subscription_tier"] = tier
+		result.Tier = tier
 	} else if err != nil {
-		metadata["display_sync_subscription_error"] = sanitizeDisplaySyncError(err)
+		result.SubscriptionErr = sanitizeDisplaySyncError(err)
+		metadata["display_sync_subscription_error"] = result.SubscriptionErr
 	}
 	if usageInfo, err := fetchOpenAIUsageInfo(ctx, client, accessToken); err == nil && len(usageInfo) > 0 {
 		metadata["usage_info"] = usageInfo
+		result.UsageInfoKeys = sortedMapKeys(usageInfo)
 	} else if err != nil {
-		metadata["display_sync_usage_error"] = sanitizeDisplaySyncError(err)
+		result.UsageErr = sanitizeDisplaySyncError(err)
+		metadata["display_sync_usage_error"] = result.UsageErr
 	}
 	account.Metadata = metadata
-	return accountDisplaySyncResult{Message: "display sync completed", Synced: true}
+	return result
+}
+
+func sortedMapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func displaySyncHTTPClient(cfg config.Config, account config.Account) (*http.Client, error) {
