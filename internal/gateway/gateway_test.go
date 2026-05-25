@@ -568,6 +568,182 @@ func TestOpenAIOAuthResponsesUsesCodexInternalEndpointAndHeaders(t *testing.T) {
 	}
 }
 
+func TestOpenAIOAuthResponsesUnauthorizedDoesNotAutoDisableOrCooldownAccount(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/codex/responses":
+			requestCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"chatgpt session rejected"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: true, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","input":"who are you"}`)
+	for i := 0; i < 3; i++ {
+		resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("responses request %d status = %d", i+1, resp.StatusCode)
+		}
+	}
+	if requestCount != 3 {
+		t.Fatalf("codex request count = %d, want 3", requestCount)
+	}
+	if !store.Snapshot().Accounts[0].Enabled {
+		t.Fatal("openai oauth account was auto-disabled by repeated codex 401 responses")
+	}
+}
+
+func TestOpenAIOAuthResponsesRefreshesAfterUnauthorizedWithoutCooldown(t *testing.T) {
+	codexRequestCount := 0
+	tokenRequestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/codex/responses":
+			codexRequestCount++
+			switch r.Header.Get("Authorization") {
+			case "Bearer stale-token":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"message":"expired chatgpt session"}}`))
+			case "Bearer refreshed-token":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output_text":"ok","usage":{"total_tokens":1}}`))
+			default:
+				t.Fatalf("upstream Authorization = %q", r.Header.Get("Authorization"))
+			}
+		case "/oauth/token":
+			tokenRequestCount++
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("ParseForm() error = %v", err)
+			}
+			if r.Form.Get("refresh_token") != "rt-test" {
+				t.Fatalf("refresh_token = %q", r.Form.Get("refresh_token"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"refreshed-token","refresh_token":"rt-new","expires_in":3600,"token_type":"Bearer"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=stale-token;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z;token_url=" + upstream.URL + "/oauth/token"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: true, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+
+	body := []byte(`{"model":"gpt-test","input":"who are you"}`)
+	resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first responses status = %d", resp.StatusCode)
+	}
+	if codexRequestCount != 2 || tokenRequestCount != 1 {
+		t.Fatalf("after first request codex=%d token=%d, want 2/1", codexRequestCount, tokenRequestCount)
+	}
+	credentialAfterRefresh := store.Snapshot().Accounts[0].Credential
+	if !strings.Contains(credentialAfterRefresh, "access_token=refreshed-token") || !strings.Contains(credentialAfterRefresh, "refresh_token=rt-new") {
+		t.Fatalf("refreshed credential was not persisted: %q", credentialAfterRefresh)
+	}
+
+	resp = doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second responses status = %d", resp.StatusCode)
+	}
+	if codexRequestCount != 3 || tokenRequestCount != 1 {
+		t.Fatalf("after second request codex=%d token=%d, want 3/1", codexRequestCount, tokenRequestCount)
+	}
+}
+
+func TestOpenAIOAuthResponsesPersistsCodexQuotaSnapshot(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("x-codex-primary-used-percent", "34")
+		w.Header().Set("x-codex-primary-reset-after-seconds", "86400")
+		w.Header().Set("x-codex-primary-window-minutes", "10080")
+		w.Header().Set("x-codex-secondary-used-percent", "12")
+		w.Header().Set("x-codex-secondary-reset-after-seconds", "600")
+		w.Header().Set("x-codex-secondary-window-minutes", "300")
+		_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","usage":{"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+
+	resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), []byte(`{"model":"gpt-test","input":"hi"}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("responses status = %d body=%s", resp.StatusCode, string(payload))
+	}
+
+	metadata := store.Snapshot().Accounts[0].Metadata
+	if got := metadata["codex_5h_used_percent"]; got != 12.0 {
+		t.Fatalf("codex_5h_used_percent = %#v, want 12", got)
+	}
+	if got := metadata["codex_7d_used_percent"]; got != 34.0 {
+		t.Fatalf("codex_7d_used_percent = %#v, want 34", got)
+	}
+	if got := metadata["codex_5h_reset_after_seconds"]; got != 600 {
+		t.Fatalf("codex_5h_reset_after_seconds = %#v, want 600", got)
+	}
+	if got := metadata["codex_7d_reset_after_seconds"]; got != 86400 {
+		t.Fatalf("codex_7d_reset_after_seconds = %#v, want 86400", got)
+	}
+	if got, ok := metadata["codex_usage_updated_at"].(string); !ok || got == "" {
+		t.Fatalf("codex_usage_updated_at = %#v, want non-empty string", metadata["codex_usage_updated_at"])
+	}
+}
+
+func TestDisabledOpenAIOAuthWithValidAccessTokenIsPersistentlyReenabled(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/codex/responses":
+			requestCount++
+			if got := r.Header.Get("Authorization"); got != "Bearer oauth-access" {
+				t.Fatalf("upstream Authorization = %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output_text":"ok","usage":{"total_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: false}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+	resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), []byte(`{"model":"gpt-test","input":"who are you"}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if requestCount != 1 {
+		t.Fatalf("codex request count = %d, want 1", requestCount)
+	}
+	if !store.Snapshot().Accounts[0].Enabled {
+		t.Fatal("disabled oauth account with valid access token was not persistently re-enabled")
+	}
+}
+
 func TestResponsesNotFoundDoesNotAutoDisableAccount(t *testing.T) {
 	requestCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

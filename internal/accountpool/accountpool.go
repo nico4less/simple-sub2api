@@ -86,8 +86,9 @@ func (m *Manager) ValidateConfig(ctx context.Context, cfg config.Config) error {
 }
 
 func (m *Manager) Snapshot() Snapshot {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refreshCooldownsLocked(time.Now().UTC())
 	out := m.snapshot
 	out.Accounts = append([]AccountState(nil), m.snapshot.Accounts...)
 	for i := range out.Accounts {
@@ -236,6 +237,24 @@ func (m *Manager) EnableAccount(account config.Account) {
 		m.snapshot.Accounts[i].Status = restoredAccountStatus(m.snapshot.Accounts[i])
 		m.snapshot.Accounts[i].CooldownUntil = ""
 		m.snapshot.Accounts[i].ActiveConns = 0
+		return
+	}
+}
+
+func (m *Manager) UpdateAccount(account config.Account) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if strings.TrimSpace(account.ID) == "" {
+		return
+	}
+	m.accounts[account.ID] = account
+	for i := range m.snapshot.Accounts {
+		if m.snapshot.Accounts[i].AccountID != account.ID {
+			continue
+		}
+		m.snapshot.Accounts[i].Label = account.Label
+		m.snapshot.Accounts[i].Tier = account.Tier
+		m.snapshot.Accounts[i].Tags = append([]string(nil), account.Tags...)
 		return
 	}
 }

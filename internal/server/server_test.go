@@ -22,6 +22,7 @@ import (
 func TestM0SecurityBoundaries(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Proxies = []config.ProxyConfig{{ID: "proxy_1", URL: "http://127.0.0.1:8081"}}
 	store, err := config.NewMemoryStore(cfg)
 	if err != nil {
 		t.Fatalf("NewMemoryStore() error = %v", err)
@@ -896,6 +897,52 @@ func TestE002AccountsCoreCRUDImportExportAndPoolDisable(t *testing.T) {
 	}
 	if strings.Contains(string(exportBody), "sk-core-secret") || strings.Contains(string(exportBody), "sk-imported-secret") || !strings.Contains(string(exportBody), "accounts") {
 		t.Fatalf("export did not redact or include accounts: %s", string(exportBody))
+	}
+}
+
+func TestAccountsCreateAcceptsUpstreamCreatePayloadAsJSONAccount(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Proxies = []config.ProxyConfig{{ID: "proxy_1", URL: "http://127.0.0.1:8081"}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	body := []byte(`{"config_version":1,"name":"Claude Console","notes":"from upstream form","platform":"anthropic","type":"apikey","credentials":{"base_url":"https://api.anthropic.com","api_key":"sk-ant-api03-test","model_mapping":{"claude-sonnet":"claude-sonnet-4-6"}},"extra":{"anthropic_passthrough":true,"allowed_models":["claude-sonnet-4-6"]},"proxy_id":"proxy_1","concurrency":2,"load_factor":3,"priority":4,"group_ids":["claude"],"expires_at":1893456000,"auto_pause_on_expired":true}`)
+	resp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/accounts", map[string]string{"Cookie": cookie.String()}, body)
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create upstream payload status = %d body = %s", resp.StatusCode, string(data))
+	}
+
+	snapshot := store.Snapshot()
+	if len(snapshot.Accounts) != 1 {
+		t.Fatalf("stored account count = %d", len(snapshot.Accounts))
+	}
+	account := snapshot.Accounts[0]
+	if account.Label != "Claude Console" || account.Type != "openai_compatible" || account.BaseURL != "https://api.anthropic.com" || account.ProxyRef != "proxy_1" || !account.Enabled {
+		t.Fatalf("unexpected stored account: %#v", account)
+	}
+	if !strings.Contains(account.Credential, "api_key=sk-ant-api03-test") || !strings.Contains(account.Credential, "base_url=https://api.anthropic.com") {
+		t.Fatalf("credential was not converted to local envelope: %q", account.Credential)
+	}
+	if account.Metadata["platform"] != "anthropic" || account.Metadata["account_category"] != "apikey" || account.Metadata["notes"] != "from upstream form" {
+		t.Fatalf("unexpected metadata identity: %#v", account.Metadata)
+	}
+	rows, ok := account.Metadata["model_mappings"].([]map[string]string)
+	if !ok || len(rows) != 1 || rows[0]["from"] != "claude-sonnet" || rows[0]["to"] != "claude-sonnet-4-6" {
+		t.Fatalf("unexpected editable model mapping rows: %#v", account.Metadata["model_mappings"])
+	}
+	if account.Metadata["concurrency"] != 2 || account.Metadata["priority"] != 4 {
+		t.Fatalf("unexpected scheduling metadata: %#v", account.Metadata)
+	}
+	groups, ok := account.Metadata["group_ids"].([]string)
+	if !ok || len(groups) != 1 || groups[0] != "claude" {
+		t.Fatalf("unexpected group metadata: %#v", account.Metadata["group_ids"])
 	}
 }
 

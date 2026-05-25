@@ -31,6 +31,7 @@ type Store interface {
 	TouchGatewayKeyLastUsed(id string, usedAt string) error
 	DisableAccount(accountID string) (bool, error)
 	UpdateOpenAIAccessToken(accountID string, token config.OpenAIAccessTokenUpdate) (config.Account, bool, error)
+	UpdateAccountMetadata(accountID string, update config.AccountMetadataUpdate) (config.Account, bool, error)
 }
 
 const permanentFailureStrikeLimit = 3
@@ -47,6 +48,81 @@ type openAITokenRefreshResponse struct {
 	TokenType    string `json:"token_type,omitempty"`
 	ExpiresIn    int64  `json:"expires_in"`
 	Scope        string `json:"scope,omitempty"`
+}
+
+type openAICodexUsageSnapshot struct {
+	PrimaryUsedPercent          *float64 `json:"primary_used_percent,omitempty"`
+	PrimaryResetAfterSeconds    *int     `json:"primary_reset_after_seconds,omitempty"`
+	PrimaryWindowMinutes        *int     `json:"primary_window_minutes,omitempty"`
+	SecondaryUsedPercent        *float64 `json:"secondary_used_percent,omitempty"`
+	SecondaryResetAfterSeconds  *int     `json:"secondary_reset_after_seconds,omitempty"`
+	SecondaryWindowMinutes      *int     `json:"secondary_window_minutes,omitempty"`
+	PrimaryOverSecondaryPercent *float64 `json:"primary_over_secondary_percent,omitempty"`
+	UpdatedAt                   string   `json:"updated_at,omitempty"`
+}
+
+type normalizedCodexLimits struct {
+	Used5hPercent   *float64
+	Reset5hSeconds  *int
+	Window5hMinutes *int
+	Used7dPercent   *float64
+	Reset7dSeconds  *int
+	Window7dMinutes *int
+}
+
+func (s *openAICodexUsageSnapshot) normalize() *normalizedCodexLimits {
+	if s == nil {
+		return nil
+	}
+	result := &normalizedCodexLimits{}
+	primaryMins, secondaryMins := 0, 0
+	hasPrimaryWindow, hasSecondaryWindow := false, false
+	if s.PrimaryWindowMinutes != nil {
+		primaryMins = *s.PrimaryWindowMinutes
+		hasPrimaryWindow = true
+	}
+	if s.SecondaryWindowMinutes != nil {
+		secondaryMins = *s.SecondaryWindowMinutes
+		hasSecondaryWindow = true
+	}
+	use5hFromPrimary, use7dFromPrimary := false, false
+	if hasPrimaryWindow && hasSecondaryWindow {
+		if primaryMins < secondaryMins {
+			use5hFromPrimary = true
+		} else {
+			use7dFromPrimary = true
+		}
+	} else if hasPrimaryWindow {
+		if primaryMins <= 360 {
+			use5hFromPrimary = true
+		} else {
+			use7dFromPrimary = true
+		}
+	} else if hasSecondaryWindow {
+		if secondaryMins <= 360 {
+			use7dFromPrimary = true
+		} else {
+			use5hFromPrimary = true
+		}
+	} else {
+		use7dFromPrimary = true
+	}
+	if use5hFromPrimary {
+		result.Used5hPercent = s.PrimaryUsedPercent
+		result.Reset5hSeconds = s.PrimaryResetAfterSeconds
+		result.Window5hMinutes = s.PrimaryWindowMinutes
+		result.Used7dPercent = s.SecondaryUsedPercent
+		result.Reset7dSeconds = s.SecondaryResetAfterSeconds
+		result.Window7dMinutes = s.SecondaryWindowMinutes
+	} else if use7dFromPrimary {
+		result.Used7dPercent = s.PrimaryUsedPercent
+		result.Reset7dSeconds = s.PrimaryResetAfterSeconds
+		result.Window7dMinutes = s.PrimaryWindowMinutes
+		result.Used5hPercent = s.SecondaryUsedPercent
+		result.Reset5hSeconds = s.SecondaryResetAfterSeconds
+		result.Window5hMinutes = s.SecondaryWindowMinutes
+	}
+	return result
 }
 
 type Handler struct {
@@ -123,7 +199,31 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lastErr = err
 			continue
 		}
-		rotateOnStatus := shouldRotateOnStatusCode(resp.StatusCode, group)
+		if shouldRefreshOpenAIOAuthAfterAuthFailure(requestPath, account, resp.StatusCode) {
+			refreshed, refreshErr := h.refreshOpenAIAccessTokenForAccount(r.Context(), cfg, account, nil)
+			if refreshErr == nil {
+				_ = resp.Body.Close()
+				h.Pool.DecrementActiveConn(activeAccountID)
+				active = false
+				account = refreshed
+				activeAccountID = account.ID
+				h.Pool.IncrementActiveConn(activeAccountID)
+				active = true
+				resp, err = h.forwardAttempt(r, cfg, account, body)
+				if err != nil {
+					h.Pool.DecrementActiveConn(activeAccountID)
+					active = false
+					excluded[account.ID] = true
+					h.cooldownWithGroupReason(account.ID, group, 0, "upstream_request_failed", http.StatusBadGateway)
+					h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "upstream request failed")
+					lastErr = err
+					continue
+				}
+			} else if h.Logger != nil {
+				h.Logger.Warn("openai_oauth_auth_failure_refresh_failed", "account_id", account.ID, "error", sanitizeCredentialError(refreshErr))
+			}
+		}
+		rotateOnStatus := shouldRotateAttemptStatus(requestPath, account, resp.StatusCode, group)
 		if rotateOnStatus {
 			cooldownOverride := retryAfterDuration(resp.Header)
 			var replayBody []byte
@@ -137,8 +237,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, resp.StatusCode, false, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
 			lastErr = errors.New("upstream returned HTTP " + http.StatusText(resp.StatusCode))
 			if attempt < maxAttempts {
-				if shouldAutoDisable(requestPath, resp.StatusCode) {
-					h.recordFailureAndMaybeDisable(account.ID, resp.StatusCode)
+				if shouldAutoDisable(requestPath, account, resp.StatusCode) {
+					h.recordFailureAndMaybeDisable(account, requestPath, resp.StatusCode)
 				}
 				h.Pool.DecrementActiveConn(activeAccountID)
 				active = false
@@ -155,9 +255,10 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Simple-Sub2API-Attempts", strconv.Itoa(attempt))
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			h.Pool.MarkSuccess(account.ID)
-		} else if shouldAutoDisable(requestPath, resp.StatusCode) {
-			h.recordFailureAndMaybeDisable(account.ID, resp.StatusCode)
+		} else if shouldAutoDisable(requestPath, account, resp.StatusCode) {
+			h.recordFailureAndMaybeDisable(account, requestPath, resp.StatusCode)
 		}
+		h.persistOpenAICodexUsageSnapshot(account, resp.Header)
 		if parsed.Stream {
 			h.writeStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
 			h.Pool.DecrementActiveConn(activeAccountID)
@@ -302,11 +403,32 @@ func (h Handler) accountWithFreshOpenAIAccessToken(ctx context.Context, cfg conf
 		return account, nil
 	}
 	if token := upstreamcompat.APIKeyFromCredential(account.Credential); token != "" && tokenNotExpired(account.Credential, 2*time.Minute) {
+		if !account.Enabled {
+			account = h.persistExistingOpenAIAccessToken(account, token)
+		}
 		return account, nil
 	}
 	refreshToken := credentialValue(account.Credential, "refresh_token")
 	if refreshToken == "" {
 		return account, nil
+	}
+	return h.refreshOpenAIAccessTokenForAccount(ctx, cfg, account, client)
+}
+
+func (h Handler) refreshOpenAIAccessTokenForAccount(ctx context.Context, cfg config.Config, account config.Account, client *http.Client) (config.Account, error) {
+	if config.AccountPlatform(account) != "openai" || strings.TrimSpace(account.Type) != "oauth" {
+		return account, nil
+	}
+	refreshToken := credentialValue(account.Credential, "refresh_token")
+	if refreshToken == "" {
+		return account, nil
+	}
+	if client == nil {
+		var err error
+		client, err = clientForAccount(cfg, account)
+		if err != nil {
+			return account, err
+		}
 	}
 	clientID := credentialValue(account.Credential, "client_id")
 	if clientID == "" {
@@ -354,10 +476,39 @@ func (h Handler) accountWithFreshOpenAIAccessToken(ctx context.Context, cfg conf
 			account = persisted
 		}
 	}
+	if h.Pool != nil {
+		h.Pool.UpdateAccount(account)
+	}
 	if h.Logger != nil {
 		h.Logger.Info("openai_oauth_refresh_success", "account_id", account.ID, "expires_at", updated.ExpiresAt, "rotated_refresh_token", updated.RefreshToken != "")
 	}
 	return account, nil
+}
+
+func (h Handler) persistExistingOpenAIAccessToken(account config.Account, accessToken string) config.Account {
+	if h.Store == nil || strings.TrimSpace(account.ID) == "" || strings.TrimSpace(accessToken) == "" {
+		return account
+	}
+	update := config.OpenAIAccessTokenUpdate{
+		AccessToken:  accessToken,
+		RefreshToken: credentialValue(account.Credential, "refresh_token"),
+		IDToken:      credentialValue(account.Credential, "id_token"),
+		ExpiresAt:    credentialValue(account.Credential, "expires_at"),
+	}
+	if strings.TrimSpace(update.ExpiresAt) == "" {
+		update.ExpiresAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	}
+	if persisted, ok, err := h.Store.UpdateOpenAIAccessToken(account.ID, update); err != nil {
+		if h.Logger != nil {
+			h.Logger.Warn("openai_oauth_existing_access_token_reenable_failed", "account_id", account.ID, "error", err.Error())
+		}
+	} else if ok {
+		account = persisted
+		if h.Logger != nil {
+			h.Logger.Info("openai_oauth_existing_access_token_reenabled_account", "account_id", account.ID)
+		}
+	}
+	return account
 }
 
 func refreshOpenAIAccessToken(ctx context.Context, client *http.Client, tokenURL string, refreshToken string, clientID string) (openAITokenRefreshResponse, error) {
@@ -450,6 +601,17 @@ func shouldRotateOnStatusCode(status int, group *config.Group) bool {
 		}
 	}
 	return false
+}
+
+func shouldRotateAttemptStatus(requestPath string, account config.Account, status int, group *config.Group) bool {
+	if upstreamcompat.IsOpenAIOAuthAccount(account) && requestPath == "/v1/responses" && isPermanentCredentialFailure(status) {
+		return false
+	}
+	return shouldRotateOnStatusCode(status, group)
+}
+
+func shouldRefreshOpenAIOAuthAfterAuthFailure(requestPath string, account config.Account, statusCode int) bool {
+	return upstreamcompat.IsOpenAIOAuthAccount(account) && requestPath == "/v1/responses" && isPermanentCredentialFailure(statusCode) && credentialValue(account.Credential, "refresh_token") != ""
 }
 
 func extractSessionID(r *http.Request, group *config.Group) string {
@@ -591,6 +753,160 @@ func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, account
 		flusher.Flush()
 	}
 	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, true, "")
+}
+
+func (h Handler) persistOpenAICodexUsageSnapshot(account config.Account, headers http.Header) {
+	if h.Store == nil || !upstreamcompat.IsOpenAIOAuthAccount(account) {
+		return
+	}
+	snapshot := parseOpenAICodexRateLimitHeaders(headers)
+	updates := buildOpenAICodexUsageMetadataUpdates(snapshot, time.Now().UTC())
+	if len(updates) == 0 {
+		return
+	}
+	if _, ok, err := h.Store.UpdateAccountMetadata(account.ID, config.AccountMetadataUpdate{Metadata: updates}); err != nil {
+		if h.Logger != nil {
+			h.Logger.Warn("openai_codex_usage_snapshot_persist_failed", slog.String("account_id", account.ID), slog.String("error", err.Error()))
+		}
+	} else if ok && h.Logger != nil {
+		h.Logger.Info("openai_codex_usage_snapshot_persisted", slog.String("account_id", account.ID))
+	}
+}
+
+func parseOpenAICodexRateLimitHeaders(headers http.Header) *openAICodexUsageSnapshot {
+	if headers == nil {
+		return nil
+	}
+	snapshot := &openAICodexUsageSnapshot{}
+	hasData := false
+	parseFloat := func(key string) *float64 {
+		if v := strings.TrimSpace(headers.Get(key)); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				return &f
+			}
+		}
+		return nil
+	}
+	parseInt := func(key string) *int {
+		if v := strings.TrimSpace(headers.Get(key)); v != "" {
+			if i, err := strconv.Atoi(v); err == nil {
+				return &i
+			}
+		}
+		return nil
+	}
+	if v := parseFloat("x-codex-primary-used-percent"); v != nil {
+		snapshot.PrimaryUsedPercent = v
+		hasData = true
+	}
+	if v := parseInt("x-codex-primary-reset-after-seconds"); v != nil {
+		snapshot.PrimaryResetAfterSeconds = v
+		hasData = true
+	}
+	if v := parseInt("x-codex-primary-window-minutes"); v != nil {
+		snapshot.PrimaryWindowMinutes = v
+		hasData = true
+	}
+	if v := parseFloat("x-codex-secondary-used-percent"); v != nil {
+		snapshot.SecondaryUsedPercent = v
+		hasData = true
+	}
+	if v := parseInt("x-codex-secondary-reset-after-seconds"); v != nil {
+		snapshot.SecondaryResetAfterSeconds = v
+		hasData = true
+	}
+	if v := parseInt("x-codex-secondary-window-minutes"); v != nil {
+		snapshot.SecondaryWindowMinutes = v
+		hasData = true
+	}
+	if v := parseFloat("x-codex-primary-over-secondary-limit-percent"); v != nil {
+		snapshot.PrimaryOverSecondaryPercent = v
+		hasData = true
+	}
+	if !hasData {
+		return nil
+	}
+	snapshot.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return snapshot
+}
+
+func buildOpenAICodexUsageMetadataUpdates(snapshot *openAICodexUsageSnapshot, fallbackNow time.Time) map[string]any {
+	if snapshot == nil {
+		return nil
+	}
+	baseTime := codexSnapshotBaseTime(snapshot, fallbackNow)
+	updates := map[string]any{"codex_usage_updated_at": baseTime.Format(time.RFC3339)}
+	if snapshot.PrimaryUsedPercent != nil {
+		updates["codex_primary_used_percent"] = *snapshot.PrimaryUsedPercent
+	}
+	if snapshot.PrimaryResetAfterSeconds != nil {
+		updates["codex_primary_reset_after_seconds"] = *snapshot.PrimaryResetAfterSeconds
+	}
+	if snapshot.PrimaryWindowMinutes != nil {
+		updates["codex_primary_window_minutes"] = *snapshot.PrimaryWindowMinutes
+	}
+	if snapshot.SecondaryUsedPercent != nil {
+		updates["codex_secondary_used_percent"] = *snapshot.SecondaryUsedPercent
+	}
+	if snapshot.SecondaryResetAfterSeconds != nil {
+		updates["codex_secondary_reset_after_seconds"] = *snapshot.SecondaryResetAfterSeconds
+	}
+	if snapshot.SecondaryWindowMinutes != nil {
+		updates["codex_secondary_window_minutes"] = *snapshot.SecondaryWindowMinutes
+	}
+	if snapshot.PrimaryOverSecondaryPercent != nil {
+		updates["codex_primary_over_secondary_percent"] = *snapshot.PrimaryOverSecondaryPercent
+	}
+	if normalized := snapshot.normalize(); normalized != nil {
+		if normalized.Used5hPercent != nil {
+			updates["codex_5h_used_percent"] = *normalized.Used5hPercent
+		}
+		if normalized.Reset5hSeconds != nil {
+			updates["codex_5h_reset_after_seconds"] = *normalized.Reset5hSeconds
+		}
+		if normalized.Window5hMinutes != nil {
+			updates["codex_5h_window_minutes"] = *normalized.Window5hMinutes
+		}
+		if normalized.Used7dPercent != nil {
+			updates["codex_7d_used_percent"] = *normalized.Used7dPercent
+		}
+		if normalized.Reset7dSeconds != nil {
+			updates["codex_7d_reset_after_seconds"] = *normalized.Reset7dSeconds
+		}
+		if normalized.Window7dMinutes != nil {
+			updates["codex_7d_window_minutes"] = *normalized.Window7dMinutes
+		}
+		if reset5hAt := codexResetAtRFC3339(baseTime, normalized.Reset5hSeconds); reset5hAt != nil {
+			updates["codex_5h_reset_at"] = *reset5hAt
+		}
+		if reset7dAt := codexResetAtRFC3339(baseTime, normalized.Reset7dSeconds); reset7dAt != nil {
+			updates["codex_7d_reset_at"] = *reset7dAt
+		}
+	}
+	return updates
+}
+
+func codexSnapshotBaseTime(snapshot *openAICodexUsageSnapshot, fallback time.Time) time.Time {
+	if snapshot == nil || strings.TrimSpace(snapshot.UpdatedAt) == "" {
+		return fallback
+	}
+	base, err := time.Parse(time.RFC3339, snapshot.UpdatedAt)
+	if err != nil {
+		return fallback
+	}
+	return base.UTC()
+}
+
+func codexResetAtRFC3339(base time.Time, resetAfterSeconds *int) *string {
+	if resetAfterSeconds == nil {
+		return nil
+	}
+	seconds := *resetAfterSeconds
+	if seconds < 0 {
+		seconds = 0
+	}
+	resetAt := base.UTC().Add(time.Duration(seconds) * time.Second).Format(time.RFC3339)
+	return &resetAt
 }
 
 func (h Handler) cooldown(accountID string) {
@@ -745,8 +1061,9 @@ func poolAccountDebugSummaries(accounts []accountpool.AccountState) []poolAccoun
 	return out
 }
 
-func (h Handler) recordFailureAndMaybeDisable(accountID string, statusCode int) {
-	if h.Pool == nil || h.Store == nil || !isPermanentCredentialFailure(statusCode) {
+func (h Handler) recordFailureAndMaybeDisable(account config.Account, requestPath string, statusCode int) {
+	accountID := account.ID
+	if h.Pool == nil || h.Store == nil || !isPermanentCredentialFailure(statusCode) || !shouldAutoDisable(requestPath, account, statusCode) {
 		return
 	}
 	strikes := h.Pool.RecordFailure(accountID, true)
@@ -772,8 +1089,11 @@ func isPermanentCredentialFailure(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
 
-func shouldAutoDisable(requestPath string, statusCode int) bool {
+func shouldAutoDisable(requestPath string, account config.Account, statusCode int) bool {
 	if requestPath == "/v1/responses" && statusCode == http.StatusNotFound {
+		return false
+	}
+	if upstreamcompat.IsOpenAIOAuthAccount(account) && requestPath == "/v1/responses" && isPermanentCredentialFailure(statusCode) {
 		return false
 	}
 	return true

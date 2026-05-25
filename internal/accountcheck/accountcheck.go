@@ -54,6 +54,16 @@ func (c Checker) Check(ctx context.Context, cfg config.Config, account config.Ac
 	if hasProxy {
 		result.ProxyID = spec.ID
 	}
+	if upstreamcompat.IsOpenAIOAuthAccount(account) {
+		if openAIOAuthCredentialPresent(account.Credential) {
+			result.Status = "healthy"
+			result.Message = "oauth credential validation passed"
+			return result
+		}
+		result.Status = "error"
+		result.Message = "openai oauth access_token or refresh_token is required"
+		return result
+	}
 	if strings.TrimSpace(account.BaseURL) == "" {
 		result.Status = "healthy"
 		result.Message = "static credential validation passed"
@@ -117,6 +127,20 @@ func apiKeyFromCredential(credential string) string {
 		return strings.TrimSpace(credential)
 	}
 	return ""
+}
+
+func openAIOAuthCredentialPresent(credential string) bool {
+	for _, part := range strings.FieldsFunc(credential, func(r rune) bool { return r == ';' || r == '\n' || r == '\r' }) {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok || strings.TrimSpace(value) == "" {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "access_token", "refresh_token":
+			return true
+		}
+	}
+	return false
 }
 
 func sanitize(err error) string {

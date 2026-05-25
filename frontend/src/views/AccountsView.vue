@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import {
   applyImport,
   createAccount,
+  createAccountFromUpstream,
   createGroup,
   deleteAccount,
   exchangeOpenAIOAuthCode,
@@ -23,6 +24,7 @@ import {
   type GroupConfig,
   type GroupsResponse,
   type ProxyConfig,
+  type UpstreamCreateAccountRequest,
   updateGroup
 } from '@/api/client'
 import AppShell from '@/components/AppShell.vue'
@@ -1322,6 +1324,7 @@ const showAnthropicAdvanced = computed(() => form.platform === 'anthropic')
 const showGeminiAdvanced = computed(() => form.platform === 'gemini')
 const showAntigravityAdvanced = computed(() => form.platform === 'antigravity')
 const isClaudeOAuthFlow = computed(() => form.platform === 'anthropic' && form.category === 'oauth-based')
+const isClaudeConsoleFlow = computed(() => form.platform === 'anthropic' && form.category === 'apikey')
 const showClaudeQuotaControls = computed(() => form.platform === 'anthropic' && form.category === 'oauth-based')
 const oauthCredentialStatus = computed(() => {
   if (!isOAuthFlow.value) return ''
@@ -1596,7 +1599,14 @@ function selectPlatform(platform: PlatformOption) {
 function selectCategory(category: AccountCategory) {
   if (form.category !== category) resetOAuthAssistantState()
   form.category = category
+  if (form.platform === 'anthropic' && category === 'apikey' && !form.base_url.trim()) {
+    form.base_url = 'https://api.anthropic.com'
+  }
   inferSimpleType()
+}
+
+function addPresetMapping(from: string, to: string) {
+  addModelMapping('main', from, to)
 }
 
 function syncPlatformModels() {
@@ -1703,6 +1713,113 @@ function summarizeCompleteAccount(account: AccountConfig) {
     credential_keys: safeCredentialKeys(account.credential || ''),
     group_count: Array.isArray(metadata.group_ids) ? metadata.group_ids.length : 0
   }
+}
+
+function parseExpiresAt(value: string): number | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const timestamp = Date.parse(trimmed)
+  if (!Number.isFinite(timestamp)) return null
+  return Math.floor(timestamp / 1000)
+}
+
+function buildUpstreamCredentials(): Record<string, unknown> {
+  const credentials: Record<string, unknown> = {}
+  const add = (key: string, value: unknown) => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim()
+      if (trimmed) credentials[key] = trimmed
+      return
+    }
+    if (value !== undefined && value !== null) credentials[key] = value
+  }
+
+  if (form.category === 'bedrock') {
+    add('auth_mode', form.bedrock_auth_mode)
+    add('aws_region', form.aws_region || 'us-east-1')
+    if (form.bedrock_auth_mode === 'apikey') {
+      add('api_key', form.api_key)
+    } else {
+      add('aws_access_key_id', form.aws_access_key_id)
+      add('aws_secret_access_key', form.aws_secret_access_key)
+      add('aws_session_token', form.aws_session_token)
+    }
+    if (form.bedrock_force_global) credentials.aws_force_global = true
+    return credentials
+  }
+
+  if (form.category === 'service_account') {
+    add('service_account_json', form.service_account_json)
+    add('project_id', form.vertex_project_id)
+    add('location', form.vertex_location)
+    return credentials
+  }
+
+  if (form.category === 'oauth-based') {
+    const envelope = parseCredentialEnvelope(buildCredential())
+    Object.entries(envelope).forEach(([key, value]) => add(key, value))
+    return credentials
+  }
+
+  add('base_url', form.base_url)
+  add('api_key', form.api_key || form.credential)
+  return credentials
+}
+
+function buildUpstreamExtra(): Record<string, unknown> {
+  const metadata = buildMetadata()
+  const extra: Record<string, unknown> = { ...metadata }
+  if (Array.isArray(metadata.allowed_models) && metadata.allowed_models.length > 0) {
+    extra.model_whitelist = metadata.allowed_models
+  }
+  if (Array.isArray(metadata.model_mappings) && metadata.model_mappings.length > 0) {
+    const mapping: Record<string, string> = {}
+    ;(metadata.model_mappings as ModelMapping[]).forEach((item) => {
+      if (item.from && item.to) mapping[item.from] = item.to
+    })
+    if (Object.keys(mapping).length > 0) extra.model_mapping = mapping
+  }
+  return extra
+}
+
+function upstreamTypeForForm(): string {
+  if (form.category === 'oauth-based') return form.add_method === 'setup-token' ? 'setup-token' : 'oauth'
+  if (form.category === 'upstream') return 'upstream'
+  if (form.category === 'bedrock') return 'bedrock'
+  if (form.category === 'service_account') return 'service_account'
+  return 'apikey'
+}
+
+function buildUpstreamCreateRequest(): UpstreamCreateAccountRequest {
+  const groupIDs = selectedGroupIDs.value
+  const expiresAt = parseExpiresAt(form.expires_at)
+  return {
+    id: form.id.trim() || undefined,
+    name: form.label.trim() || form.id.trim(),
+    notes: form.notes.trim() || null,
+    platform: form.platform,
+    type: upstreamTypeForForm(),
+    credentials: buildUpstreamCredentials(),
+    extra: buildUpstreamExtra(),
+    proxy_id: form.proxy_ref.trim() || null,
+    concurrency: form.concurrency,
+    load_factor: form.load_factor,
+    priority: form.priority,
+    group_ids: groupIDs,
+    expires_at: expiresAt,
+    auto_pause_on_expired: form.auto_pause_on_expired
+  }
+}
+
+function shouldUseUpstreamCreatePayload(): boolean {
+  return editorMode.value === 'create' && form.platform === 'anthropic' && form.category === 'apikey'
+}
+
+async function createAccountWithCompatiblePayload(configVersion: number, account: AccountConfig) {
+  if (shouldUseUpstreamCreatePayload()) {
+    return createAccountFromUpstream(configVersion, buildUpstreamCreateRequest())
+  }
+  return createAccount(configVersion, account)
 }
 
 function applyCredentialEnvelope(credential: string) {
@@ -2311,7 +2428,7 @@ async function saveAccount() {
   }
   const latest = await refreshAccountsSnapshot()
   if (editorMode.value === 'create') {
-    await createAccount(latest.config_version, account)
+    await createAccountWithCompatiblePayload(latest.config_version, account)
     notice.value = t('accounts.created', { id: account.id })
   } else {
     await updateAccount(latest.config_version, account)
@@ -2419,7 +2536,7 @@ async function completeOAuthAccount() {
     })
     if (editorMode.value === 'create') {
       oauthCompleteLog('info', 'create_request', { account_id: account.id, config_version: latest.config_version })
-      await createAccount(latest.config_version, account)
+      await createAccountWithCompatiblePayload(latest.config_version, account)
       notice.value = t('accounts.created', { id: account.id })
       oauthCompleteLog('info', 'create_success', { account_id: account.id })
     } else {
@@ -3042,6 +3159,145 @@ onMounted(() => {
                     <input v-model="form.api_key" type="password" required class="input font-mono normal-case" :placeholder="form.platform === 'openai' ? 'sk-proj-...' : form.platform === 'gemini' ? 'AIza...' : 'sk-ant-...'" />
                     <p class="input-hint">{{ form.platform === 'openai' ? t('admin.accounts.openai.apiKeyHint') : form.platform === 'gemini' ? t('admin.accounts.gemini.apiKeyHint') : t('admin.accounts.apiKeyHint') }}</p>
                   </div>
+
+                  <div v-if="isClaudeConsoleFlow" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+                    <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <label class="input-label mb-0">{{ t('admin.accounts.modelRestriction') }}</label>
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Preserved as upstream-compatible model whitelist or mapping metadata for Claude Console accounts.</p>
+                      </div>
+                      <select v-model="form.model_mode" class="input max-w-xs normal-case">
+                        <option value="whitelist">{{ t('admin.accounts.modelWhitelist') }}</option>
+                        <option value="mapping">{{ t('admin.accounts.modelMapping') }}</option>
+                      </select>
+                    </div>
+                    <div v-if="form.model_mode === 'whitelist'" class="mt-3 grid gap-2">
+                      <div class="rounded-lg border border-gray-200 bg-white p-3 dark:border-dark-700 dark:bg-dark-900/40">
+                        <div class="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4">
+                          <button
+                            v-for="model in allowedModelList"
+                            :key="model"
+                            type="button"
+                            class="inline-flex items-center justify-between gap-1 rounded bg-gray-100 px-2 py-1 text-xs text-gray-700 dark:bg-dark-600 dark:text-gray-300"
+                            @click="toggleAllowedModel(model)"
+                          >
+                            <span class="truncate">{{ model }}</span>
+                            <span class="text-gray-400">×</span>
+                          </button>
+                        </div>
+                        <p v-if="allowedModelList.length === 0" class="text-sm text-gray-500 dark:text-gray-400">No whitelist models selected. Empty means this account can support all models.</p>
+                        <div class="mt-2 flex items-center justify-between border-t border-gray-200 pt-2 dark:border-dark-600">
+                          <span class="text-xs text-gray-400">{{ allowedModelList.length }} models</span>
+                          <span class="text-xs text-gray-400">Model Whitelist</span>
+                        </div>
+                      </div>
+                      <input v-model="modelSearchQuery" class="input normal-case" placeholder="Search Claude models" />
+                      <div class="max-h-52 overflow-auto rounded-lg border border-gray-200 dark:border-dark-700">
+                        <button
+                          v-for="model in filteredModelOptions"
+                          :key="model.value"
+                          type="button"
+                          class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-gray-100 dark:hover:bg-dark-600"
+                          @click="toggleAllowedModel(model.value)"
+                        >
+                          <span :class="['flex h-4 w-4 shrink-0 items-center justify-center rounded border', allowedModelList.includes(model.value) ? 'border-primary-500 bg-primary-500 text-white' : 'border-gray-300 dark:border-dark-500']">
+                            <span v-if="allowedModelList.includes(model.value)" class="text-[10px] leading-none">✓</span>
+                          </span>
+                          <span class="truncate text-gray-900 dark:text-white">{{ model.label }}</span>
+                        </button>
+                        <div v-if="filteredModelOptions.length === 0" class="px-3 py-4 text-center text-sm text-gray-500 dark:text-gray-400">No matching models</div>
+                      </div>
+                      <div class="flex flex-wrap gap-2">
+                        <button class="rounded-lg border border-blue-200 px-3 py-1.5 text-sm text-blue-600 hover:bg-blue-50 dark:border-blue-800 dark:text-blue-400 dark:hover:bg-blue-900/30" type="button" @click="syncPlatformModels">Sync latest supported models</button>
+                        <button class="rounded-lg border border-red-200 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-900/30" type="button" @click="clearAllowedModels">Clear all models</button>
+                      </div>
+                      <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Custom Model Name
+                        <span class="flex gap-2">
+                          <input v-model="customModelInput" class="input normal-case" placeholder="enter custom model name" @keydown.enter.prevent="handleCustomModelEnter" @compositionstart="isCustomModelComposing = true" @compositionend="isCustomModelComposing = false" />
+                          <button class="btn btn-secondary shrink-0 px-3 py-2" type="button" @click="addCustomModel">Add</button>
+                        </span>
+                      </label>
+                    </div>
+                    <div v-else class="mt-3 grid gap-2">
+                      <div class="rounded-lg bg-purple-50 p-3 dark:bg-purple-900/20">
+                        <p class="text-xs text-purple-700 dark:text-purple-400">Map request models to actual Claude models. Left is the requested model, right is sent upstream.</p>
+                      </div>
+                      <div v-for="(mapping, index) in form.model_mappings" :key="index" class="grid gap-2 sm:grid-cols-[1fr_auto_1fr_auto] sm:items-center">
+                        <input v-model="mapping.from" class="input normal-case" placeholder="request model" />
+                        <span class="text-center text-gray-400">→</span>
+                        <input v-model="mapping.to" class="input normal-case" placeholder="actual model" />
+                        <button class="btn btn-danger px-3 py-1.5" type="button" @click="form.model_mappings.splice(index, 1)">Remove</button>
+                      </div>
+                      <button class="btn btn-secondary" type="button" @click="addModelMapping('main')">Add Model Mapping</button>
+                      <div class="flex flex-wrap gap-2">
+                        <button class="rounded-lg bg-gray-100 px-3 py-1 text-xs text-gray-600 hover:bg-gray-200 dark:bg-dark-600 dark:text-gray-300 dark:hover:bg-dark-500" type="button" @click="addPresetMapping('claude-3-5-sonnet', 'claude-sonnet-4-5')">+ Sonnet preset</button>
+                        <button class="rounded-lg bg-gray-100 px-3 py-1 text-xs text-gray-600 hover:bg-gray-200 dark:bg-dark-600 dark:text-gray-300 dark:hover:bg-dark-500" type="button" @click="addPresetMapping('claude-opus', 'claude-opus-4-5')">+ Opus preset</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div v-if="isClaudeConsoleFlow" class="border-t border-gray-200 pt-4 dark:border-dark-600 space-y-4">
+                    <div class="flex items-center justify-between gap-4">
+                      <div>
+                        <label class="input-label mb-0">{{ t('admin.accounts.anthropic.apiKeyPassthrough') }}</label>
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.anthropic.apiKeyPassthroughDesc') }}</p>
+                      </div>
+                      <button type="button" @click="form.anthropic_passthrough = !form.anthropic_passthrough" :class="toggleSwitchClass(form.anthropic_passthrough)">
+                        <span :class="toggleKnobClass(form.anthropic_passthrough)" />
+                      </button>
+                    </div>
+                    <div class="flex items-center justify-between gap-4">
+                      <div>
+                        <label class="input-label mb-0">{{ t('admin.accounts.anthropic.webSearchEmulation') }}</label>
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.anthropic.webSearchEmulationDesc') }}</p>
+                      </div>
+                      <select v-model="form.web_search_mode" class="input w-32 text-sm normal-case">
+                        <option value="default">{{ t('admin.accounts.anthropic.webSearchDefault') }}</option>
+                        <option value="enabled">{{ t('admin.accounts.anthropic.webSearchEnabled') }}</option>
+                        <option value="disabled">{{ t('admin.accounts.anthropic.webSearchDisabled') }}</option>
+                      </select>
+                    </div>
+                    <div class="flex items-center justify-between gap-4">
+                      <div>
+                        <label class="input-label mb-0">{{ t('admin.accounts.poolMode') }}</label>
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.poolModeHint') }}</p>
+                      </div>
+                      <button type="button" @click="form.pool_mode = !form.pool_mode" :class="toggleSwitchClass(form.pool_mode)">
+                        <span :class="toggleKnobClass(form.pool_mode)" />
+                      </button>
+                    </div>
+                    <label v-if="form.pool_mode" class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{{ t('admin.accounts.poolModeRetryCount') }}
+                      <input v-model.number="form.pool_mode_retry_count" type="number" min="0" class="input" />
+                    </label>
+                    <div class="flex items-center justify-between gap-4">
+                      <div>
+                        <label class="input-label mb-0">{{ t('admin.accounts.customErrorCodes') }}</label>
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.customErrorCodesHint') }}</p>
+                      </div>
+                      <button type="button" @click="form.custom_error_codes_enabled = !form.custom_error_codes_enabled" :class="toggleSwitchClass(form.custom_error_codes_enabled)">
+                        <span :class="toggleKnobClass(form.custom_error_codes_enabled)" />
+                      </button>
+                    </div>
+                    <div v-if="form.custom_error_codes_enabled" class="grid gap-2">
+                      <div class="flex flex-wrap gap-2">
+                        <button
+                          v-for="code in commonErrorCodes"
+                          :key="code"
+                          :class="[
+                            'rounded-lg px-3 py-1.5 text-sm font-medium transition-colors',
+                            numberList(form.custom_error_codes).includes(code)
+                              ? 'bg-red-100 text-red-700 ring-1 ring-red-500 dark:bg-red-900/30 dark:text-red-400'
+                              : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-dark-600 dark:text-gray-400 dark:hover:bg-dark-500'
+                          ]"
+                          type="button"
+                          @click="toggleNumberCode(code)"
+                        >
+                          {{ code }}
+                        </button>
+                      </div>
+                      <input v-model="form.custom_error_codes" class="input normal-case" :placeholder="t('admin.accounts.enterErrorCode')" />
+                    </div>
+                  </div>
                 </div>
 
                 <div v-if="showServiceAccount" class="space-y-4">
@@ -3402,7 +3658,7 @@ onMounted(() => {
                   </label>
                 </div>
 
-                <div class="rounded-xl border border-gray-200 p-3 dark:border-dark-700">
+                <div v-if="!isClaudeConsoleFlow" class="rounded-xl border border-gray-200 p-3 dark:border-dark-700">
                   <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                     <div>
                       <h4 class="text-sm font-bold">Model Restriction / Mapping</h4>
@@ -3476,7 +3732,7 @@ onMounted(() => {
                   </div>
                 </div>
 
-                <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                <div v-if="!isClaudeConsoleFlow" class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                   <label class="flex items-center gap-2 text-sm font-semibold"><input v-model="form.pool_mode" type="checkbox" /> Pool mode</label>
                   <label v-if="isClaudeOAuthFlow" class="flex items-center gap-2 text-sm font-semibold"><input v-model="form.temp_unsched_enabled" type="checkbox" /> Temp Unschedulable</label>
                   <label class="grid gap-1 text-xs font-semibold uppercase tracking-wider text-gray-500">Pool Retry Count<input v-model.number="form.pool_mode_retry_count" type="number" min="0" class="input" /></label>
@@ -3531,7 +3787,7 @@ onMounted(() => {
                   <label class="flex items-center gap-2 text-sm font-semibold"><input v-model="form.auto_pause_on_expired" type="checkbox" /> Auto pause on expired</label>
                 </div>
 
-                <div class="rounded-xl border border-gray-200 p-3 dark:border-dark-700">
+                <div v-if="!isClaudeConsoleFlow" class="rounded-xl border border-gray-200 p-3 dark:border-dark-700">
                   <div class="mb-3">
                     <h4 class="text-sm font-bold">Quota Control</h4>
                     <p class="text-xs text-gray-500 dark:text-gray-400">Configure cost window, session limits, client affinity and other scheduling controls.</p>
@@ -3556,7 +3812,7 @@ onMounted(() => {
                   </div>
                 </div>
 
-                <div class="grid gap-4 lg:grid-cols-2">
+                <div v-if="!isClaudeConsoleFlow" class="grid gap-4 lg:grid-cols-2">
                   <div class="rounded-lg border border-gray-200 p-4 dark:border-dark-600">
                     <div class="flex items-center justify-between gap-4">
                       <div>

@@ -139,6 +139,26 @@ func TestManagerSelectWithGroupPolicyExcludesCooldownStickyAccount(t *testing.T)
 	}
 }
 
+func TestManagerSnapshotClearsExpiredCooldown(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "A", Tier: "simple", Credential: "api_key=sk-one", Enabled: true}}
+	if err := config.EnsureDefaultsAndSecrets(&cfg); err != nil {
+		t.Fatalf("EnsureDefaultsAndSecrets() error = %v", err)
+	}
+	manager, err := accountpool.NewManager(cfg)
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	manager.Cooldown("acct_1", time.Now().UTC().Add(-time.Second))
+	snapshot := manager.Snapshot()
+	if len(snapshot.Accounts) != 1 {
+		t.Fatalf("snapshot account count = %d", len(snapshot.Accounts))
+	}
+	if snapshot.Accounts[0].Status != "healthy" || snapshot.Accounts[0].CooldownUntil != "" {
+		t.Fatalf("expired cooldown snapshot state = status %q until %q", snapshot.Accounts[0].Status, snapshot.Accounts[0].CooldownUntil)
+	}
+}
+
 func TestManagerSelectWithGroupPolicyPriorityAndP2C(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Accounts = []config.Account{

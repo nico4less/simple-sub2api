@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -695,8 +696,12 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		if !decodeJSON(w, r, &req) {
 			return
 		}
+		account := req.Account
+		if account.ID == "" && req.isUpstreamCreate() {
+			account = req.toJSONAccount(time.Now().UTC().Format(time.RFC3339))
+		}
 		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
-			cfg.Accounts = upsertAccount(cfg.Accounts, req.Account)
+			cfg.Accounts = upsertAccount(cfg.Accounts, account)
 			return nil
 		})
 		s.writeUpdateResult(w, updated, err)
@@ -1537,8 +1542,293 @@ type versionedRequest struct {
 }
 
 type accountMutationRequest struct {
-	ConfigVersion int            `json:"config_version"`
-	Account       config.Account `json:"account"`
+	ConfigVersion           int            `json:"config_version"`
+	Account                 config.Account `json:"account"`
+	ID                      string         `json:"id"`
+	Name                    string         `json:"name"`
+	Notes                   *string        `json:"notes"`
+	Platform                string         `json:"platform"`
+	Type                    string         `json:"type"`
+	Credentials             map[string]any `json:"credentials"`
+	Extra                   map[string]any `json:"extra"`
+	ProxyID                 any            `json:"proxy_id"`
+	Concurrency             int            `json:"concurrency"`
+	LoadFactor              any            `json:"load_factor"`
+	Priority                int            `json:"priority"`
+	RateMultiplier          any            `json:"rate_multiplier"`
+	GroupIDs                []any          `json:"group_ids"`
+	ExpiresAt               any            `json:"expires_at"`
+	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
+	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"`
+}
+
+func (r accountMutationRequest) isUpstreamCreate() bool {
+	return strings.TrimSpace(r.Name) != "" && strings.TrimSpace(r.Platform) != "" && strings.TrimSpace(r.Type) != "" && len(r.Credentials) > 0
+}
+
+func (r accountMutationRequest) toJSONAccount(now string) config.Account {
+	platform := strings.TrimSpace(r.Platform)
+	accountType := simpleAccountTypeFromUpstream(platform, strings.TrimSpace(r.Type))
+	metadata := map[string]any{}
+	for key, value := range r.Extra {
+		metadata[key] = value
+	}
+	metadata["upstream_create_account_compat"] = true
+	metadata["platform"] = platform
+	metadata["account_category"] = accountCategoryFromUpstreamType(strings.TrimSpace(r.Type))
+	metadata["upstream_type"] = strings.TrimSpace(r.Type)
+	if r.Notes != nil && strings.TrimSpace(*r.Notes) != "" {
+		metadata["notes"] = strings.TrimSpace(*r.Notes)
+	}
+	if r.Concurrency > 0 {
+		metadata["concurrency"] = r.Concurrency
+	}
+	if loadFactor := numberFromAny(r.LoadFactor); loadFactor > 0 {
+		metadata["load_factor"] = loadFactor
+	}
+	if r.Priority > 0 {
+		metadata["priority"] = r.Priority
+	}
+	if rateMultiplier := numberFromAny(r.RateMultiplier); rateMultiplier >= 0 {
+		metadata["rate_multiplier"] = rateMultiplier
+	}
+	if r.AutoPauseOnExpired != nil {
+		metadata["auto_pause_on_expired"] = *r.AutoPauseOnExpired
+	}
+	if expiresAt := expiresAtString(r.ExpiresAt); expiresAt != "" {
+		metadata["expires_at"] = expiresAt
+	}
+	if modelMapping, ok := r.Credentials["model_mapping"]; ok && modelMapping != nil {
+		metadata["model_mapping"] = modelMapping
+		metadata["model_mappings"] = modelMappingRowsFromAny(modelMapping)
+	}
+	if compactMapping, ok := r.Credentials["compact_model_mapping"]; ok && compactMapping != nil {
+		metadata["openai_compact_mappings"] = compactMapping
+	}
+
+	credential := credentialEnvelopeFromMap(r.Credentials)
+	baseURL := credentialString(r.Credentials, "base_url")
+	proxyRef := stringFromAny(r.ProxyID)
+	groupIDs := stringSliceFromAny(r.GroupIDs)
+	if len(groupIDs) > 0 {
+		metadata["group_ids"] = groupIDs
+		metadata["groups"] = groupIDs
+	}
+
+	accountID := strings.TrimSpace(r.ID)
+	if accountID == "" {
+		accountID = accountIDFromName(r.Name, now)
+	}
+
+	return config.Account{
+		ID:         accountID,
+		Type:       accountType,
+		Label:      strings.TrimSpace(r.Name),
+		BaseURL:    baseURL,
+		Tier:       tierFromCreateRequest(platform, r.Credentials, r.Extra),
+		Tags:       groupIDs,
+		Credential: credential,
+		Metadata:   metadata,
+		ProxyRef:   proxyRef,
+		Enabled:    true,
+	}
+}
+
+func simpleAccountTypeFromUpstream(platform, upstreamType string) string {
+	switch strings.TrimSpace(upstreamType) {
+	case "oauth", "setup-token":
+		return "oauth"
+	case "upstream":
+		return "openai_compatible"
+	}
+	if strings.TrimSpace(platform) == "openai" {
+		return "openai_api_key"
+	}
+	return "openai_compatible"
+}
+
+func accountCategoryFromUpstreamType(upstreamType string) string {
+	switch strings.TrimSpace(upstreamType) {
+	case "oauth", "setup-token":
+		return "oauth-based"
+	case "bedrock":
+		return "bedrock"
+	case "service_account":
+		return "service_account"
+	case "upstream":
+		return "upstream"
+	default:
+		return "apikey"
+	}
+}
+
+func modelMappingRowsFromAny(value any) []map[string]string {
+	rows := []map[string]string{}
+	if mapping, ok := value.(map[string]any); ok {
+		for from, rawTo := range mapping {
+			to := strings.TrimSpace(stringFromAny(rawTo))
+			from = strings.TrimSpace(from)
+			if from == "" || to == "" {
+				continue
+			}
+			rows = append(rows, map[string]string{"from": from, "to": to})
+		}
+	}
+	return rows
+}
+
+func credentialEnvelopeFromMap(values map[string]any) string {
+	if len(values) == 0 {
+		return ""
+	}
+	preferred := []string{
+		"api_key", "refresh_token", "setup_token", "access_token", "session_token", "codex_session",
+		"service_account_json", "auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token", "aws_region",
+		"base_url", "project_id", "location", "client_email", "tier_id", "token_type", "expires_at", "client_id",
+	}
+	seen := map[string]bool{}
+	parts := make([]string, 0, len(values))
+	add := func(key string) {
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		value := stringFromAny(values[key])
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		parts = append(parts, key+"="+value)
+	}
+	for _, key := range preferred {
+		add(key)
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		add(key)
+	}
+	return strings.Join(parts, ";")
+}
+
+func credentialString(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	return stringFromAny(values[key])
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case json.Number:
+		return v.String()
+	case float64:
+		if v == float64(int64(v)) {
+			return strconv.FormatInt(int64(v), 10)
+		}
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case bool:
+		return strconv.FormatBool(v)
+	default:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
+}
+
+func numberFromAny(value any) float64 {
+	switch v := value.(type) {
+	case nil:
+		return -1
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		parsed, err := v.Float64()
+		if err != nil {
+			return -1
+		}
+		return parsed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return -1
+		}
+		return parsed
+	default:
+		return -1
+	}
+}
+
+func stringSliceFromAny(values []any) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		text := stringFromAny(value)
+		if text != "" {
+			out = ensureString(out, text)
+		}
+	}
+	return out
+}
+
+func expiresAtString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case float64:
+		if v <= 0 {
+			return ""
+		}
+		return time.Unix(int64(v), 0).UTC().Format(time.RFC3339)
+	case int64:
+		if v <= 0 {
+			return ""
+		}
+		return time.Unix(v, 0).UTC().Format(time.RFC3339)
+	case int:
+		if v <= 0 {
+			return ""
+		}
+		return time.Unix(int64(v), 0).UTC().Format(time.RFC3339)
+	default:
+		return ""
+	}
+}
+
+func tierFromCreateRequest(platform string, credentials map[string]any, extra map[string]any) string {
+	for _, key := range []string{"tier", "tier_id", "gemini_tier"} {
+		if value := credentialString(credentials, key); value != "" {
+			return value
+		}
+		if value := stringFromAny(extra[key]); value != "" {
+			return value
+		}
+	}
+	if strings.TrimSpace(platform) == "gemini" {
+		return "aistudio_free"
+	}
+	return "simple"
 }
 
 type accountPatchRequest struct {
@@ -2431,6 +2721,10 @@ func gatewayKeyIDFromName(name string, now string) string {
 
 func groupIDFromName(name string, now string) string {
 	return idFromName(name, now, "group")
+}
+
+func accountIDFromName(name string, now string) string {
+	return "acct_" + idFromName(name, now, "account")
 }
 
 func idFromName(name string, now string, fallback string) string {

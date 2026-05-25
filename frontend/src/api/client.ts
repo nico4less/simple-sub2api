@@ -77,6 +77,24 @@ export interface AccountConfig {
   enabled?: boolean
 }
 
+export interface UpstreamCreateAccountRequest {
+  id?: string
+  name: string
+  notes?: string | null
+  platform: string
+  type: string
+  credentials: Record<string, unknown>
+  extra?: Record<string, unknown>
+  proxy_id?: string | number | null
+  concurrency?: number
+  load_factor?: number | null
+  priority?: number
+  rate_multiplier?: number
+  group_ids?: Array<string | number>
+  expires_at?: string | number | null
+  auto_pause_on_expired?: boolean
+}
+
 export interface GroupConfig {
   id: string
   name: string
@@ -412,6 +430,13 @@ export function createAccount(configVersion: number, account: AccountConfig) {
   return api<AdminConfig>('/api/admin/accounts', {
     method: 'POST',
     body: JSON.stringify({ config_version: configVersion, account })
+  })
+}
+
+export function createAccountFromUpstream(configVersion: number, request: UpstreamCreateAccountRequest) {
+  return api<AdminConfig>('/api/admin/accounts', {
+    method: 'POST',
+    body: JSON.stringify({ config_version: configVersion, ...request })
   })
 }
 

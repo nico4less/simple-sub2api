@@ -43,3 +43,22 @@ func TestCheckModelsNormalizesOriginAndV1BaseURL(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAIOAuthCheckDoesNotProbePlatformModels(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		http.Error(w, `{"error":"platform token rejected"}`, http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	checker := accountcheck.Checker{Timeout: time.Second}
+	result := checker.Check(context.Background(), cfg, config.Account{ID: "acct_oauth", Type: "oauth", Credential: "access_token=chatgpt-access;refresh_token=rt-test", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true})
+	if result.Status != "healthy" {
+		t.Fatalf("Check() result = %#v", result)
+	}
+	if requestCount != 0 {
+		t.Fatalf("oauth check performed %d platform probes, want 0", requestCount)
+	}
+}

@@ -427,6 +427,10 @@ type OpenAIAccessTokenUpdate struct {
 	ExpiresAt    string
 }
 
+type AccountMetadataUpdate struct {
+	Metadata map[string]any
+}
+
 func (s *Store) UpdateOpenAIAccessToken(accountID string, token OpenAIAccessTokenUpdate) (Account, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -452,6 +456,47 @@ func (s *Store) UpdateOpenAIAccessToken(accountID string, token OpenAIAccessToke
 			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"id_token": token.IDToken})
 		}
 		candidate.Accounts[i].Enabled = true
+		candidate.ConfigVersion = s.cfg.ConfigVersion + 1
+		if err := EnsureDefaultsAndSecrets(&candidate); err != nil {
+			return Account{}, false, err
+		}
+		if err := Validate(candidate); err != nil {
+			return Account{}, false, err
+		}
+		if err := s.saveConfigLocked(candidate); err != nil {
+			return Account{}, false, err
+		}
+		s.cfg = candidate
+		return cloneAccounts([]Account{candidate.Accounts[i]})[0], true, nil
+	}
+	return Account{}, false, nil
+}
+
+func (s *Store) UpdateAccountMetadata(accountID string, update AccountMetadataUpdate) (Account, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(accountID) == "" || len(update.Metadata) == 0 {
+		return Account{}, false, nil
+	}
+	if err := s.reloadLocked(); err != nil {
+		return Account{}, false, err
+	}
+	candidate := cloneConfig(s.cfg)
+	for i := range candidate.Accounts {
+		if candidate.Accounts[i].ID != accountID {
+			continue
+		}
+		metadata := cloneAnyMap(candidate.Accounts[i].Metadata)
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		for key, value := range update.Metadata {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			metadata[key] = value
+		}
+		candidate.Accounts[i].Metadata = metadata
 		candidate.ConfigVersion = s.cfg.ConfigVersion + 1
 		if err := EnsureDefaultsAndSecrets(&candidate); err != nil {
 			return Account{}, false, err
