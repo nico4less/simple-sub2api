@@ -52,6 +52,48 @@ func TestChatCompletionsNonStreamGateway(t *testing.T) {
 	_ = quotaResp.Body.Close()
 }
 
+func TestResponsesGatewayForCodexClient(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			gotPath = r.URL.Path
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upstream body: %v", err)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer sk-upstream" {
+				t.Fatalf("upstream Authorization = %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output_text":"ok","usage":{"total_tokens":11}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","input":"who are you"}`)
+	resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q", gotPath)
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("upstream body = %q, want %q", string(gotBody), string(body))
+	}
+}
+
 func TestChatCompletionsDoesNotLeakLocalMetadataUpstream(t *testing.T) {
 	seen := make(chan http.Header, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -405,6 +447,158 @@ func TestGatewayThreeStrikeDisablesPermanentCredentialFailure(t *testing.T) {
 	}
 	if requestCount != 3 {
 		t.Fatalf("upstream request count after fourth request = %d, want 3", requestCount)
+	}
+}
+
+func TestOAuthRefreshRequiresRetryAndReenablesDisabledRuntimeAccount(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			requestCount++
+			if got := r.Header.Get("Authorization"); got != "Bearer refreshed-token" {
+				t.Fatalf("upstream Authorization = %q", got)
+			}
+		case "/backend-api/codex/responses":
+			requestCount++
+			if got := r.Header.Get("Authorization"); got != "Bearer refreshed-token" {
+				t.Fatalf("upstream Authorization = %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output_text":"ok","usage":{"total_tokens":1}}`))
+		case "/oauth/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("ParseForm() error = %v", err)
+			}
+			if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "rt-test" {
+				t.Fatalf("unexpected refresh form: %#v", r.Form)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"refreshed-token","refresh_token":"rt-new","expires_in":3600,"token_type":"Bearer"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: "refresh_token=rt-test;token_url=" + upstream.URL + "/oauth/token", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: true, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+
+	resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), []byte(`{"model":"gpt-test","input":"who are you"}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(body))
+	}
+	if requestCount != 1 {
+		t.Fatalf("upstream request count = %d, want 1", requestCount)
+	}
+	snapshot := store.Snapshot()
+	if len(snapshot.Accounts) != 1 || !snapshot.Accounts[0].Enabled || !strings.Contains(snapshot.Accounts[0].Credential, "access_token=refreshed-token") || !strings.Contains(snapshot.Accounts[0].Credential, "refresh_token=rt-new") {
+		t.Fatalf("refreshed account was not persisted/enabled: %#v", snapshot.Accounts)
+	}
+}
+
+func TestOpenAIOAuthResponsesUsesCodexInternalEndpointAndHeaders(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/backend-api/codex/responses":
+			requestCount++
+			if got := r.Host; got != "chatgpt.com" {
+				t.Fatalf("upstream Host = %q", got)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer oauth-access" {
+				t.Fatalf("upstream Authorization = %q", got)
+			}
+			if got := r.Header.Get("chatgpt-account-id"); got != "chatgpt-acc" {
+				t.Fatalf("chatgpt-account-id = %q", got)
+			}
+			if got := r.Header.Get("OpenAI-Beta"); got != "responses=experimental" {
+				t.Fatalf("OpenAI-Beta = %q", got)
+			}
+			if got := r.Header.Get("originator"); got != "codex_cli_rs" {
+				t.Fatalf("originator = %q", got)
+			}
+			if got := r.Header.Get("User-Agent"); got != "codex_cli_rs/0.125.0" {
+				t.Fatalf("User-Agent = %q", got)
+			}
+			if got := r.Header.Get("session_id"); got == "" || got == "client-session" {
+				t.Fatalf("session_id was not isolated: %q", got)
+			}
+			if got := r.Header.Get("conversation_id"); got == "" || got == "client-conversation" {
+				t.Fatalf("conversation_id was not isolated: %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output_text":"ok","usage":{"total_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z;chatgpt_account_id=chatgpt-acc"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","input":"who are you","prompt_cache_key":"cache-key"}`)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "OpenAI/Python 1.2.3")
+	req.Header.Set("session_id", "client-session")
+	req.Header.Set("conversation_id", "client-conversation")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if requestCount != 1 {
+		t.Fatalf("codex upstream request count = %d, want 1", requestCount)
+	}
+}
+
+func TestResponsesNotFoundDoesNotAutoDisableAccount(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			requestCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"upstream responses endpoint unavailable"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "A", Tier: "simple", Credential: "api_key=sk-a", BaseURL: upstream.URL, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","input":"who are you"}`)
+	for i := 0; i < 3; i++ {
+		resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("responses request %d status = %d", i+1, resp.StatusCode)
+		}
+	}
+	if requestCount != 3 {
+		t.Fatalf("responses request count = %d", requestCount)
+	}
+	if !store.Snapshot().Accounts[0].Enabled {
+		t.Fatal("account was auto-disabled by repeated /v1/responses 404 responses")
 	}
 }
 

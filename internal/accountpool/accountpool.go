@@ -218,6 +218,28 @@ func (m *Manager) DisableAccount(accountID string) {
 	}
 }
 
+func (m *Manager) EnableAccount(account config.Account) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if strings.TrimSpace(account.ID) == "" {
+		return
+	}
+	delete(m.failures, account.ID)
+	delete(m.activeConns, account.ID)
+	delete(m.cooldowns, account.ID)
+	m.deleteStickyForAccountLocked(account.ID)
+	m.accounts[account.ID] = account
+	for i := range m.snapshot.Accounts {
+		if m.snapshot.Accounts[i].AccountID != account.ID {
+			continue
+		}
+		m.snapshot.Accounts[i].Status = restoredAccountStatus(m.snapshot.Accounts[i])
+		m.snapshot.Accounts[i].CooldownUntil = ""
+		m.snapshot.Accounts[i].ActiveConns = 0
+		return
+	}
+}
+
 func (m *Manager) Select(decision routing.Decision) (config.Account, AccountState, error) {
 	return m.SelectWithPolicy(decision, config.KeyRoutingPolicy{Mode: "all_enabled"})
 }
@@ -490,6 +512,19 @@ func (m *Manager) refreshCooldownsLocked(now time.Time) {
 			}
 		}
 	}
+}
+
+func restoredAccountStatus(state AccountState) string {
+	if state.Quota.Status == quota.StatusExhausted {
+		return "quota"
+	}
+	if state.Check.Status == "disabled" {
+		return "healthy"
+	}
+	if state.Check.Status == "healthy" {
+		return "healthy"
+	}
+	return "error"
 }
 
 func (m *Manager) pruneExpiredStickyLocked(now time.Time) {

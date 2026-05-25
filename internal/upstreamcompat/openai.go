@@ -11,6 +11,7 @@ import (
 type ChatCompletionRequest struct {
 	Model    string            `json:"model"`
 	Messages []json.RawMessage `json:"messages"`
+	Input    json.RawMessage   `json:"input,omitempty"`
 	Stream   bool              `json:"stream,omitempty"`
 	Metadata map[string]any    `json:"metadata,omitempty"`
 }
@@ -47,8 +48,8 @@ func ParseChatCompletionRequest(r io.Reader, maxBytes int64) (ChatCompletionRequ
 	if strings.TrimSpace(req.Model) == "" {
 		return ChatCompletionRequest{}, nil, errors.New("model is required")
 	}
-	if len(req.Messages) == 0 {
-		return ChatCompletionRequest{}, nil, errors.New("messages are required")
+	if len(req.Messages) == 0 && len(req.Input) == 0 {
+		return ChatCompletionRequest{}, nil, errors.New("messages or input are required")
 	}
 	return req, body, nil
 }

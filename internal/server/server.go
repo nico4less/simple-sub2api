@@ -12,6 +12,8 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
+	"os/exec"
 	"path"
 	"sort"
 	"strings"
@@ -40,6 +42,12 @@ type Server struct {
 	tunnel         tunnel.Controller
 	debugDashboard bool
 }
+
+const (
+	openAIOAuthClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+	openAIOAuthRedirectURI = "http://localhost:1455/auth/callback"
+	openAIOAuthTokenURL    = "https://auth.openai.com/oauth/token"
+)
 
 type Options struct {
 	DebugDashboard bool
@@ -124,6 +132,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/admin/account-pool", s.adminOnly(http.HandlerFunc(s.accountPool)))
 	mux.Handle("/api/admin/metrics", s.adminOnly(http.HandlerFunc(s.metricsSnapshot)))
 	mux.Handle("/api/admin/metrics/recent-usage", s.adminOnly(http.HandlerFunc(s.recentUsage)))
+	mux.Handle("/api/admin/openai/oauth/exchange-code", s.adminOnly(http.HandlerFunc(s.openAIOAuthExchangeCode)))
 	mux.Handle("/api/admin/debug/snapshot", s.adminOnly(http.HandlerFunc(s.debugSnapshot)))
 	return s.cors(mux)
 }
@@ -742,6 +751,24 @@ func (s *Server) accountByID(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 		s.writeUpdateResult(w, updated, err)
+	case http.MethodPatch:
+		var req accountPatchRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		updated, err := s.updateConfig(req.ConfigVersion, func(cfg *config.Config) error {
+			for i := range cfg.Accounts {
+				if cfg.Accounts[i].ID != id {
+					continue
+				}
+				if req.Enabled != nil {
+					cfg.Accounts[i].Enabled = *req.Enabled
+				}
+				return nil
+			}
+			return errors.New("account not found")
+		})
+		s.writeUpdateResult(w, updated, err)
 	case http.MethodDelete:
 		var req versionedRequest
 		if !decodeJSON(w, r, &req) {
@@ -752,6 +779,7 @@ func (s *Server) accountByID(w http.ResponseWriter, r *http.Request) {
 				return errors.New("account not found")
 			}
 			cfg.Accounts = deleteAccount(cfg.Accounts, id)
+			removeAccountFromGroups(cfg.Groups, id)
 			removeAccountFromGatewayPolicies(cfg.GatewayKeys, id)
 			return nil
 		})
@@ -846,6 +874,85 @@ func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id strin
 		s.logger.Warn("account_refresh_not_found", slog.String("account_id", id))
 	}
 	http.Error(w, "account not found", http.StatusNotFound)
+}
+
+func (s *Server) openAIOAuthExchangeCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req openAIOAuthExchangeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		http.Error(w, "authorization code is required", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.CodeVerifier) == "" {
+		http.Error(w, "code verifier is required; regenerate the authorization URL and retry", http.StatusBadRequest)
+		return
+	}
+	clientID := strings.TrimSpace(req.ClientID)
+	if clientID == "" {
+		clientID = openAIOAuthClientID
+	}
+	redirectURI := strings.TrimSpace(req.RedirectURI)
+	if redirectURI == "" {
+		redirectURI = openAIOAuthRedirectURI
+	}
+	tokenURL := strings.TrimSpace(req.TokenURL)
+	if tokenURL == "" {
+		tokenURL = openAIOAuthTokenURL
+	}
+	client, err := s.openAIOAuthHTTPClient(r.Context(), req.ProxyRef)
+	if err != nil {
+		http.Error(w, sanitizeOpenAIOAuthExchangeError(err), http.StatusBadGateway)
+		return
+	}
+	token, err := exchangeOpenAIOAuthCode(r.Context(), client, openAIOAuthExchangeInput{
+		Code:         strings.TrimSpace(req.Code),
+		CodeVerifier: strings.TrimSpace(req.CodeVerifier),
+		RedirectURI:  redirectURI,
+		ClientID:     clientID,
+		TokenURL:     tokenURL,
+	})
+	if err != nil {
+		http.Error(w, sanitizeOpenAIOAuthExchangeError(err), http.StatusBadGateway)
+		return
+	}
+	credentials := map[string]string{
+		"access_token":  token.AccessToken,
+		"refresh_token": token.RefreshToken,
+		"expires_at":    time.Now().UTC().Add(time.Duration(token.ExpiresIn) * time.Second).Format(time.RFC3339),
+		"client_id":     clientID,
+	}
+	if token.ExpiresIn <= 0 {
+		credentials["expires_at"] = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	}
+	if strings.TrimSpace(token.IDToken) != "" {
+		credentials["id_token"] = strings.TrimSpace(token.IDToken)
+	}
+	writeJSON(w, http.StatusOK, openAIOAuthExchangeResponse{Credentials: credentials, ExpiresAt: credentials["expires_at"]})
+}
+
+func (s *Server) openAIOAuthHTTPClient(ctx context.Context, proxyRef string) (*http.Client, error) {
+	cfg := s.store.Snapshot()
+	timeout := time.Duration(cfg.Probe.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	account := config.Account{ID: "openai_oauth_exchange", ProxyRef: strings.TrimSpace(proxyRef)}
+	spec, _, err := proxyclient.Resolve(account, proxyclient.SpecsFromConfig(cfg))
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		return proxyclient.HTTPClient(spec, timeout)
+	}
 }
 
 func (s *Server) oauthSources(w http.ResponseWriter, r *http.Request) {
@@ -1349,9 +1456,23 @@ func (s *Server) updateConfig(expectedVersion int, mutate func(*config.Config) e
 	}
 	s.metrics.ApplyRecentErrorsLimit(updated.Metrics.RecentErrorsLimit)
 	if err := s.applyTunnelConfig(updated); err != nil {
+		if isMissingTunnelBinaryError(err) {
+			if s.logger != nil {
+				s.logger.Warn("tunnel_apply_skipped_missing_binary", slog.String("error", err.Error()))
+			}
+			return updated, nil
+		}
 		return config.Config{}, err
 	}
 	return updated, nil
+}
+
+func isMissingTunnelBinaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var execErr *exec.Error
+	return errors.Is(err, exec.ErrNotFound) || (errors.As(err, &execErr) && errors.Is(execErr.Err, exec.ErrNotFound))
 }
 
 func (s *Server) applyTunnelConfig(cfg config.Config) error {
@@ -1418,6 +1539,11 @@ type versionedRequest struct {
 type accountMutationRequest struct {
 	ConfigVersion int            `json:"config_version"`
 	Account       config.Account `json:"account"`
+}
+
+type accountPatchRequest struct {
+	ConfigVersion int   `json:"config_version"`
+	Enabled       *bool `json:"enabled,omitempty"`
 }
 
 type groupMutationRequest struct {
@@ -1506,6 +1632,38 @@ type accountRefreshResponse struct {
 	Health    accountcheck.Result `json:"health"`
 	Account   *accountSummary     `json:"account,omitempty"`
 	Accounts  *accountsResponse   `json:"accounts,omitempty"`
+}
+
+type openAIOAuthExchangeRequest struct {
+	Code         string `json:"code"`
+	State        string `json:"state,omitempty"`
+	CodeVerifier string `json:"code_verifier"`
+	RedirectURI  string `json:"redirect_uri,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	TokenURL     string `json:"token_url,omitempty"`
+	ProxyRef     string `json:"proxy_ref,omitempty"`
+}
+
+type openAIOAuthExchangeResponse struct {
+	Credentials map[string]string `json:"credentials"`
+	ExpiresAt   string            `json:"expires_at"`
+}
+
+type openAIOAuthExchangeInput struct {
+	Code         string
+	CodeVerifier string
+	RedirectURI  string
+	ClientID     string
+	TokenURL     string
+}
+
+type openAIOAuthTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	IDToken      string `json:"id_token,omitempty"`
+	TokenType    string `json:"token_type,omitempty"`
+	ExpiresIn    int64  `json:"expires_in"`
+	Scope        string `json:"scope,omitempty"`
 }
 
 type accountDisplaySyncResult struct {
@@ -1852,6 +2010,70 @@ func credentialValue(credential string, key string) string {
 	return ""
 }
 
+func exchangeOpenAIOAuthCode(ctx context.Context, client *http.Client, input openAIOAuthExchangeInput) (openAIOAuthTokenResponse, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("client_id", input.ClientID)
+	form.Set("code", input.Code)
+	form.Set("redirect_uri", input.RedirectURI)
+	form.Set("code_verifier", input.CodeVerifier)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, input.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return openAIOAuthTokenResponse{}, err
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("User-Agent", "codex-cli/0.91.0")
+	request.Header.Set("Accept", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return openAIOAuthTokenResponse{}, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if err != nil {
+		return openAIOAuthTokenResponse{}, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return openAIOAuthTokenResponse{}, fmt.Errorf("token exchange failed: status %d, body: %s", response.StatusCode, sanitizeCredentialText(string(body)))
+	}
+	var token openAIOAuthTokenResponse
+	if err := json.Unmarshal(body, &token); err != nil {
+		return openAIOAuthTokenResponse{}, err
+	}
+	if strings.TrimSpace(token.AccessToken) == "" {
+		return openAIOAuthTokenResponse{}, errors.New("token exchange response missing access_token")
+	}
+	if strings.TrimSpace(token.RefreshToken) == "" {
+		return openAIOAuthTokenResponse{}, errors.New("token exchange response missing refresh_token")
+	}
+	return token, nil
+}
+
+func sanitizeCredentialText(text string) string {
+	for _, marker := range []string{"Bearer ", "sk-", "access_token=", "refresh_token=", "id_token=", "code=", "code_verifier="} {
+		if strings.Contains(text, marker) {
+			return "credential material redacted"
+		}
+	}
+	return text
+}
+
+func sanitizeOpenAIOAuthExchangeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	for _, marker := range []string{"Bearer ", "sk-", "access_token=", "refresh_token=", "id_token=", "code=", "code_verifier="} {
+		if strings.Contains(message, marker) {
+			return "OpenAI OAuth token exchange failed"
+		}
+	}
+	return message
+}
+
 func joinRefreshMessages(healthMessage string, syncMessage string) string {
 	if syncMessage == "" {
 		return healthMessage
@@ -2104,6 +2326,12 @@ func deleteAccount(accounts []config.Account, id string) []config.Account {
 func removeAccountFromGatewayPolicies(keys []config.GatewayKey, id string) {
 	for i := range keys {
 		keys[i].RoutingPolicy.AccountIDs = removeString(keys[i].RoutingPolicy.AccountIDs, id)
+	}
+}
+
+func removeAccountFromGroups(groups []config.Group, id string) {
+	for i := range groups {
+		groups[i].AccountIDs = removeString(groups[i].AccountIDs, id)
 	}
 }
 

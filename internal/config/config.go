@@ -420,6 +420,54 @@ func (s *Store) DisableAccount(accountID string) (bool, error) {
 	return false, nil
 }
 
+type OpenAIAccessTokenUpdate struct {
+	AccessToken  string
+	RefreshToken string
+	IDToken      string
+	ExpiresAt    string
+}
+
+func (s *Store) UpdateOpenAIAccessToken(accountID string, token OpenAIAccessTokenUpdate) (Account, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(accountID) == "" || strings.TrimSpace(token.AccessToken) == "" {
+		return Account{}, false, nil
+	}
+	if err := s.reloadLocked(); err != nil {
+		return Account{}, false, err
+	}
+	candidate := cloneConfig(s.cfg)
+	for i := range candidate.Accounts {
+		if candidate.Accounts[i].ID != accountID {
+			continue
+		}
+		candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{
+			"access_token": token.AccessToken,
+			"expires_at":   token.ExpiresAt,
+		})
+		if strings.TrimSpace(token.RefreshToken) != "" {
+			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"refresh_token": token.RefreshToken})
+		}
+		if strings.TrimSpace(token.IDToken) != "" {
+			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"id_token": token.IDToken})
+		}
+		candidate.Accounts[i].Enabled = true
+		candidate.ConfigVersion = s.cfg.ConfigVersion + 1
+		if err := EnsureDefaultsAndSecrets(&candidate); err != nil {
+			return Account{}, false, err
+		}
+		if err := Validate(candidate); err != nil {
+			return Account{}, false, err
+		}
+		if err := s.saveConfigLocked(candidate); err != nil {
+			return Account{}, false, err
+		}
+		s.cfg = candidate
+		return cloneAccounts([]Account{candidate.Accounts[i]})[0], true, nil
+	}
+	return Account{}, false, nil
+}
+
 func (s *Store) ApplyOverrides(overrides RuntimeOverrides) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -969,6 +1017,43 @@ func AccountPlatform(account Account) string {
 		return "gemini"
 	}
 	return ""
+}
+
+func mergeCredential(credential string, updates map[string]string) string {
+	values := map[string]string{}
+	keys := make([]string, 0)
+	for _, part := range strings.FieldsFunc(credential, func(r rune) bool { return r == ';' || r == '\n' || r == '\r' }) {
+		name, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		key := strings.TrimSpace(name)
+		if key == "" {
+			continue
+		}
+		if _, exists := values[key]; !exists {
+			keys = append(keys, key)
+		}
+		values[key] = strings.TrimSpace(value)
+	}
+	for key, value := range updates {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" {
+			continue
+		}
+		if _, exists := values[key]; !exists {
+			keys = append(keys, key)
+		}
+		values[key] = value
+	}
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value := strings.TrimSpace(values[key]); value != "" {
+			parts = append(parts, key+"="+value)
+		}
+	}
+	return strings.Join(parts, ";")
 }
 
 func validateProxies(proxies []ProxyConfig) error {

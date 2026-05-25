@@ -20,7 +20,17 @@ func TestParseChatCompletionRequestStrictContract(t *testing.T) {
 		t.Fatalf("parsed request = %#v body=%q", req, string(body))
 	}
 	if _, _, err := upstreamcompat.ParseChatCompletionRequest(strings.NewReader(`{"model":"gpt-test"}`), 1024); err == nil {
-		t.Fatal("ParseChatCompletionRequest() accepted missing messages")
+		t.Fatal("ParseChatCompletionRequest() accepted missing messages/input")
+	}
+}
+
+func TestParseChatCompletionRequestAcceptsResponsesInput(t *testing.T) {
+	req, body, err := upstreamcompat.ParseChatCompletionRequest(strings.NewReader(`{"model":"gpt-test","input":"who are you"}`), 1024)
+	if err != nil {
+		t.Fatalf("ParseChatCompletionRequest() error = %v", err)
+	}
+	if req.Model != "gpt-test" || len(req.Input) == 0 || len(req.Messages) != 0 || len(body) == 0 {
+		t.Fatalf("parsed request = %#v body=%q", req, string(body))
 	}
 }
 
@@ -70,6 +80,62 @@ func TestBuildUpstreamRequestNormalizesV1Base(t *testing.T) {
 	}
 	if got, want := request.URL.String(), "https://api.openai.com/v1/chat/completions"; got != want {
 		t.Fatalf("upstream URL = %q, want %q", got, want)
+	}
+}
+
+func TestBuildUpstreamRequestPreservesResponsesEndpoint(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{BaseURL: "https://api.openai.com/v1", Credential: "api_key=sk-upstream"}, []byte(`{"model":"gpt-test","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	if got, want := request.URL.String(), "https://api.openai.com/v1/responses"; got != want {
+		t.Fatalf("upstream URL = %q, want %q", got, want)
+	}
+}
+
+func TestBuildUpstreamRequestUsesChatGPTCodexForOpenAIOAuth(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	base.Header.Set("Authorization", "Bearer local-gateway-key")
+	base.Header.Set("User-Agent", "OpenAI/Python 1.2.3")
+	base.Header.Set("session_id", "client-session")
+	base.Header.Set("conversation_id", "client-conversation")
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access;chatgpt_account_id=chatgpt-acc", Metadata: map[string]any{"platform": "openai"}}, []byte(`{"model":"gpt-test","input":"hi","prompt_cache_key":"cache-key"}`))
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	if got, want := request.URL.String(), "https://chatgpt.com/backend-api/codex/responses"; got != want {
+		t.Fatalf("upstream URL = %q, want %q", got, want)
+	}
+	if got := request.Host; got != "chatgpt.com" {
+		t.Fatalf("Host = %q", got)
+	}
+	if got := request.Header.Get("Authorization"); got != "Bearer oauth-access" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := request.Header.Get("chatgpt-account-id"); got != "chatgpt-acc" {
+		t.Fatalf("chatgpt-account-id = %q", got)
+	}
+	if got := request.Header.Get("OpenAI-Beta"); got != "responses=experimental" {
+		t.Fatalf("OpenAI-Beta = %q", got)
+	}
+	if got := request.Header.Get("originator"); got != "codex_cli_rs" {
+		t.Fatalf("originator = %q", got)
+	}
+	if got := request.Header.Get("User-Agent"); got != "codex_cli_rs/0.125.0" {
+		t.Fatalf("User-Agent = %q", got)
+	}
+	if got := request.Header.Get("session_id"); got == "" || got == "client-session" {
+		t.Fatalf("session_id was not isolated: %q", got)
+	}
+	if got := request.Header.Get("conversation_id"); got == "" || got == "client-conversation" {
+		t.Fatalf("conversation_id was not isolated: %q", got)
 	}
 }
 

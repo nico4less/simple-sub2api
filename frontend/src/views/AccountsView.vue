@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import {
   applyImport,
   createAccount,
+  createGroup,
   deleteAccount,
+  exchangeOpenAIOAuthCode,
   exportAccounts,
   loadAccounts,
   loadGroups,
+  patchAccountEnabled,
   previewImport,
   refreshAccount,
   testAllAccounts,
@@ -19,7 +22,8 @@ import {
   type AccountsResponse,
   type GroupConfig,
   type GroupsResponse,
-  type ProxyConfig
+  type ProxyConfig,
+  updateGroup
 } from '@/api/client'
 import AppShell from '@/components/AppShell.vue'
 import DataTable from '@/components/DataTable.vue'
@@ -146,6 +150,8 @@ const copiedUrl = ref(false)
 const activeOAuthTab = ref('manual')
 const authCodeInput = ref('')
 const accountNameInput = ref<HTMLInputElement | null>(null)
+const openAIOAuthSession = ref<{ state: string; codeVerifier: string; redirectURI: string; clientID: string } | null>(null)
+const oauthCallbackStateInput = ref('')
 
 const OAUTH_CALLBACK_URL = 'http://localhost:1455/auth/callback'
 const ANTIGRAVITY_CALLBACK_URL = 'http://localhost:8085/callback'
@@ -1331,7 +1337,7 @@ const authorizationStepTitle = computed(() => {
   return t('accounts.oauth.antigravity.title')
 })
 const canContinueAccountSetup = computed(() => true)
-const canSubmit = computed(() => canContinueAccountSetup.value && buildCredential().trim() !== '')
+const canSubmit = computed(() => canContinueAccountSetup.value && (!isOAuthFlow.value || buildCredential().trim() !== '' || editorMode.value === 'edit'))
 
 function toggleNumberCode(code: number) {
   const codes = numberList(form.custom_error_codes)
@@ -1415,6 +1421,76 @@ function groupLabel(group: GroupConfig) {
   return group.name || group.id
 }
 
+function defaultGroupName(platform: PlatformOption) {
+  if (platform === 'anthropic') return 'Claude'
+  if (platform === 'openai') return 'OpenAI'
+  if (platform === 'gemini') return 'Gemini'
+  return 'Antigravity'
+}
+
+function defaultGroupID(platform: PlatformOption) {
+  return platform === 'anthropic' ? 'claude' : platform
+}
+
+function buildDefaultGroup(platform: PlatformOption): Partial<GroupConfig> {
+  return {
+    id: defaultGroupID(platform),
+    name: defaultGroupName(platform),
+    platform,
+    description: `Default ${defaultGroupName(platform)} routing group`,
+    status: 'active',
+    tags: [defaultGroupID(platform)],
+    account_ids: []
+  }
+}
+
+async function ensureDefaultGroupForAccount(accountID: string): Promise<string[]> {
+  const selected = selectedGroupIDs.value
+  if (selected.length > 0) return selected
+  const groups = groupsState.value || await loadGroups()
+  groupsState.value = groups
+  const existing = (groups.groups || [])
+    .map((summary) => summary.config)
+    .find((group) => group.platform === form.platform && group.status !== 'disabled')
+  if (existing) {
+    form.group_ids = existing.id
+    return [existing.id]
+  }
+  const created = await createGroup(groups.config_version, buildDefaultGroup(form.platform))
+  const nextGroups = await loadGroups()
+  groupsState.value = nextGroups
+  const groupID = created.groups?.find((group) => group.platform === form.platform && group.account_ids?.includes(accountID))?.id || defaultGroupID(form.platform)
+  form.group_ids = groupID
+  return [groupID]
+}
+
+async function ensureSelectedAccountGroups(accountID: string) {
+  const groupIDs = selectedGroupIDs.value
+  if (groupIDs.length === 0) return
+  const groups = await loadGroups()
+  groupsState.value = groups
+  let configVersion = groups.config_version
+  let changed = false
+  for (const groupSummary of groups.groups || []) {
+    const group = groupSummary.config
+    const shouldInclude = groupIDs.includes(group.id)
+    const currentlyIncludes = (group.account_ids || []).includes(accountID)
+    if (shouldInclude === currentlyIncludes) continue
+    const nextGroup: GroupConfig = {
+      ...group,
+      account_ids: shouldInclude
+        ? [...(group.account_ids || []), accountID]
+        : (group.account_ids || []).filter((id) => id !== accountID)
+    }
+    const updated = await updateGroup(configVersion, nextGroup)
+    configVersion = updated.config_version
+    changed = true
+  }
+  if (changed) {
+    groupsState.value = await loadGroups()
+  }
+}
+
 function resetForm() {
   editorStep.value = 1
   showAdvancedAccountOptions.value = false
@@ -1495,7 +1571,8 @@ function resetForm() {
   form.mixed_scheduling = false
   form.allow_overages = false
   form.group_default = false
-  form.group_ids = ''
+  const defaultGroup = filteredGroupsForPlatform.value.find((group) => group.status !== 'disabled')
+  form.group_ids = defaultGroup?.id || ''
   form.model_mappings = []
   modelSearchQuery.value = ''
   customModelInput.value = ''
@@ -1510,6 +1587,8 @@ function selectPlatform(platform: PlatformOption) {
   if (form.platform !== platform) resetOAuthAssistantState()
   form.platform = platform
   form.category = normalizeCategoryForPlatform(platform, form.category)
+  const defaultGroup = filteredGroupsForPlatform.value.find((group) => group.status !== 'disabled')
+  form.group_ids = defaultGroup?.id || ''
   if (form.model_mode === 'whitelist') syncPlatformModels()
   inferSimpleType()
 }
@@ -1847,10 +1926,36 @@ function extractOAuthCallbackParam(raw: string, param: 'code' | 'state'): string
   }
 }
 
+function applyOpenAIOAuthCredentials(credentials: Record<string, string>) {
+  form.access_token = credentials.access_token || ''
+  form.refresh_token = credentials.refresh_token || ''
+  if (credentials.id_token) {
+    form.credential = buildCredentialWithExtras({ id_token: credentials.id_token, expires_at: credentials.expires_at, client_id: credentials.client_id })
+  } else {
+    form.credential = buildCredentialWithExtras({ expires_at: credentials.expires_at, client_id: credentials.client_id })
+  }
+}
+
+function buildCredentialWithExtras(extras: Record<string, string>): string {
+  const parts: string[] = []
+  const add = (key: string, value: string | undefined) => {
+    const trimmed = (value || '').trim()
+    if (trimmed) parts.push(`${key}=${trimmed}`)
+  }
+  add('refresh_token', form.refresh_token)
+  add('access_token', form.access_token)
+  Object.entries(extras).forEach(([key, value]) => add(key, value))
+  return parts.join(';')
+}
+
 watch(authCodeInput, (newVal: string) => {
   if (!isOAuthFlow.value) return
   const trimmed = newVal.trim()
   const code = extractOAuthCallbackParam(trimmed, 'code')
+  const state = extractOAuthCallbackParam(trimmed, 'state')
+  if (state) {
+    oauthCallbackStateInput.value = state
+  }
   const captured = code || trimmed
   if (code && authCodeInput.value !== code) {
     authCodeInput.value = code
@@ -1880,6 +1985,7 @@ async function handleGenerateAuthLink() {
       params.set('scope', 'openid profile email offline_access')
       params.set('state', state)
       computedAuthUrl.value = `https://auth.openai.com/oauth/authorize?${params.toString()}`
+      openAIOAuthSession.value = { state, codeVerifier, redirectURI: OAUTH_CALLBACK_URL, clientID: OPENAI_CODEX_CLIENT_ID }
     } else if (form.platform === 'anthropic') {
       const state = randomOAuthToken(32)
       const codeVerifier = randomOAuthToken(32)
@@ -1979,8 +2085,15 @@ function goBackToAccountSetup() {
 }
 
 function closeEditor() {
+  const before = editorOpen.value
   editorOpen.value = false
   error.value = ''
+  oauthCompleteLog('info', 'close_editor_called', {
+    before_open: before,
+    after_open: editorOpen.value,
+    step: editorStep.value,
+    mode: editorMode.value
+  })
 }
 
 async function refreshAccountsSnapshot(): Promise<AccountsResponse> {
@@ -1992,6 +2105,18 @@ async function refreshAccountsSnapshot(): Promise<AccountsResponse> {
 
 function buildCredential(): string {
   const parts: string[] = []
+  const existingExtras: Record<string, string> = {}
+  form.credential
+    .split(/[;\n\r]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .forEach((item) => {
+      const [key, ...rest] = item.split('=')
+      const normalizedKey = key.trim()
+      if (!normalizedKey || ['api_key', 'refresh_token', 'setup_token', 'session_token', 'access_token', 'codex_session'].includes(normalizedKey)) return
+      const value = rest.join('=').trim()
+      if (value) existingExtras[normalizedKey] = value
+    })
   const add = (key: string, value: string) => {
     const trimmed = value.trim()
     if (trimmed) parts.push(`${key}=${trimmed}`)
@@ -2007,6 +2132,7 @@ function buildCredential(): string {
     add('session_token', form.session_token)
     add('access_token', form.access_token)
     add('codex_session', form.codex_session)
+    Object.entries(existingExtras).forEach(([key, value]) => add(key, value))
   }
   if (showServiceAccount.value) add('service_account_json', form.service_account_json)
   if (showBedrock.value) {
@@ -2178,6 +2304,11 @@ async function saveAccount() {
     return
   }
   const account = buildAccount()
+  const groupIDs = await ensureDefaultGroupForAccount(account.id)
+  if (groupIDs.length > 0) {
+    account.metadata = buildMetadata()
+    account.tags = Array.from(new Set([...(account.tags || []), ...groupIDs]))
+  }
   const latest = await refreshAccountsSnapshot()
   if (editorMode.value === 'create') {
     await createAccount(latest.config_version, account)
@@ -2186,6 +2317,7 @@ async function saveAccount() {
     await updateAccount(latest.config_version, account)
     notice.value = t('accounts.updated', { id: account.id })
   }
+  await ensureSelectedAccountGroups(account.id)
   editorOpen.value = false
   await loadAll()
 }
@@ -2209,6 +2341,18 @@ async function completeOAuthAccount() {
   try {
     const capturedCode = extractOAuthCallbackParam(rawInput, 'code') || rawInput || form.refresh_token.trim() || form.setup_token.trim()
     if (!capturedCode) {
+      if (editorMode.value === 'edit') {
+        oauthCompleteLog('info', 'no_new_code_save_existing', {
+          account_id: form.id || '(pending)',
+          selected_group_ids: selectedGroupIDs.value
+        })
+        await saveAccount()
+        oauthCompleteLog('info', 'saved_existing_without_new_code', {
+          account_id: form.id || '(pending)',
+          editor_open: editorOpen.value
+        })
+        return
+      }
       oauthCompleteLog('warn', 'missing_code', {
         account_id: form.id || '(pending)',
         credential_status: oauthCredentialStatus.value
@@ -2221,7 +2365,32 @@ async function completeOAuthAccount() {
       source: extractOAuthCallbackParam(rawInput, 'code') ? 'callback_url' : rawInput ? 'manual_input' : form.refresh_token.trim() ? 'refresh_token_field' : 'setup_token_field',
       code_length: capturedCode.length
     })
-    if (form.add_method === 'setup-token') {
+    if (form.platform === 'openai' && form.add_method !== 'setup-token') {
+      const callbackState = extractOAuthCallbackParam(rawInput, 'state') || oauthCallbackStateInput.value
+      const session = openAIOAuthSession.value
+      if (!session?.codeVerifier) {
+        error.value = 'OpenAI OAuth session missing. Regenerate the authorization URL, sign in again, then paste the callback URL.'
+        return
+      }
+      if (callbackState && callbackState !== session.state) {
+        error.value = 'OpenAI OAuth state mismatch. Regenerate the authorization URL and retry.'
+        return
+      }
+      const exchanged = await exchangeOpenAIOAuthCode({
+        code: capturedCode,
+        state: callbackState || session.state,
+        code_verifier: session.codeVerifier,
+        redirect_uri: session.redirectURI,
+        client_id: session.clientID,
+        proxy_ref: form.proxy_ref.trim() || undefined
+      })
+      applyOpenAIOAuthCredentials(exchanged.credentials)
+      openAIOAuthSession.value = null
+      oauthCompleteLog('info', 'openai_code_exchanged', {
+        account_id: form.id || '(pending)',
+        credential_keys: safeCredentialKeys(buildCredential())
+      })
+    } else if (form.add_method === 'setup-token') {
       form.setup_token = capturedCode
     } else {
       form.refresh_token = capturedCode
@@ -2236,6 +2405,11 @@ async function completeOAuthAccount() {
       return
     }
     const account = buildAccount()
+    const groupIDs = await ensureDefaultGroupForAccount(account.id)
+    if (groupIDs.length > 0) {
+      account.metadata = buildMetadata()
+      account.tags = Array.from(new Set([...(account.tags || []), ...groupIDs]))
+    }
     oauthCompleteLog('info', 'built_account', summarizeCompleteAccount(account))
     const latest = await refreshAccountsSnapshot()
     oauthCompleteLog('info', 'snapshot_loaded', {
@@ -2254,6 +2428,23 @@ async function completeOAuthAccount() {
       notice.value = t('accounts.updated', { id: account.id })
       oauthCompleteLog('info', 'update_success', { account_id: account.id })
     }
+    await ensureSelectedAccountGroups(account.id)
+    closeEditor()
+    await nextTick()
+    oauthCompleteLog('info', 'closed_editor_after_save', {
+      account_id: account.id,
+      editor_open: editorOpen.value,
+      modal_removed: !document.querySelector('[data-account-editor-modal="true"]')
+    })
+    if (!editorOpen.value) {
+      setTimeout(() => {
+        oauthCompleteLog('info', 'close_editor_deferred_check', {
+          account_id: account.id,
+          editor_open: editorOpen.value,
+          modal_present: Boolean(document.querySelector('[data-account-editor-modal="true"]'))
+        })
+      }, 0)
+    }
     oauthCompleteLog('info', 'refresh_request', { account_id: account.id })
     const validation = await refreshAccount(account.id)
     oauthCompleteLog('info', 'refresh_success', {
@@ -2271,8 +2462,7 @@ async function completeOAuthAccount() {
     operationOutput.value = JSON.stringify(validation, null, 2)
     if (validation.accounts) accountsState.value = validation.accounts
     notice.value = `${notice.value} Complete validation: ${validation.status}.`
-    closeEditor()
-    oauthCompleteLog('info', 'closed_editor', {
+    oauthCompleteLog('info', 'post_close_refresh_finished', {
       account_id: account.id,
       loaded_from_refresh_snapshot: Boolean(validation.accounts)
     })
@@ -2287,18 +2477,18 @@ async function completeOAuthAccount() {
     completingAccount.value = false
     oauthCompleteLog('info', 'finished', {
       account_id: form.id || '(pending)',
-      editor_open: editorOpen.value
+      editor_open: editorOpen.value,
+      modal_present: Boolean(document.querySelector('[data-account-editor-modal="true"]'))
     })
   }
 }
 
 async function toggleAccount(row: AccountRow) {
   if (!accountsState.value) return
-  const account = structuredClone(row.summary.config)
-  account.enabled = !row.enabled
+  const enabled = !row.enabled
   const latest = await refreshAccountsSnapshot()
-  await updateAccount(latest.config_version, account)
-  notice.value = `${account.enabled ? 'Enabled' : 'Disabled'} ${account.id}.`
+  await patchAccountEnabled(latest.config_version, row.id, enabled)
+  notice.value = `${enabled ? 'Enabled' : 'Disabled'} ${row.id}.`
   await loadAll()
 }
 
@@ -2647,7 +2837,7 @@ onMounted(() => {
         <pre class="max-h-96 overflow-auto rounded-xl bg-gray-100 p-3 text-xs text-gray-600 dark:bg-dark-800 dark:text-gray-300">{{ operationOutput || $t('accounts.noOperationOutput') }}</pre>
       </section>
 
-      <div v-if="editorOpen" class="xforce-modal-backdrop fixed inset-0 z-50 grid place-items-center">
+      <div v-if="editorOpen" data-account-editor-modal="true" class="xforce-modal-backdrop fixed inset-0 z-50 grid place-items-center">
         <section class="card xforce-modal-panel max-h-[92vh] w-full max-w-6xl overflow-auto">
           <div class="flex items-center justify-between gap-3">
             <div>

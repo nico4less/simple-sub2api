@@ -194,6 +194,21 @@ export interface AccountRefreshResponse extends AccountHealth {
   accounts?: AccountsResponse
 }
 
+export interface OpenAIOAuthExchangeRequest {
+  code: string
+  state?: string
+  code_verifier: string
+  redirect_uri?: string
+  client_id?: string
+  token_url?: string
+  proxy_ref?: string
+}
+
+export interface OpenAIOAuthExchangeResponse {
+  credentials: Record<string, string>
+  expires_at: string
+}
+
 export interface RuntimeAccount {
   account_id: string
   tier: string
@@ -407,6 +422,13 @@ export function updateAccount(configVersion: number, account: AccountConfig) {
   })
 }
 
+export function patchAccountEnabled(configVersion: number, accountID: string, enabled: boolean) {
+  return api<AdminConfig>(`/api/admin/accounts/${encodeURIComponent(accountID)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ config_version: configVersion, enabled })
+  })
+}
+
 export function previewImport(content: string, kind = 'line_tokens') {
   return api<unknown>('/api/admin/accounts/import/preview', {
     method: 'POST',
@@ -434,6 +456,13 @@ export function testAllAccounts() {
 
 export function refreshAccount(accountID: string) {
   return api<AccountRefreshResponse>(`/api/admin/accounts/${encodeURIComponent(accountID)}/refresh`, { method: 'POST' })
+}
+
+export function exchangeOpenAIOAuthCode(payload: OpenAIOAuthExchangeRequest) {
+  return api<OpenAIOAuthExchangeResponse>('/api/admin/openai/oauth/exchange-code', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
 }
 
 export function deleteAccount(configVersion: number, accountID: string) {

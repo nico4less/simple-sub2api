@@ -3,10 +3,12 @@ package server_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -914,6 +916,7 @@ func TestE004DeleteAccountPrunesGatewayPolicyAndRecentUsageIsRedacted(t *testing
 	cfg := config.DefaultConfig()
 	cfg.Dashboard.AdminPassword = "admin-secret"
 	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "A", Tier: "simple", Credential: "api_key=sk-upstream", BaseURL: upstream.URL, Enabled: true}}
+	cfg.Groups[0].AccountIDs = []string{"acct_1"}
 	store, err := config.NewMemoryStore(cfg)
 	if err != nil {
 		t.Fatalf("NewMemoryStore() error = %v", err)
@@ -957,8 +960,93 @@ func TestE004DeleteAccountPrunesGatewayPolicyAndRecentUsageIsRedacted(t *testing
 		t.Fatalf("delete status = %d", deleteResp.StatusCode)
 	}
 	snapshot := store.Snapshot()
-	if len(snapshot.Accounts) != 0 || len(snapshot.GatewayKeys) != 2 || len(snapshot.GatewayKeys[1].RoutingPolicy.AccountIDs) != 0 {
-		t.Fatalf("account delete did not prune gateway policy: %#v", snapshot)
+	if len(snapshot.Accounts) != 0 || len(snapshot.GatewayKeys) != 2 || len(snapshot.GatewayKeys[1].RoutingPolicy.AccountIDs) != 0 || len(snapshot.Groups[0].AccountIDs) != 0 {
+		t.Fatalf("account delete did not prune references: %#v", snapshot)
+	}
+}
+
+func TestAccountCreateIgnoresMissingTunnelBinary(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Tunnel.Enabled = true
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	fakeTunnel := &fakeTunnelController{applyErr: fmt.Errorf("cloudflared binary not found: %w", exec.ErrNotFound)}
+	srv := httptest.NewServer(server.NewWithOptions(store, slog.New(slog.NewTextHandler(io.Discard, nil)), server.Options{TunnelManager: fakeTunnel}).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	body := []byte(`{"config_version":1,"account":{"id":"acct_oauth","type":"oauth","label":"OAuth","tier":"simple","credential":"refresh_token=rt-test","metadata":{"platform":"openai","account_category":"oauth-based"},"enabled":true}}`)
+	resp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/accounts", map[string]string{"Cookie": cookie.String()}, body)
+	if resp.StatusCode != http.StatusOK {
+		responseBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("create account status = %d body=%s", resp.StatusCode, string(responseBody))
+	}
+	snapshot := store.Snapshot()
+	if len(snapshot.Accounts) != 1 || snapshot.Accounts[0].ID != "acct_oauth" {
+		t.Fatalf("account was not persisted when tunnel binary was missing: %#v", snapshot.Accounts)
+	}
+	if len(fakeTunnel.applies) == 0 {
+		t.Fatal("expected tunnel Apply attempt")
+	}
+}
+
+func TestOpenAIOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
+	var gotForm map[string]string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/oauth/token" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse token form: %v", err)
+		}
+		gotForm = map[string]string{
+			"grant_type":    r.Form.Get("grant_type"),
+			"client_id":     r.Form.Get("client_id"),
+			"code":          r.Form.Get("code"),
+			"redirect_uri":  r.Form.Get("redirect_uri"),
+			"code_verifier": r.Form.Get("code_verifier"),
+		}
+		writeFixtureJSON(t, w, map[string]any{
+			"access_token":  "access-from-code",
+			"refresh_token": "refresh-from-code",
+			"id_token":      "id-from-code",
+			"expires_in":    3600,
+			"token_type":    "Bearer",
+		})
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+	body := []byte(`{"code":"auth-code-value","state":"state-value","code_verifier":"verifier-value","redirect_uri":"http://localhost:1455/auth/callback","client_id":"app_EMoamEEZ73f0CkXaXp7hrann","token_url":"` + upstream.URL + `/oauth/token"}`)
+	resp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/openai/oauth/exchange-code", map[string]string{"Cookie": cookie.String()}, body)
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("exchange status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	var decoded struct {
+		Credentials map[string]string `json:"credentials"`
+		ExpiresAt   string            `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode exchange response: %v", err)
+	}
+	if decoded.Credentials["refresh_token"] != "refresh-from-code" || decoded.Credentials["access_token"] != "access-from-code" || decoded.Credentials["id_token"] != "id-from-code" || decoded.Credentials["client_id"] == "" || decoded.ExpiresAt == "" {
+		t.Fatalf("unexpected token bundle: %#v", decoded)
+	}
+	if gotForm["grant_type"] != "authorization_code" || gotForm["code"] != "auth-code-value" || gotForm["code_verifier"] != "verifier-value" || gotForm["redirect_uri"] != "http://localhost:1455/auth/callback" {
+		t.Fatalf("unexpected exchange form: %#v", gotForm)
 	}
 }
 
@@ -1023,10 +1111,11 @@ func loginCookie(t *testing.T, serverURL string, password string) *http.Cookie {
 }
 
 type fakeTunnelController struct {
-	mu      sync.Mutex
-	status  tunnel.RuntimeStatus
-	applies []fakeTunnelApply
-	stops   int
+	mu       sync.Mutex
+	status   tunnel.RuntimeStatus
+	applies  []fakeTunnelApply
+	stops    int
+	applyErr error
 }
 
 type fakeTunnelApply struct {
@@ -1038,6 +1127,10 @@ func (f *fakeTunnelController) Apply(cfg config.TunnelConfig, bind string) error
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.applies = append(f.applies, fakeTunnelApply{cfg: cfg, bind: bind})
+	if f.applyErr != nil {
+		f.status = tunnel.RuntimeStatus{Status: tunnel.StatusError, ErrorMessage: f.applyErr.Error()}
+		return f.applyErr
+	}
 	if cfg.Enabled {
 		f.status = tunnel.RuntimeStatus{Status: tunnel.StatusConnected, PublicURL: "https://fake.trycloudflare.com", RecentLogs: []string{"fake connected"}}
 		return nil
