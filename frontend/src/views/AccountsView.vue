@@ -830,7 +830,8 @@ function makeBadgeChip(key: string, label: string, className: string, icon: Badg
   return { key, label, className, icon, title }
 }
 
-function subscriptionTierBadge(tier: 'ultra' | 'pro' | 'free'): BadgeChip {
+function subscriptionTierBadge(tier: string): BadgeChip {
+  const normalized = tier.toLowerCase()
   if (tier === 'ultra') {
     return makeBadgeChip(
       'subscription:ultra',
@@ -840,13 +841,14 @@ function subscriptionTierBadge(tier: 'ultra' | 'pro' | 'free'): BadgeChip {
       'Subscription tier: Ultra'
     )
   }
-  if (tier === 'pro') {
+  if (['plus', 'team', 'enterprise', 'pro'].includes(normalized)) {
+    const label = normalized === 'plus' ? 'Plus' : normalized === 'team' ? 'Team' : normalized === 'enterprise' ? 'Enterprise' : 'Pro'
     return makeBadgeChip(
-      'subscription:pro',
-      'Pro',
+      `subscription:${normalized}`,
+      label,
       'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-blue-600 to-indigo-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105',
       'diamond',
-      'Subscription tier: Pro'
+      `Subscription tier: ${label}`
     )
   }
   return makeBadgeChip(
@@ -942,11 +944,14 @@ function buildAccountBadges(account: AccountConfig, summary: AccountSummary, met
   return badges
 }
 
-function normalizedSubscriptionTier(row: { tier?: string; tierLabel?: string; summary?: AccountSummary }): 'ultra' | 'pro' | 'free' {
+function normalizedSubscriptionTier(row: { tier?: string; tierLabel?: string; summary?: AccountSummary }): string {
   const raw = row.summary?.subscription_tier || stringRecordValue(row.summary?.quota, 'subscription_tier', `${row.tierLabel || row.tier || ''}`)
   const lower = raw.toLowerCase()
   if (lower.includes('ultra')) return 'ultra'
-  if (lower.includes('pro') || lower.includes('paid') || lower.includes('standard') || lower.includes('enterprise')) return 'pro'
+  if (lower.includes('team')) return 'team'
+  if (lower.includes('enterprise')) return 'enterprise'
+  if (lower.includes('plus')) return 'plus'
+  if (lower.includes('pro') || lower.includes('paid') || lower.includes('standard')) return 'pro'
   return 'free'
 }
 
@@ -2046,10 +2051,40 @@ function extractOAuthCallbackParam(raw: string, param: 'code' | 'state'): string
 function applyOpenAIOAuthCredentials(credentials: Record<string, string>) {
   form.access_token = credentials.access_token || ''
   form.refresh_token = credentials.refresh_token || ''
-  if (credentials.id_token) {
-    form.credential = buildCredentialWithExtras({ id_token: credentials.id_token, expires_at: credentials.expires_at, client_id: credentials.client_id })
-  } else {
-    form.credential = buildCredentialWithExtras({ expires_at: credentials.expires_at, client_id: credentials.client_id })
+  const credentialExtras: Record<string, string> = {
+    id_token: credentials.id_token,
+    expires_at: credentials.expires_at,
+    client_id: credentials.client_id,
+    email: credentials.email,
+    chatgpt_account_id: credentials.chatgpt_account_id,
+    chatgpt_user_id: credentials.chatgpt_user_id,
+    user_id: credentials.user_id,
+    organization_id: credentials.organization_id,
+    poid: credentials.poid,
+    plan_type: credentials.plan_type,
+    subscription_tier: credentials.subscription_tier,
+    subscription_expires_at: credentials.subscription_expires_at,
+    codex_usage_updated_at: credentials.codex_usage_updated_at,
+    codex_primary_used_percent: credentials.codex_primary_used_percent,
+    codex_primary_reset_after_seconds: credentials.codex_primary_reset_after_seconds,
+    codex_primary_window_minutes: credentials.codex_primary_window_minutes,
+    codex_secondary_used_percent: credentials.codex_secondary_used_percent,
+    codex_secondary_reset_after_seconds: credentials.codex_secondary_reset_after_seconds,
+    codex_secondary_window_minutes: credentials.codex_secondary_window_minutes,
+    codex_primary_over_secondary_percent: credentials.codex_primary_over_secondary_percent,
+    codex_5h_used_percent: credentials.codex_5h_used_percent,
+    codex_5h_reset_after_seconds: credentials.codex_5h_reset_after_seconds,
+    codex_5h_window_minutes: credentials.codex_5h_window_minutes,
+    codex_5h_reset_at: credentials.codex_5h_reset_at,
+    codex_7d_used_percent: credentials.codex_7d_used_percent,
+    codex_7d_reset_after_seconds: credentials.codex_7d_reset_after_seconds,
+    codex_7d_window_minutes: credentials.codex_7d_window_minutes,
+    codex_7d_reset_at: credentials.codex_7d_reset_at
+  }
+  form.credential = buildCredentialWithExtras(credentialExtras)
+  const planType = credentials.subscription_tier || credentials.plan_type
+  if (planType) {
+    form.tier = normalizedSubscriptionTier({ tier: planType, tierLabel: planType })
   }
 }
 

@@ -19,6 +19,13 @@ import (
 	"github.com/0xForce-Network/simple-sub2api/internal/tunnel"
 )
 
+type accountsResponseFixture struct {
+	Accounts []struct {
+		SubscriptionTier string                    `json:"subscription_tier"`
+		UsageInfo        map[string]map[string]any `json:"usage_info"`
+	} `json:"accounts"`
+}
+
 func TestM0SecurityBoundaries(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Dashboard.AdminPassword = "admin-secret"
@@ -769,6 +776,66 @@ func TestQueueEAccountDeleteAndRefresh(t *testing.T) {
 	}
 }
 
+func TestAccountCheckAllSyncsOpenAIAccountCoreDisplayState(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			writeFixtureJSON(t, w, map[string]any{"accounts": map[string]any{"acct": map[string]any{"account": map[string]any{"plan_type": "team", "is_default": true}}}})
+		case "/backend-api/codex/responses":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("x-codex-primary-used-percent", "91")
+			w.Header().Set("x-codex-primary-reset-after-seconds", "604800")
+			w.Header().Set("x-codex-primary-window-minutes", "10080")
+			w.Header().Set("x-codex-secondary-used-percent", "27")
+			w.Header().Set("x-codex-secondary-reset-after-seconds", "18000")
+			w.Header().Set("x-codex-secondary-window-minutes", "300")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\"}\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Accounts = []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: "access_token=chatgpt-access;refresh_token=rt-test;chatgpt_account_id=acct", Metadata: map[string]any{"platform": "openai", "account_category": "oauth-based"}, Enabled: true}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.NewWithOptions(store, slog.New(slog.NewTextHandler(io.Discard, nil)), server.Options{OpenAICodexBaseURL: upstream.URL}).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+
+	resp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/account-check", map[string]string{"Cookie": cookie.String()}, nil)
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("account-check status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	_ = resp.Body.Close()
+	accountsResp := doRequest(t, http.MethodGet, srv.URL+"/api/admin/accounts", map[string]string{"Cookie": cookie.String()}, nil)
+	if accountsResp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(accountsResp.Body)
+		t.Fatalf("accounts status = %d body=%s", accountsResp.StatusCode, string(payload))
+	}
+	var decoded accountsResponseFixture
+	if err := json.NewDecoder(accountsResp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode accounts response: %v", err)
+	}
+	if len(decoded.Accounts) != 1 {
+		t.Fatalf("accounts response length = %d", len(decoded.Accounts))
+	}
+	if decoded.Accounts[0].SubscriptionTier != "team" {
+		t.Fatalf("subscription tier = %q", decoded.Accounts[0].SubscriptionTier)
+	}
+	if got := decoded.Accounts[0].UsageInfo["five_hour"]["used_percent"]; got != float64(27) {
+		t.Fatalf("five_hour used_percent = %#v", got)
+	}
+	if got := decoded.Accounts[0].UsageInfo["seven_day"]["used_percent"]; got != float64(91) {
+		t.Fatalf("seven_day used_percent = %#v", got)
+	}
+}
+
 func TestE002AccountsCoreCRUDImportExportAndPoolDisable(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Dashboard.AdminPassword = "admin-secret"
@@ -1043,27 +1110,39 @@ func TestAccountCreateIgnoresMissingTunnelBinary(t *testing.T) {
 func TestOpenAIOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
 	var gotForm map[string]string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/oauth/token" {
+		switch r.URL.Path {
+		case "/oauth/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("parse token form: %v", err)
+			}
+			gotForm = map[string]string{
+				"grant_type":    r.Form.Get("grant_type"),
+				"client_id":     r.Form.Get("client_id"),
+				"code":          r.Form.Get("code"),
+				"redirect_uri":  r.Form.Get("redirect_uri"),
+				"code_verifier": r.Form.Get("code_verifier"),
+			}
+			writeFixtureJSON(t, w, map[string]any{
+				"access_token":  "access-from-code",
+				"refresh_token": "refresh-from-code",
+				"id_token":      "id-from-code",
+				"expires_in":    3600,
+				"token_type":    "Bearer",
+			})
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			writeFixtureJSON(t, w, map[string]any{"accounts": map[string]any{"acct": map[string]any{"account": map[string]any{"plan_type": "plus", "is_default": true}}}})
+		case "/backend-api/codex/responses":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("x-codex-primary-used-percent", "88")
+			w.Header().Set("x-codex-primary-reset-after-seconds", "604800")
+			w.Header().Set("x-codex-primary-window-minutes", "10080")
+			w.Header().Set("x-codex-secondary-used-percent", "42")
+			w.Header().Set("x-codex-secondary-reset-after-seconds", "18000")
+			w.Header().Set("x-codex-secondary-window-minutes", "300")
+			_, _ = w.Write([]byte("data: {\"type\":\"response.completed\"}\n\n"))
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		if err := r.ParseForm(); err != nil {
-			t.Fatalf("parse token form: %v", err)
-		}
-		gotForm = map[string]string{
-			"grant_type":    r.Form.Get("grant_type"),
-			"client_id":     r.Form.Get("client_id"),
-			"code":          r.Form.Get("code"),
-			"redirect_uri":  r.Form.Get("redirect_uri"),
-			"code_verifier": r.Form.Get("code_verifier"),
-		}
-		writeFixtureJSON(t, w, map[string]any{
-			"access_token":  "access-from-code",
-			"refresh_token": "refresh-from-code",
-			"id_token":      "id-from-code",
-			"expires_in":    3600,
-			"token_type":    "Bearer",
-		})
 	}))
 	defer upstream.Close()
 
@@ -1073,7 +1152,7 @@ func TestOpenAIOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMemoryStore() error = %v", err)
 	}
-	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	srv := httptest.NewServer(server.NewWithOptions(store, slog.New(slog.NewTextHandler(io.Discard, nil)), server.Options{OpenAICodexBaseURL: upstream.URL}).Handler())
 	defer srv.Close()
 	cookie := loginCookie(t, srv.URL, "admin-secret")
 	body := []byte(`{"code":"auth-code-value","state":"state-value","code_verifier":"verifier-value","redirect_uri":"http://localhost:1455/auth/callback","client_id":"app_EMoamEEZ73f0CkXaXp7hrann","token_url":"` + upstream.URL + `/oauth/token"}`)
@@ -1091,6 +1170,9 @@ func TestOpenAIOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
 	}
 	if decoded.Credentials["refresh_token"] != "refresh-from-code" || decoded.Credentials["access_token"] != "access-from-code" || decoded.Credentials["id_token"] != "id-from-code" || decoded.Credentials["client_id"] == "" || decoded.ExpiresAt == "" {
 		t.Fatalf("unexpected token bundle: %#v", decoded)
+	}
+	if decoded.Credentials["subscription_tier"] != "plus" || decoded.Credentials["codex_5h_used_percent"] != "42" || decoded.Credentials["codex_7d_used_percent"] != "88" {
+		t.Fatalf("expected plan and codex usage in token bundle: %#v", decoded.Credentials)
 	}
 	if gotForm["grant_type"] != "authorization_code" || gotForm["code"] != "auth-code-value" || gotForm["code_verifier"] != "verifier-value" || gotForm["redirect_uri"] != "http://localhost:1455/auth/callback" {
 		t.Fatalf("unexpected exchange form: %#v", gotForm)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,14 +46,21 @@ type Server struct {
 }
 
 const (
-	openAIOAuthClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
-	openAIOAuthRedirectURI = "http://localhost:1455/auth/callback"
-	openAIOAuthTokenURL    = "https://auth.openai.com/oauth/token"
+	openAIOAuthClientID          = "app_EMoamEEZ73f0CkXaXp7hrann"
+	openAIOAuthRedirectURI       = "http://localhost:1455/auth/callback"
+	openAIOAuthTokenURL          = "https://auth.openai.com/oauth/token"
+	chatGPTAccountsCheckURL      = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+	chatGPTCodexResponsesURL     = "https://chatgpt.com/backend-api/codex/responses"
+	openAICodexDefaultProbeModel = "gpt-5.4"
 )
 
+var chatGPTAccountsCheckEndpoint = chatGPTAccountsCheckURL
+var chatGPTCodexResponsesEndpoint = chatGPTCodexResponsesURL
+
 type Options struct {
-	DebugDashboard bool
-	TunnelManager  tunnel.Controller
+	DebugDashboard     bool
+	TunnelManager      tunnel.Controller
+	OpenAICodexBaseURL string
 }
 
 func New(store *config.Store, logger *slog.Logger) *Server {
@@ -78,10 +86,22 @@ func NewWithOptions(store *config.Store, logger *slog.Logger, options Options) *
 		tunnel:         tunnelManager,
 		debugDashboard: options.DebugDashboard,
 	}
+	if strings.TrimSpace(options.OpenAICodexBaseURL) != "" {
+		s.applyOpenAICodexEndpointOverride(options.OpenAICodexBaseURL)
+	}
 	if err := s.applyTunnelConfig(cfg); err != nil && logger != nil {
 		logger.Error("tunnel init failed", "error", err)
 	}
 	return s
+}
+
+func (s *Server) applyOpenAICodexEndpointOverride(baseURL string) {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmed == "" {
+		return
+	}
+	chatGPTAccountsCheckEndpoint = trimmed + "/backend-api/accounts/check/v4-2023-04-27"
+	chatGPTCodexResponsesEndpoint = trimmed + "/backend-api/codex/responses"
 }
 
 func (s *Server) Handler() http.Handler {
@@ -839,7 +859,19 @@ func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id strin
 				)
 			}
 			if displaySync.Synced {
-				cfg = replaceAccountInConfig(cfg, account)
+				if shouldPersistAccountCheckDisplaySync(account) {
+					if persisted, ok, err := s.persistAccountDisplayMetadata(account); err == nil && ok {
+						account = persisted
+						cfg = s.store.Snapshot()
+					} else {
+						if err != nil && s.logger != nil {
+							s.logger.Warn("account_refresh_display_sync_persist_failed", slog.String("account_id", account.ID), slog.String("error", err.Error()))
+						}
+						cfg = replaceAccountInConfig(cfg, account)
+					}
+				} else {
+					cfg = replaceAccountInConfig(cfg, account)
+				}
 			}
 			if s.pool != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Probe.TimeoutSeconds)*time.Second)
@@ -937,6 +969,32 @@ func (s *Server) openAIOAuthExchangeCode(w http.ResponseWriter, r *http.Request)
 	}
 	if strings.TrimSpace(token.IDToken) != "" {
 		credentials["id_token"] = strings.TrimSpace(token.IDToken)
+	}
+	if tokenClaims, err := decodeOpenAIOAuthTokenClaims(token.IDToken); err == nil {
+		applyOpenAIOAuthTokenClaims(credentials, tokenClaims)
+	}
+	if tokenClaims, err := decodeOpenAIOAuthTokenClaims(token.AccessToken); err == nil {
+		applyOpenAIOAuthTokenClaims(credentials, tokenClaims)
+	}
+	if strings.TrimSpace(token.AccessToken) != "" {
+		if plan, err := fetchChatGPTAccountPlan(r.Context(), client, token.AccessToken, firstNonEmptyString(credentials["organization_id"], credentials["poid"])); err == nil && plan.PlanType != "" {
+			credentials["plan_type"] = plan.PlanType
+			credentials["subscription_tier"] = plan.PlanType
+			if plan.SubscriptionExpiresAt != "" {
+				credentials["subscription_expires_at"] = plan.SubscriptionExpiresAt
+			}
+		} else if err != nil && s.logger != nil {
+			s.logger.Warn("openai_oauth_exchange_plan_sync_failed", slog.String("error", sanitizeDisplaySyncError(err)))
+		}
+		if codexUsage, err := fetchOpenAICodexUsageInfo(r.Context(), client, token.AccessToken, firstNonEmptyString(credentials["chatgpt_account_id"], credentials["organization_id"], credentials["poid"]), s.store.Snapshot().Probe.Model); err == nil && len(codexUsage) > 0 {
+			for key, value := range codexUsage {
+				if text := stringFromAny(value); text != "" {
+					credentials[key] = text
+				}
+			}
+		} else if err != nil && s.logger != nil {
+			s.logger.Warn("openai_oauth_exchange_codex_usage_sync_failed", slog.String("error", sanitizeDisplaySyncError(err)))
+		}
 	}
 	writeJSON(w, http.StatusOK, openAIOAuthExchangeResponse{Credentials: credentials, ExpiresAt: credentials["expires_at"]})
 }
@@ -1337,7 +1395,7 @@ func (s *Server) accountCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.store.Snapshot()
 	if r.Method == http.MethodGet {
-		writeJSON(w, http.StatusOK, accountcheck.CheckAll(r.Context(), cfg))
+		writeJSON(w, http.StatusOK, s.checkAllAccounts(r.Context(), cfg))
 		return
 	}
 	var req struct {
@@ -1348,11 +1406,69 @@ func (s *Server) accountCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, account := range cfg.Accounts {
 		if account.ID == req.AccountID {
-			writeJSON(w, http.StatusOK, accountcheck.New(cfg.Probe).Check(r.Context(), cfg, account))
+			writeJSON(w, http.StatusOK, s.checkAccountForAdmin(r.Context(), cfg, account))
 			return
 		}
 	}
 	http.Error(w, "account not found", http.StatusNotFound)
+}
+
+func (s *Server) checkAllAccounts(ctx context.Context, cfg config.Config) []accountcheck.Result {
+	checker := accountcheck.New(cfg.Probe)
+	results := make([]accountcheck.Result, 0, len(cfg.Accounts))
+	updatedCfg := cfg
+	changed := false
+	for _, account := range cfg.Accounts {
+		result, nextCfg, synced := s.checkAccountForAdminWithChecker(ctx, updatedCfg, account, checker)
+		results = append(results, result)
+		if synced {
+			updatedCfg = nextCfg
+			changed = true
+		}
+	}
+	if changed && s.pool != nil {
+		ctxApply, cancel := context.WithTimeout(context.Background(), time.Duration(updatedCfg.Probe.TimeoutSeconds)*time.Second)
+		defer cancel()
+		_ = s.pool.ApplyConfig(ctxApply, updatedCfg)
+	}
+	return results
+}
+
+func (s *Server) checkAccountForAdmin(ctx context.Context, cfg config.Config, account config.Account) accountcheck.Result {
+	result, nextCfg, synced := s.checkAccountForAdminWithChecker(ctx, cfg, account, accountcheck.New(cfg.Probe))
+	if synced && s.pool != nil {
+		ctxApply, cancel := context.WithTimeout(context.Background(), time.Duration(nextCfg.Probe.TimeoutSeconds)*time.Second)
+		defer cancel()
+		_ = s.pool.ApplyConfig(ctxApply, nextCfg)
+	}
+	return result
+}
+
+func (s *Server) checkAccountForAdminWithChecker(ctx context.Context, cfg config.Config, account config.Account, checker accountcheck.Checker) (accountcheck.Result, config.Config, bool) {
+	result := checker.Check(ctx, cfg, account)
+	displaySync := s.syncAccountDisplayState(ctx, cfg, &account)
+	if displaySync.Synced {
+		if shouldPersistAccountCheckDisplaySync(account) {
+			if persisted, ok, err := s.persistAccountDisplayMetadata(account); err == nil && ok {
+				return result, replaceAccountInConfig(s.store.Snapshot(), persisted), true
+			} else if err != nil && s.logger != nil {
+				s.logger.Warn("account_check_display_sync_persist_failed", slog.String("account_id", account.ID), slog.String("error", err.Error()))
+			}
+		}
+		return result, replaceAccountInConfig(cfg, account), true
+	}
+	return result, cfg, false
+}
+
+func shouldPersistAccountCheckDisplaySync(account config.Account) bool {
+	return config.AccountPlatform(account) == "openai" && strings.TrimSpace(account.Type) == "oauth"
+}
+
+func (s *Server) persistAccountDisplayMetadata(account config.Account) (config.Account, bool, error) {
+	if s == nil || s.store == nil || len(account.Metadata) == 0 {
+		return config.Account{}, false, nil
+	}
+	return s.store.UpdateAccountMetadata(account.ID, config.AccountMetadataUpdate{Metadata: account.Metadata})
 }
 
 func (s *Server) accountPool(w http.ResponseWriter, r *http.Request) {
@@ -1939,6 +2055,27 @@ type openAIOAuthExchangeResponse struct {
 	ExpiresAt   string            `json:"expires_at"`
 }
 
+type openAIOAuthTokenClaims struct {
+	Email      string                  `json:"email"`
+	OpenAIAuth *openAIOAuthClaimValues `json:"https://api.openai.com/auth,omitempty"`
+}
+
+type openAIOAuthClaimValues struct {
+	ChatGPTAccountID string                       `json:"chatgpt_account_id"`
+	ChatGPTUserID    string                       `json:"chatgpt_user_id"`
+	ChatGPTPlanType  string                       `json:"chatgpt_plan_type"`
+	UserID           string                       `json:"user_id"`
+	POID             string                       `json:"poid"`
+	Organizations    []openAIOAuthOrganizationJWT `json:"organizations"`
+}
+
+type openAIOAuthOrganizationJWT struct {
+	ID        string `json:"id"`
+	Role      string `json:"role"`
+	Title     string `json:"title"`
+	IsDefault bool   `json:"is_default"`
+}
+
 type openAIOAuthExchangeInput struct {
 	Code         string
 	CodeVerifier string
@@ -1996,6 +2133,10 @@ func (s *Server) accountsResponseFromConfig(cfg config.Config) accountsResponse 
 		}
 	}
 	metricSnapshot := s.metrics.Snapshot()
+	originalByID := map[string]config.Account{}
+	for _, account := range cfg.Accounts {
+		originalByID[account.ID] = account
+	}
 	summaries := make([]accountSummary, 0, len(redacted.Accounts))
 	for _, account := range redacted.Accounts {
 		summary := accountSummary{Config: account, RuntimeStatus: "unknown"}
@@ -2015,7 +2156,11 @@ func (s *Server) accountsResponseFromConfig(cfg config.Config) accountsResponse 
 		if quotaState, ok := quotaByID[account.ID]; ok {
 			summary.Quota = quotaState
 		}
-		applyDisplayState(&summary, account)
+		displayAccount := account
+		if original, ok := originalByID[account.ID]; ok {
+			displayAccount = accountWithDisplayMetadata(account, original)
+		}
+		applyDisplayState(&summary, displayAccount)
 		summary.Metrics = map[string]uint64{
 			"hits":   metricSnapshot.PerAccountHits[account.ID],
 			"errors": metricSnapshot.PerAccountErrors[account.ID],
@@ -2034,6 +2179,16 @@ func (s *Server) accountsResponseFromConfig(cfg config.Config) accountsResponse 
 		sources = append(sources, source.ID)
 	}
 	return accountsResponse{ConfigVersion: redacted.ConfigVersion, Accounts: summaries, Proxies: redacted.Proxies, Groups: redacted.Groups, QuotaPolicies: redacted.Quota.Policies, Sources: sources}
+}
+
+func accountWithDisplayMetadata(redacted config.Account, original config.Account) config.Account {
+	metadata := cloneDisplayMap(redacted.Metadata)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	applyOpenAIDisplayCredentialMetadata(metadata, original.Credential)
+	redacted.Metadata = metadata
+	return redacted
 }
 
 func applyDisplayState(summary *accountSummary, account config.Account) {
@@ -2106,13 +2261,40 @@ func (s *Server) syncAccountDisplayState(ctx context.Context, cfg config.Config,
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
+	applyOpenAIDisplayCredentialMetadata(metadata, account.Credential)
 	result := accountDisplaySyncResult{Message: "display sync completed", Synced: true, CredentialSource: credentialSource}
-	if tier, err := fetchOpenAISubscriptionTier(ctx, client, accessToken); err == nil && tier != "" {
+	if plan, err := fetchChatGPTAccountPlan(ctx, client, accessToken, firstMetadataString(metadata, []string{"organization_id", "org_id", "poid"}, "")); err == nil && plan.PlanType != "" {
+		metadata["subscription_tier"] = plan.PlanType
+		metadata["plan_type"] = plan.PlanType
+		if plan.SubscriptionExpiresAt != "" {
+			metadata["subscription_expires_at"] = plan.SubscriptionExpiresAt
+		}
+		result.Tier = plan.PlanType
+	} else if err != nil {
+		result.SubscriptionErr = sanitizeDisplaySyncError(err)
+		metadata["display_sync_subscription_error"] = result.SubscriptionErr
+	} else if tier, err := fetchOpenAISubscriptionTier(ctx, client, accessToken); err == nil && tier != "" {
 		metadata["subscription_tier"] = tier
 		result.Tier = tier
 	} else if err != nil {
 		result.SubscriptionErr = sanitizeDisplaySyncError(err)
 		metadata["display_sync_subscription_error"] = result.SubscriptionErr
+	}
+	if credentialSource == "access_token" {
+		if codexUsage, err := fetchOpenAICodexUsageInfo(ctx, client, accessToken, credentialValue(account.Credential, "chatgpt_account_id"), cfg.Probe.Model); err == nil && len(codexUsage) > 0 {
+			for key, value := range codexUsage {
+				metadata[key] = value
+			}
+			if usageInfo := usageInfoFromCodexMetadata(codexUsage); len(usageInfo) > 0 {
+				metadata["usage_info"] = usageInfo
+				result.UsageInfoKeys = sortedMapKeys(usageInfo)
+			}
+			account.Metadata = metadata
+			return result
+		} else if err != nil {
+			result.UsageErr = sanitizeDisplaySyncError(err)
+			metadata["display_sync_usage_error"] = result.UsageErr
+		}
 	}
 	if usageInfo, err := fetchOpenAIUsageInfo(ctx, client, accessToken); err == nil && len(usageInfo) > 0 {
 		metadata["usage_info"] = usageInfo
@@ -2123,6 +2305,11 @@ func (s *Server) syncAccountDisplayState(ctx context.Context, cfg config.Config,
 	}
 	account.Metadata = metadata
 	return result
+}
+
+type chatGPTAccountPlan struct {
+	PlanType              string
+	SubscriptionExpiresAt string
 }
 
 func sortedMapKeys(values map[string]any) []string {
@@ -2159,6 +2346,119 @@ func fetchOpenAISubscriptionTier(ctx context.Context, client *http.Client, acces
 	return normalizeSubscriptionTier(subscriptionTierFromPayload(payload)), nil
 }
 
+func fetchChatGPTAccountPlan(ctx context.Context, client *http.Client, accessToken string, orgID string) (chatGPTAccountPlan, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, chatGPTAccountsCheckEndpoint, nil)
+	if err != nil {
+		return chatGPTAccountPlan{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("Origin", "https://chatgpt.com")
+	request.Header.Set("Referer", "https://chatgpt.com/")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "Mozilla/5.0 simple-sub2api")
+	response, err := client.Do(request)
+	if err != nil {
+		return chatGPTAccountPlan{}, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return chatGPTAccountPlan{}, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return chatGPTAccountPlan{}, fmt.Errorf("HTTP %d", response.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return chatGPTAccountPlan{}, err
+	}
+	plan := chatGPTAccountPlanFromPayload(payload, orgID)
+	if plan.PlanType == "" {
+		return chatGPTAccountPlan{}, nil
+	}
+	return plan, nil
+}
+
+func decodeOpenAIOAuthTokenClaims(token string) (openAIOAuthTokenClaims, error) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 {
+		return openAIOAuthTokenClaims{}, fmt.Errorf("invalid JWT format: expected 3 parts, got %d", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(padBase64URL(parts[1]))
+	}
+	if err != nil {
+		payload, err = base64.StdEncoding.DecodeString(padBase64URL(parts[1]))
+	}
+	if err != nil {
+		return openAIOAuthTokenClaims{}, err
+	}
+	var claims openAIOAuthTokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return openAIOAuthTokenClaims{}, err
+	}
+	return claims, nil
+}
+
+func padBase64URL(value string) string {
+	switch len(value) % 4 {
+	case 2:
+		return value + "=="
+	case 3:
+		return value + "="
+	default:
+		return value
+	}
+}
+
+func applyOpenAIOAuthTokenClaims(credentials map[string]string, claims openAIOAuthTokenClaims) {
+	if credentials == nil {
+		return
+	}
+	setCredentialIfNotEmpty(credentials, "email", claims.Email)
+	if claims.OpenAIAuth == nil {
+		return
+	}
+	setCredentialIfNotEmpty(credentials, "chatgpt_account_id", claims.OpenAIAuth.ChatGPTAccountID)
+	setCredentialIfNotEmpty(credentials, "chatgpt_user_id", claims.OpenAIAuth.ChatGPTUserID)
+	setCredentialIfNotEmpty(credentials, "user_id", claims.OpenAIAuth.UserID)
+	setCredentialIfNotEmpty(credentials, "poid", claims.OpenAIAuth.POID)
+	if strings.TrimSpace(claims.OpenAIAuth.ChatGPTPlanType) != "" {
+		credentials["plan_type"] = strings.TrimSpace(claims.OpenAIAuth.ChatGPTPlanType)
+		credentials["subscription_tier"] = strings.TrimSpace(claims.OpenAIAuth.ChatGPTPlanType)
+	}
+	orgID := ""
+	for _, org := range claims.OpenAIAuth.Organizations {
+		if strings.TrimSpace(org.ID) != "" && org.IsDefault {
+			orgID = strings.TrimSpace(org.ID)
+			break
+		}
+	}
+	if orgID == "" && len(claims.OpenAIAuth.Organizations) > 0 {
+		orgID = strings.TrimSpace(claims.OpenAIAuth.Organizations[0].ID)
+	}
+	setCredentialIfNotEmpty(credentials, "organization_id", firstNonEmptyString(orgID, claims.OpenAIAuth.POID))
+}
+
+func setCredentialIfNotEmpty(credentials map[string]string, key string, value string) {
+	if strings.TrimSpace(value) != "" {
+		credentials[key] = strings.TrimSpace(value)
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func fetchOpenAIUsageInfo(ctx context.Context, client *http.Client, accessToken string) (map[string]any, error) {
 	body, err := postJSONWithBearer(ctx, client, "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels", accessToken, map[string]any{})
 	if err != nil {
@@ -2169,6 +2469,259 @@ func fetchOpenAIUsageInfo(ctx context.Context, client *http.Client, accessToken 
 		return nil, err
 	}
 	return usageInfoFromQuotaModels(payload), nil
+}
+
+func fetchOpenAICodexUsageInfo(ctx context.Context, client *http.Client, accessToken string, accountID string, model string) (map[string]any, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	body, err := json.Marshal(openAICodexProbePayload(model))
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, chatGPTCodexResponsesEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Host = "chatgpt.com"
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	request.Header.Set("OpenAI-Beta", "responses=experimental")
+	request.Header.Set("originator", "codex_cli_rs")
+	request.Header.Set("Version", "0.125.0")
+	request.Header.Set("User-Agent", "codex_cli_rs/0.125.0")
+	if strings.TrimSpace(accountID) != "" {
+		request.Header.Set("chatgpt-account-id", strings.TrimSpace(accountID))
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	updates := openAICodexUsageMetadataFromHeaders(response.Header, time.Now().UTC())
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
+	if len(updates) > 0 {
+		return updates, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", response.StatusCode)
+	}
+	return nil, nil
+}
+
+func openAICodexProbePayload(model string) map[string]any {
+	probeModel := strings.TrimSpace(model)
+	if probeModel == "" || !strings.Contains(strings.ToLower(probeModel), "gpt-5") {
+		probeModel = openAICodexDefaultProbeModel
+	}
+	return map[string]any{
+		"model": probeModel,
+		"input": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": "hi",
+			}},
+		}},
+		"stream":       true,
+		"store":        false,
+		"instructions": "You are a helpful assistant.",
+	}
+}
+
+type openAICodexHeaderSnapshot struct {
+	PrimaryUsedPercent          *float64
+	PrimaryResetAfterSeconds    *int
+	PrimaryWindowMinutes        *int
+	SecondaryUsedPercent        *float64
+	SecondaryResetAfterSeconds  *int
+	SecondaryWindowMinutes      *int
+	PrimaryOverSecondaryPercent *float64
+	UpdatedAt                   string
+}
+
+type openAICodexNormalizedLimits struct {
+	Used5hPercent   *float64
+	Reset5hSeconds  *int
+	Window5hMinutes *int
+	Used7dPercent   *float64
+	Reset7dSeconds  *int
+	Window7dMinutes *int
+}
+
+func openAICodexUsageMetadataFromHeaders(headers http.Header, now time.Time) map[string]any {
+	snapshot := parseOpenAICodexUsageHeaders(headers, now)
+	if snapshot == nil {
+		return nil
+	}
+	baseTime := now.UTC()
+	if parsed, err := time.Parse(time.RFC3339, snapshot.UpdatedAt); err == nil {
+		baseTime = parsed.UTC()
+	}
+	updates := map[string]any{"codex_usage_updated_at": baseTime.Format(time.RFC3339)}
+	if snapshot.PrimaryUsedPercent != nil {
+		updates["codex_primary_used_percent"] = *snapshot.PrimaryUsedPercent
+	}
+	if snapshot.PrimaryResetAfterSeconds != nil {
+		updates["codex_primary_reset_after_seconds"] = *snapshot.PrimaryResetAfterSeconds
+	}
+	if snapshot.PrimaryWindowMinutes != nil {
+		updates["codex_primary_window_minutes"] = *snapshot.PrimaryWindowMinutes
+	}
+	if snapshot.SecondaryUsedPercent != nil {
+		updates["codex_secondary_used_percent"] = *snapshot.SecondaryUsedPercent
+	}
+	if snapshot.SecondaryResetAfterSeconds != nil {
+		updates["codex_secondary_reset_after_seconds"] = *snapshot.SecondaryResetAfterSeconds
+	}
+	if snapshot.SecondaryWindowMinutes != nil {
+		updates["codex_secondary_window_minutes"] = *snapshot.SecondaryWindowMinutes
+	}
+	if snapshot.PrimaryOverSecondaryPercent != nil {
+		updates["codex_primary_over_secondary_percent"] = *snapshot.PrimaryOverSecondaryPercent
+	}
+	if normalized := snapshot.normalize(); normalized != nil {
+		if normalized.Used5hPercent != nil {
+			updates["codex_5h_used_percent"] = *normalized.Used5hPercent
+		}
+		if normalized.Reset5hSeconds != nil {
+			updates["codex_5h_reset_after_seconds"] = *normalized.Reset5hSeconds
+			updates["codex_5h_reset_at"] = codexResetAt(baseTime, *normalized.Reset5hSeconds)
+		}
+		if normalized.Window5hMinutes != nil {
+			updates["codex_5h_window_minutes"] = *normalized.Window5hMinutes
+		}
+		if normalized.Used7dPercent != nil {
+			updates["codex_7d_used_percent"] = *normalized.Used7dPercent
+		}
+		if normalized.Reset7dSeconds != nil {
+			updates["codex_7d_reset_after_seconds"] = *normalized.Reset7dSeconds
+			updates["codex_7d_reset_at"] = codexResetAt(baseTime, *normalized.Reset7dSeconds)
+		}
+		if normalized.Window7dMinutes != nil {
+			updates["codex_7d_window_minutes"] = *normalized.Window7dMinutes
+		}
+	}
+	return updates
+}
+
+func parseOpenAICodexUsageHeaders(headers http.Header, now time.Time) *openAICodexHeaderSnapshot {
+	if headers == nil {
+		return nil
+	}
+	snapshot := &openAICodexHeaderSnapshot{UpdatedAt: now.UTC().Format(time.RFC3339)}
+	hasData := false
+	parseFloat := func(key string) *float64 {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+				return &parsed
+			}
+		}
+		return nil
+	}
+	parseInt := func(key string) *int {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			if parsed, err := strconv.Atoi(value); err == nil {
+				return &parsed
+			}
+		}
+		return nil
+	}
+	if value := parseFloat("x-codex-primary-used-percent"); value != nil {
+		snapshot.PrimaryUsedPercent = value
+		hasData = true
+	}
+	if value := parseInt("x-codex-primary-reset-after-seconds"); value != nil {
+		snapshot.PrimaryResetAfterSeconds = value
+		hasData = true
+	}
+	if value := parseInt("x-codex-primary-window-minutes"); value != nil {
+		snapshot.PrimaryWindowMinutes = value
+		hasData = true
+	}
+	if value := parseFloat("x-codex-secondary-used-percent"); value != nil {
+		snapshot.SecondaryUsedPercent = value
+		hasData = true
+	}
+	if value := parseInt("x-codex-secondary-reset-after-seconds"); value != nil {
+		snapshot.SecondaryResetAfterSeconds = value
+		hasData = true
+	}
+	if value := parseInt("x-codex-secondary-window-minutes"); value != nil {
+		snapshot.SecondaryWindowMinutes = value
+		hasData = true
+	}
+	if value := parseFloat("x-codex-primary-over-secondary-limit-percent"); value != nil {
+		snapshot.PrimaryOverSecondaryPercent = value
+		hasData = true
+	}
+	if !hasData {
+		return nil
+	}
+	return snapshot
+}
+
+func (snapshot *openAICodexHeaderSnapshot) normalize() *openAICodexNormalizedLimits {
+	if snapshot == nil {
+		return nil
+	}
+	result := &openAICodexNormalizedLimits{}
+	primaryMins, secondaryMins := 0, 0
+	hasPrimaryWindow, hasSecondaryWindow := false, false
+	if snapshot.PrimaryWindowMinutes != nil {
+		primaryMins = *snapshot.PrimaryWindowMinutes
+		hasPrimaryWindow = true
+	}
+	if snapshot.SecondaryWindowMinutes != nil {
+		secondaryMins = *snapshot.SecondaryWindowMinutes
+		hasSecondaryWindow = true
+	}
+	use5hFromPrimary, use7dFromPrimary := false, false
+	if hasPrimaryWindow && hasSecondaryWindow {
+		if primaryMins < secondaryMins {
+			use5hFromPrimary = true
+		} else {
+			use7dFromPrimary = true
+		}
+	} else if hasPrimaryWindow {
+		if primaryMins <= 360 {
+			use5hFromPrimary = true
+		} else {
+			use7dFromPrimary = true
+		}
+	} else if hasSecondaryWindow {
+		if secondaryMins <= 360 {
+			use7dFromPrimary = true
+		} else {
+			use5hFromPrimary = true
+		}
+	} else {
+		use7dFromPrimary = true
+	}
+	if use5hFromPrimary {
+		result.Used5hPercent = snapshot.PrimaryUsedPercent
+		result.Reset5hSeconds = snapshot.PrimaryResetAfterSeconds
+		result.Window5hMinutes = snapshot.PrimaryWindowMinutes
+		result.Used7dPercent = snapshot.SecondaryUsedPercent
+		result.Reset7dSeconds = snapshot.SecondaryResetAfterSeconds
+		result.Window7dMinutes = snapshot.SecondaryWindowMinutes
+	} else if use7dFromPrimary {
+		result.Used7dPercent = snapshot.PrimaryUsedPercent
+		result.Reset7dSeconds = snapshot.PrimaryResetAfterSeconds
+		result.Window7dMinutes = snapshot.PrimaryWindowMinutes
+		result.Used5hPercent = snapshot.SecondaryUsedPercent
+		result.Reset5hSeconds = snapshot.SecondaryResetAfterSeconds
+		result.Window5hMinutes = snapshot.SecondaryWindowMinutes
+	}
+	return result
+}
+
+func codexResetAt(base time.Time, resetAfterSeconds int) string {
+	if resetAfterSeconds < 0 {
+		resetAfterSeconds = 0
+	}
+	return base.UTC().Add(time.Duration(resetAfterSeconds) * time.Second).Format(time.RFC3339)
 }
 
 func postJSONWithBearer(ctx context.Context, client *http.Client, url string, token string, payload any) ([]byte, error) {
@@ -2216,6 +2769,74 @@ func subscriptionTierFromPayload(payload map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func chatGPTAccountPlanFromPayload(payload map[string]any, orgID string) chatGPTAccountPlan {
+	accounts, ok := payload["accounts"].(map[string]any)
+	if !ok || len(accounts) == 0 {
+		return chatGPTAccountPlan{}
+	}
+	if strings.TrimSpace(orgID) != "" {
+		if raw, ok := accounts[strings.TrimSpace(orgID)]; ok {
+			if plan := chatGPTAccountPlanFromAccount(raw); plan.PlanType != "" {
+				return plan
+			}
+		}
+	}
+	type candidate struct {
+		plan     chatGPTAccountPlan
+		priority int
+		sequence int
+	}
+	best := candidate{priority: -1, sequence: int(^uint(0) >> 1)}
+	sequence := 0
+	for _, raw := range accounts {
+		sequence++
+		plan := chatGPTAccountPlanFromAccount(raw)
+		if plan.PlanType == "" {
+			continue
+		}
+		priority := 0
+		lower := strings.ToLower(plan.PlanType)
+		if lower != "free" {
+			priority = 1
+		}
+		if account, ok := raw.(map[string]any); ok {
+			if nested, ok := account["account"].(map[string]any); ok && metadataBool(nested, "is_default") {
+				priority = 2
+			}
+		}
+		if priority > best.priority || (priority == best.priority && sequence < best.sequence) {
+			best = candidate{plan: plan, priority: priority, sequence: sequence}
+		}
+	}
+	return best.plan
+}
+
+func chatGPTAccountPlanFromAccount(raw any) chatGPTAccountPlan {
+	acct, ok := raw.(map[string]any)
+	if !ok {
+		return chatGPTAccountPlan{}
+	}
+	plan := chatGPTAccountPlan{PlanType: extractChatGPTPlanType(acct)}
+	if entitlement, ok := acct["entitlement"].(map[string]any); ok {
+		plan.SubscriptionExpiresAt = firstMetadataString(entitlement, []string{"expires_at", "expiresAt"}, "")
+	}
+	return plan
+}
+
+func extractChatGPTPlanType(acct map[string]any) string {
+	if account, ok := acct["account"].(map[string]any); ok {
+		if planType := firstMetadataString(account, []string{"plan_type", "planType"}, ""); planType != "" {
+			return planType
+		}
+	}
+	if entitlement, ok := acct["entitlement"].(map[string]any); ok {
+		if planType := firstMetadataString(entitlement, []string{"subscription_plan", "subscriptionPlan", "plan_type", "planType"}, ""); planType != "" {
+			return planType
+		}
+	}
+	return firstMetadataString(acct, []string{"plan_type", "planType", "subscription_plan", "subscriptionPlan"}, "")
 }
 
 func tierName(value any) string {
@@ -2387,7 +3008,60 @@ func sanitizeDisplaySyncError(err error) string {
 	return message
 }
 
+func applyOpenAIDisplayCredentialMetadata(metadata map[string]any, credential string) {
+	if metadata == nil || strings.TrimSpace(credential) == "" {
+		return
+	}
+	for _, key := range []string{
+		"email",
+		"chatgpt_account_id",
+		"chatgpt_user_id",
+		"user_id",
+		"organization_id",
+		"poid",
+		"plan_type",
+		"subscription_tier",
+		"subscription_expires_at",
+		"codex_usage_updated_at",
+		"codex_primary_used_percent",
+		"codex_primary_reset_after_seconds",
+		"codex_primary_window_minutes",
+		"codex_secondary_used_percent",
+		"codex_secondary_reset_after_seconds",
+		"codex_secondary_window_minutes",
+		"codex_primary_over_secondary_percent",
+		"codex_5h_used_percent",
+		"codex_5h_reset_after_seconds",
+		"codex_5h_window_minutes",
+		"codex_5h_reset_at",
+		"codex_7d_used_percent",
+		"codex_7d_reset_after_seconds",
+		"codex_7d_window_minutes",
+		"codex_7d_reset_at",
+	} {
+		value := credentialValue(credential, key)
+		if value == "" {
+			continue
+		}
+		if strings.Contains(key, "percent") || strings.Contains(key, "seconds") || strings.Contains(key, "minutes") {
+			if parsed, err := json.Number(value).Float64(); err == nil {
+				metadata[key] = parsed
+				continue
+			}
+		}
+		metadata[key] = value
+	}
+	if _, ok := metadata["usage_info"].(map[string]any); !ok {
+		if usageInfo := usageInfoFromCodexMetadata(metadata); len(usageInfo) > 0 {
+			metadata["usage_info"] = usageInfo
+		}
+	}
+}
+
 func usageInfoFromQuotaAndMetadata(quotaState map[string]any, metadata map[string]any) map[string]any {
+	if usageInfo := usageInfoFromCodexMetadata(metadata); len(usageInfo) > 0 {
+		return usageInfo
+	}
 	fiveHourUsed := firstFloatFromMaps([]map[string]any{metadata, quotaState}, []string{"window_cost_used", "session_window_cost_used"})
 	fiveHourLimit := firstFloatFromMaps([]map[string]any{metadata, quotaState}, []string{"window_cost_limit", "session_window_cost_limit"})
 	weeklyUsed := firstFloatFromMaps([]map[string]any{quotaState, metadata}, []string{"weekly_used_tokens", "quota_weekly_used"})
@@ -2400,6 +3074,52 @@ func usageInfoFromQuotaAndMetadata(quotaState map[string]any, metadata map[strin
 		usageInfo["seven_day"] = usageWindow("7d", weeklyUsed, weeklyLimit, firstMetadataString(metadata, []string{"quota_weekly_reset_at", "weekly_reset_at"}, ""))
 	}
 	return usageInfo
+}
+
+func usageInfoFromCodexMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	usageInfo := map[string]any{}
+	if usedPercent := firstFloatFromMaps([]map[string]any{metadata}, []string{"codex_5h_used_percent"}); usedPercent > 0 || hasAnyMetadataKey(metadata, "codex_5h_used_percent", "codex_5h_reset_at", "codex_5h_reset_after_seconds") {
+		usageInfo["five_hour"] = codexUsageWindow("5h", usedPercent, firstMetadataString(metadata, []string{"codex_5h_reset_at"}, ""), firstFloatFromMaps([]map[string]any{metadata}, []string{"codex_5h_reset_after_seconds"}))
+	}
+	if usedPercent := firstFloatFromMaps([]map[string]any{metadata}, []string{"codex_7d_used_percent"}); usedPercent > 0 || hasAnyMetadataKey(metadata, "codex_7d_used_percent", "codex_7d_reset_at", "codex_7d_reset_after_seconds") {
+		usageInfo["seven_day"] = codexUsageWindow("7d", usedPercent, firstMetadataString(metadata, []string{"codex_7d_reset_at"}, ""), firstFloatFromMaps([]map[string]any{metadata}, []string{"codex_7d_reset_after_seconds"}))
+	}
+	return usageInfo
+}
+
+func codexUsageWindow(label string, usedPercent float64, resetAt string, resetAfterSeconds float64) map[string]any {
+	if usedPercent < 0 {
+		usedPercent = 0
+	}
+	if usedPercent > 100 {
+		usedPercent = 100
+	}
+	window := map[string]any{
+		"label":        label,
+		"utilization":  usedPercent,
+		"used_percent": usedPercent,
+	}
+	if resetAt != "" {
+		window["reset_at"] = resetAt
+		window["reset_time"] = resetAt
+	}
+	if resetAfterSeconds != 0 {
+		window["reset_after_seconds"] = resetAfterSeconds
+		window["remaining_seconds"] = resetAfterSeconds
+	}
+	return window
+}
+
+func hasAnyMetadataKey(metadata map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := metadata[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func usageWindow(label string, used float64, limit float64, resetAt string) map[string]any {
@@ -2507,7 +3227,13 @@ func normalizeSubscriptionTier(raw string) string {
 	switch {
 	case strings.Contains(lower, "ultra"):
 		return "ultra"
-	case strings.Contains(lower, "pro") || strings.Contains(lower, "paid") || strings.Contains(lower, "standard") || strings.Contains(lower, "enterprise") || strings.Contains(lower, "team") || strings.Contains(lower, "plus"):
+	case strings.Contains(lower, "team"):
+		return "team"
+	case strings.Contains(lower, "enterprise"):
+		return "enterprise"
+	case strings.Contains(lower, "plus"):
+		return "plus"
+	case strings.Contains(lower, "pro") || strings.Contains(lower, "paid") || strings.Contains(lower, "standard"):
 		return "pro"
 	default:
 		return "free"
