@@ -132,7 +132,7 @@ func TestGroupRotationPolicyDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("EnsureDefaultsAndSecrets() error = %v", err)
 	}
 	policy := cfg.Groups[0].RotationPolicy
-	if policy.Strategy != "polling" || policy.StickyHeader != "X-Session-ID" || policy.CooldownDurationSeconds != 60 || policy.MinQuotaThresholdPercent != 0.10 || len(policy.RotateErrorCodes) != 5 {
+	if policy.Strategy != "polling" || policy.StickyHeader != "X-Session-ID" || !policy.RetryOnErrors || policy.CooldownDurationSeconds != 60 || policy.MinQuotaThresholdPercent != 0.10 || len(policy.RotateErrorCodes) != 5 {
 		t.Fatalf("rotation defaults = %#v", policy)
 	}
 	if err := Validate(cfg); err != nil {

@@ -36,7 +36,6 @@ type Store interface {
 
 const permanentFailureStrikeLimit = 3
 const openAIClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
-const openAIRefreshScopes = "openid profile email"
 const openAITokenURL = "https://auth.openai.com/oauth/token"
 
 var cooldownCountdownPattern = regexp.MustCompile(`(?i)(?:try again|retry|available|reset)[^\n\r]{0,80}\b(?:in|after)\s+(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:ute)?s?)?)?\s*(?:(\d+)\s*s(?:ec(?:ond)?s?)?)?`)
@@ -138,6 +137,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		matchedKey = config.GatewayKey{ID: "legacy", RoutingPolicy: config.KeyRoutingPolicy{Mode: "all_enabled"}}
 	}
+	normalizeGatewayRequestPath(r)
 	if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses" {
 		h.logAPIDebugRequest(r, matchedKey, nil, upstreamcompat.ChatCompletionRequest{}, errors.New("gateway route not found"))
 		writeOpenAIError(w, http.StatusNotFound, "gateway route not found", "not_found_error", "route_not_found")
@@ -199,7 +199,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.Pool.DecrementActiveConn(activeAccountID)
 			active = false
 			excluded[account.ID] = true
-			h.cooldownWithGroupReason(account.ID, group, 0, "upstream_request_failed", http.StatusBadGateway)
+			if shouldCooldownUpstreamFailure(requestPath, err) {
+				h.cooldownWithGroupReason(account.ID, group, 0, "upstream_request_failed", http.StatusBadGateway)
+			}
 			h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "upstream request failed")
 			lastErr = err
 			continue
@@ -219,7 +221,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					h.Pool.DecrementActiveConn(activeAccountID)
 					active = false
 					excluded[account.ID] = true
-					h.cooldownWithGroupReason(account.ID, group, 0, "upstream_request_failed", http.StatusBadGateway)
+					if shouldCooldownUpstreamFailure(requestPath, err) {
+						h.cooldownWithGroupReason(account.ID, group, 0, "upstream_request_failed", http.StatusBadGateway)
+					}
 					h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, http.StatusBadGateway, false, "upstream request failed")
 					lastErr = err
 					continue
@@ -265,7 +269,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.persistOpenAICodexUsageSnapshot(account, resp.Header)
 		if parsed.Stream {
-			h.writeStream(w, resp, state.AccountID, matchedKey, parsed.Model, taskType)
+			h.writeStream(w, r, resp, state.AccountID, matchedKey, parsed.Model, taskType)
 			h.Pool.DecrementActiveConn(activeAccountID)
 			active = false
 			_ = resp.Body.Close()
@@ -527,7 +531,6 @@ func refreshOpenAIAccessToken(ctx context.Context, client *http.Client, tokenURL
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("client_id", clientID)
-	form.Set("scope", openAIRefreshScopes)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return openAITokenRefreshResponse{}, err
@@ -617,6 +620,21 @@ func shouldRotateAttemptStatus(requestPath string, account config.Account, statu
 
 func shouldRefreshOpenAIOAuthAfterAuthFailure(requestPath string, account config.Account, statusCode int) bool {
 	return upstreamcompat.IsOpenAIOAuthAccount(account) && requestPath == "/v1/responses" && isPermanentCredentialFailure(statusCode) && credentialValue(account.Credential, "refresh_token") != ""
+}
+
+func shouldCooldownUpstreamFailure(requestPath string, err error) bool {
+	if requestPath == "/v1/responses" && isTransientTLSFailure(err) {
+		return false
+	}
+	return true
+}
+
+func isTransientTLSFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "tls: bad record mac") || strings.Contains(message, "tls: record header error") || strings.Contains(message, "tls: unexpected message") || strings.Contains(message, "malformed http") || strings.Contains(message, "unexpected eof")
 }
 
 func extractSessionID(r *http.Request, group *config.Group) string {
@@ -733,7 +751,15 @@ func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, acco
 	_, _ = w.Write(body)
 }
 
-func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
+func (h Handler) writeStream(w http.ResponseWriter, r *http.Request, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
+	if shouldPassthroughResponsesSSE(r) {
+		h.writeResponsesStreamPassthrough(w, resp, accountID, key, model, taskType)
+		return
+	}
+	h.writeReencodedStream(w, resp, accountID, key, model, taskType)
+}
+
+func (h Handler) writeReencodedStream(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -758,6 +784,95 @@ func (h Handler) writeStream(w http.ResponseWriter, resp *http.Response, account
 		flusher.Flush()
 	}
 	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, true, "")
+}
+
+func (h Handler) writeResponsesStreamPassthrough(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
+	copySafeHeaders(w.Header(), resp.Header)
+	w.Header().Set("Content-Type", contentType(resp.Header.Get("Content-Type"), "text/event-stream"))
+	if strings.TrimSpace(w.Header().Get("Cache-Control")) == "" {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(resp.StatusCode)
+	flusher, _ := w.(http.Flusher)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = copyStreamWithFlush(w, resp.Body, flusher)
+		h.recordRequest(accountID, key, model, taskType, resp.StatusCode, false, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
+		return
+	}
+	if _, err := copyStreamWithFlush(w, resp.Body, flusher); err != nil {
+		h.recordRequest(accountID, key, model, taskType, http.StatusBadGateway, false, "upstream stream passthrough failed")
+		return
+	}
+	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, true, "")
+}
+
+func shouldPassthroughResponsesSSE(r *http.Request) bool {
+	if r == nil || r.URL == nil || r.URL.Path != "/v1/responses" {
+		return false
+	}
+	if headerContainsAnyFold(r.Header, "Originator", "codex-tui", "codex_cli_rs") {
+		return true
+	}
+	if headerContainsAnyFold(r.Header, "User-Agent", "codex-tui", "codex_cli_rs") {
+		return true
+	}
+	if headerContainsAnyFold(r.Header, "Originator", "roo-code", "cline") {
+		return true
+	}
+	if headerContainsAnyFold(r.Header, "User-Agent", "roo-code", "cline") {
+		return true
+	}
+	for key := range r.Header {
+		if strings.HasPrefix(http.CanonicalHeaderKey(key), "X-Stainless-") {
+			return true
+		}
+	}
+	return false
+}
+
+func headerContainsAnyFold(header http.Header, key string, needles ...string) bool {
+	if header == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(header.Get(key)))
+	if value == "" {
+		return false
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, strings.ToLower(strings.TrimSpace(needle))) {
+			return true
+		}
+	}
+	return false
+}
+
+func copyStreamWithFlush(dst io.Writer, src io.Reader, flusher http.Flusher) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			nw, writeErr := dst.Write(chunk)
+			written += int64(nw)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if nw != n {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
 }
 
 func (h Handler) persistOpenAICodexUsageSnapshot(account config.Account, headers http.Header) {
@@ -1257,6 +1372,18 @@ func copySafeHeaders(dst http.Header, src http.Header) {
 		for _, value := range values {
 			dst.Add(canonical, value)
 		}
+	}
+}
+
+func normalizeGatewayRequestPath(r *http.Request) {
+	if r == nil || r.URL == nil {
+		return
+	}
+	switch r.URL.Path {
+	case "/v1/v1/chat/completions":
+		r.URL.Path = "/v1/chat/completions"
+	case "/v1/v1/responses":
+		r.URL.Path = "/v1/responses"
 	}
 }
 

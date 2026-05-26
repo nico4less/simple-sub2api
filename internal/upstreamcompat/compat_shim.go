@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -14,6 +16,23 @@ import (
 const defaultUserAgent = "simple-sub2api-gateway/1.0"
 const codexCLIUserAgent = "codex_cli_rs/0.125.0"
 const chatGPTCodexResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
+
+var openAIChatGPTInternalUnsupportedFields = []string{
+	"user",
+	"metadata",
+	"prompt_cache_retention",
+	"safety_identifier",
+	"stream_options",
+}
+
+var openAICodexOAuthUnsupportedFields = append([]string{
+	"max_output_tokens",
+	"max_completion_tokens",
+	"temperature",
+	"top_p",
+	"frequency_penalty",
+	"presence_penalty",
+}, openAIChatGPTInternalUnsupportedFields...)
 
 var upstreamHeaderAllowlist = map[string]struct{}{
 	"Accept":          {},
@@ -44,11 +63,15 @@ var upstreamHeaderAllowlist = map[string]struct{}{
 }
 
 func BuildUpstreamRequest(base *http.Request, account config.Account, body []byte) (*http.Request, error) {
-	requestURL, err := AccountUpstreamURL(account, base.URL.Path)
+	useOfficialResponsesAPI := shouldUseOfficialResponsesAPIForOAuth(base, account)
+	requestURL, err := AccountUpstreamURL(account, base.URL.Path, useOfficialResponsesAPI)
 	if err != nil {
 		return nil, err
 	}
 	body = normalizeAnthropicBillingHeader(body, base.Header.Get("User-Agent"))
+	if IsOpenAIOAuthAccount(account) && !useOfficialResponsesAPI {
+		body = normalizeOpenAIOAuthResponsesBody(base, body)
+	}
 	request, err := http.NewRequestWithContext(base.Context(), http.MethodPost, requestURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -66,14 +89,19 @@ func BuildUpstreamRequest(base *http.Request, account config.Account, body []byt
 	if key := APIKeyFromCredential(account.Credential); key != "" {
 		request.Header.Set("Authorization", "Bearer "+key)
 	}
-	if IsOpenAIOAuthAccount(account) {
+	if IsOpenAIOAuthAccount(account) && !useOfficialResponsesAPI {
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		request.ContentLength = int64(len(body))
 		applyOpenAIOAuthCodexHeaders(request, base, account, body)
 	}
 	return request, nil
 }
 
-func AccountUpstreamURL(account config.Account, endpointPath string) (string, error) {
+func AccountUpstreamURL(account config.Account, endpointPath string, useOfficialResponsesAPI bool) (string, error) {
 	if IsOpenAIOAuthAccount(account) {
+		if useOfficialResponsesAPI {
+			return OpenAIAPIURL(account.BaseURL, endpointPath)
+		}
 		return OpenAIOAuthCodexURL(account.BaseURL, endpointPath)
 	}
 	return OpenAIAPIURL(account.BaseURL, endpointPath)
@@ -122,20 +150,131 @@ func applyOpenAIOAuthCodexHeaders(request *http.Request, base *http.Request, acc
 	if !isCodexCLIUserAgent(request.Header.Get("User-Agent")) {
 		request.Header.Set("User-Agent", codexCLIUserAgent)
 	}
-	if strings.TrimSpace(request.Header.Get("Accept")) == "" || strings.EqualFold(strings.TrimSpace(request.Header.Get("Accept")), "application/json") {
+	if shouldSetCodexAcceptHeader(request.Header.Get("Accept")) {
 		request.Header.Set("Accept", codexAcceptHeader(base, body))
 	}
 	applyIsolatedCodexSessionHeaders(request, base, body)
 }
 
 func codexAcceptHeader(base *http.Request, body []byte) string {
-	if base != nil && strings.TrimSpace(base.URL.Path) == "/v1/responses" {
-		return "application/json"
-	}
-	if strings.Contains(string(body), `"stream"`) && strings.Contains(string(body), "true") {
+	if bodyRequestsStream(body) {
 		return "text/event-stream"
 	}
 	return "application/json"
+}
+
+func shouldSetCodexAcceptHeader(value string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	if trimmed == "" {
+		return true
+	}
+	return trimmed == "application/json" || trimmed == "*/*"
+}
+
+func bodyRequestsStream(body []byte) bool {
+	text := string(body)
+	return strings.Contains(text, `"stream"`) && strings.Contains(text, "true")
+}
+
+func shouldUseOfficialResponsesAPIForOAuth(base *http.Request, account config.Account) bool {
+	if !IsOpenAIOAuthAccount(account) || base == nil || base.URL == nil || strings.TrimSpace(base.URL.Path) != "/v1/responses" {
+		return false
+	}
+	if wantsCodexInternalResponses(base, account) {
+		return false
+	}
+	return false
+}
+
+func wantsCodexInternalResponses(base *http.Request, account config.Account) bool {
+	if forcesCodexInternalResponses(account) {
+		return true
+	}
+	if isCodexOfficialClientByHeaders(base.Header.Get("User-Agent"), base.Header.Get("Originator")) {
+		return true
+	}
+	if isOpenAIResponsesOAuthScopeFailureProneClient(base) {
+		return true
+	}
+	return false
+}
+
+func isOpenAIResponsesOAuthScopeFailureProneClient(base *http.Request) bool {
+	if base == nil {
+		return false
+	}
+	if headerContainsAnyFold(base.Header, "Originator", "roo-code", "cline") {
+		return true
+	}
+	if headerContainsAnyFold(base.Header, "User-Agent", "roo-code", "cline") {
+		return true
+	}
+	return false
+}
+
+func forcesCodexInternalResponses(account config.Account) bool {
+	if credentialValue(account.Credential, "force_codex_responses") == "true" {
+		return true
+	}
+	if credentialValue(account.Credential, "force_codex_responses") == "1" {
+		return true
+	}
+	if credentialValue(account.Credential, "force_codex_internal") == "true" {
+		return true
+	}
+	if credentialValue(account.Credential, "force_codex_internal") == "1" {
+		return true
+	}
+	return false
+}
+
+func headerContainsAnyFold(header http.Header, key string, needles ...string) bool {
+	if header == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(header.Get(key)))
+	if value == "" {
+		return false
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, strings.ToLower(strings.TrimSpace(needle))) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeOpenAIOAuthResponsesBody(base *http.Request, body []byte) []byte {
+	if base == nil || base.URL == nil || strings.TrimSpace(base.URL.Path) != "/v1/responses" || len(body) == 0 {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	modified := false
+	for _, key := range openAICodexOAuthUnsupportedFields {
+		if _, ok := payload[key]; ok {
+			delete(payload, key)
+			modified = true
+		}
+	}
+	if store, ok := payload["store"].(bool); !ok || store {
+		payload["store"] = false
+		modified = true
+	}
+	if stream, ok := payload["stream"].(bool); !ok || !stream {
+		payload["stream"] = true
+		modified = true
+	}
+	if !modified {
+		return body
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return normalized
 }
 
 func applyIsolatedCodexSessionHeaders(request *http.Request, base *http.Request, body []byte) {
@@ -200,8 +339,43 @@ func isolateSessionID(seed string) string {
 }
 
 func isCodexCLIUserAgent(userAgent string) bool {
-	lower := strings.ToLower(strings.TrimSpace(userAgent))
-	return strings.Contains(lower, "codex_cli_rs") || strings.Contains(lower, "codex-cli")
+	return matchesCodexClientPrefixes(userAgent, []string{
+		"codex_cli_rs/",
+		"codex_vscode/",
+		"codex_app/",
+		"codex_chatgpt_desktop/",
+		"codex_atlas/",
+		"codex_exec/",
+		"codex_sdk_ts/",
+		"codex ",
+		"codex-cli",
+		"codex-tui",
+	})
+}
+
+func isCodexOfficialClientByHeaders(userAgent string, originator string) bool {
+	return isCodexCLIUserAgent(userAgent) || isCodexOfficialClientOriginator(originator)
+}
+
+func isCodexOfficialClientOriginator(originator string) bool {
+	return matchesCodexClientPrefixes(originator, []string{"codex_", "codex "})
+}
+
+func matchesCodexClientPrefixes(value string, prefixes []string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	for _, prefix := range prefixes {
+		normalized := strings.ToLower(strings.TrimSpace(prefix))
+		if normalized == "" {
+			continue
+		}
+		if strings.HasPrefix(lower, normalized) || strings.Contains(lower, normalized) {
+			return true
+		}
+	}
+	return false
 }
 
 func copyUpstreamProtocolHeaders(dst http.Header, src http.Header) {

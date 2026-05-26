@@ -694,6 +694,9 @@ func ensureGroupRotationDefaults(policy *GroupRotationPolicy) {
 	if len(policy.RotateErrorCodes) == 0 {
 		policy.RotateErrorCodes = []int{429, 401, 403, 404, 500}
 	}
+	if !policy.RetryOnErrors && len(policy.RotateErrorCodes) == 5 && policy.RotateErrorCodes[0] == 429 && policy.RotateErrorCodes[1] == 401 && policy.RotateErrorCodes[2] == 403 && policy.RotateErrorCodes[3] == 404 && policy.RotateErrorCodes[4] == 500 {
+		policy.RetryOnErrors = true
+	}
 	if policy.CooldownDurationSeconds == 0 {
 		policy.CooldownDurationSeconds = 60
 	}

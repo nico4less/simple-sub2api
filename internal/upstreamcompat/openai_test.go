@@ -1,6 +1,7 @@
 package upstreamcompat_test
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"regexp"
@@ -97,6 +98,126 @@ func TestBuildUpstreamRequestPreservesResponsesEndpoint(t *testing.T) {
 	}
 }
 
+func TestBuildUpstreamRequestUsesCodexInternalForRooOpenAIOAuth(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	base.Header.Set("Accept", "*/*")
+	base.Header.Set("User-Agent", "roo-code/3.53.0")
+	base.Header.Set("Originator", "roo-code")
+	base.Header.Set("X-Stainless-Lang", "js")
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access;chatgpt_account_id=chatgpt-acc", Metadata: map[string]any{"platform": "openai"}}, []byte(`{"model":"gpt-test","input":"hi","stream":true,"max_output_tokens":4096}`))
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	if got, want := request.URL.String(), "https://chatgpt.com/backend-api/codex/responses"; got != want {
+		t.Fatalf("upstream URL = %q, want %q", got, want)
+	}
+	if got := request.Host; got != "chatgpt.com" {
+		t.Fatalf("Host = %q, want chatgpt.com", got)
+	}
+	if got := request.Header.Get("Authorization"); got != "Bearer oauth-access" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := request.Header.Get("User-Agent"); got != "codex_cli_rs/0.125.0" {
+		t.Fatalf("User-Agent = %q", got)
+	}
+	if got := request.Header.Get("Originator"); got != "codex_cli_rs" {
+		t.Fatalf("Originator = %q", got)
+	}
+	if got := request.Header.Get("OpenAI-Beta"); got != "responses=experimental" {
+		t.Fatalf("OpenAI-Beta = %q", got)
+	}
+	if got := request.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept = %q", got)
+	}
+	gotBody, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if strings.Contains(string(gotBody), `"max_output_tokens"`) {
+		t.Fatalf("codex internal body should strip max_output_tokens: %s", string(gotBody))
+	}
+}
+
+func TestBuildUpstreamRequestCanForceCodexInternalForRooOpenAIOAuth(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	base.Header.Set("Accept", "*/*")
+	base.Header.Set("User-Agent", "roo-code/3.53.0")
+	base.Header.Set("Originator", "roo-code")
+	base.Header.Set("X-Stainless-Lang", "js")
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access;force_codex_responses=true", Metadata: map[string]any{"platform": "openai"}}, []byte(`{"model":"gpt-test","input":"hi","stream":true,"max_output_tokens":4096}`))
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	if got, want := request.URL.String(), "https://chatgpt.com/backend-api/codex/responses"; got != want {
+		t.Fatalf("upstream URL = %q, want %q", got, want)
+	}
+	if got := request.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept = %q", got)
+	}
+	gotBody, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if strings.Contains(string(gotBody), `"max_output_tokens"`) {
+		t.Fatalf("forced codex body still contains unsupported max_output_tokens: %s", string(gotBody))
+	}
+}
+
+func TestBuildUpstreamRequestTreatsCodexOriginatorAsInternalClient(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	base.Header.Set("Accept", "*/*")
+	base.Header.Set("User-Agent", "openai-node/4.0.0")
+	base.Header.Set("Originator", "codex_cli_rs")
+	base.Header.Set("X-Stainless-Lang", "js")
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access", Metadata: map[string]any{"platform": "openai"}}, []byte(`{"model":"gpt-test","input":"hi","stream":true}`))
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	if got, want := request.URL.String(), "https://chatgpt.com/backend-api/codex/responses"; got != want {
+		t.Fatalf("upstream URL = %q, want %q", got, want)
+	}
+}
+
+func TestBuildUpstreamRequestNormalizesCodexInternalBodyLikeUpstream(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	body := []byte(`{"model":"gpt-test","input":"hi","stream":false,"store":true,"max_output_tokens":4096,"max_completion_tokens":4096,"temperature":0.2,"top_p":0.9,"frequency_penalty":1,"presence_penalty":1,"user":"u","metadata":{"user_id":"u"},"prompt_cache_retention":"24h","safety_identifier":"sid","stream_options":{"include_usage":true}}`)
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access", Metadata: map[string]any{"platform": "openai"}}, body)
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	gotBody, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "temperature", "top_p", "frequency_penalty", "presence_penalty", "user", "metadata", "prompt_cache_retention", "safety_identifier", "stream_options"} {
+		if _, ok := payload[key]; ok {
+			t.Fatalf("%s should be stripped for Codex internal path: %s", key, string(gotBody))
+		}
+	}
+	if got := payload["store"]; got != false {
+		t.Fatalf("store = %#v", got)
+	}
+	if got := payload["stream"]; got != true {
+		t.Fatalf("stream = %#v", got)
+	}
+}
+
 func TestBuildUpstreamRequestUsesChatGPTCodexForOpenAIOAuth(t *testing.T) {
 	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
 	if err != nil {
@@ -136,6 +257,47 @@ func TestBuildUpstreamRequestUsesChatGPTCodexForOpenAIOAuth(t *testing.T) {
 	}
 	if got := request.Header.Get("conversation_id"); got == "" || got == "client-conversation" {
 		t.Fatalf("conversation_id was not isolated: %q", got)
+	}
+}
+
+func TestBuildUpstreamRequestUsesStreamingAcceptForOpenAIOAuthResponses(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	base.Header.Set("Accept", "*/*")
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access", Metadata: map[string]any{"platform": "openai"}}, []byte(`{"model":"gpt-test","input":"hi","stream":true}`))
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	if got := request.Header.Get("Accept"); got != "text/event-stream" {
+		t.Fatalf("Accept = %q", got)
+	}
+}
+
+func TestBuildUpstreamRequestStripsUnsupportedMaxOutputTokensForOpenAIOAuthResponses(t *testing.T) {
+	base, err := http.NewRequest(http.MethodPost, "http://localhost/v1/responses", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	body := []byte(`{"model":"gpt-test","input":"hi","stream":true,"max_output_tokens":4096}`)
+	request, err := upstreamcompat.BuildUpstreamRequest(base, config.Account{Type: "oauth", BaseURL: "https://api.openai.com/v1", Credential: "access_token=oauth-access", Metadata: map[string]any{"platform": "openai"}}, body)
+	if err != nil {
+		t.Fatalf("BuildUpstreamRequest() error = %v", err)
+	}
+	gotBody, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if _, ok := payload["max_output_tokens"]; ok {
+		t.Fatalf("max_output_tokens should be stripped: %s", string(gotBody))
+	}
+	if got := payload["stream"]; got != true {
+		t.Fatalf("stream = %#v", got)
 	}
 }
 

@@ -94,6 +94,161 @@ func TestResponsesGatewayForCodexClient(t *testing.T) {
 	}
 }
 
+func TestResponsesGatewayNormalizesDuplicatedV1Prefix(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			gotPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_test","object":"response","output_text":"ok","usage":{"total_tokens":11}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	resp := doGatewayRequest(t, srv.URL+"/v1/v1/responses", store.GatewayKey(), []byte(`{"model":"gpt-test","input":"who are you"}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want %q", gotPath, "/v1/responses")
+	}
+}
+
+func TestChatCompletionsGatewayNormalizesDuplicatedV1Prefix(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/chat/completions":
+			gotPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[],"usage":{"total_tokens":17}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	resp := doGatewayRequest(t, srv.URL+"/v1/v1/chat/completions", store.GatewayKey(), []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if gotPath != "/v1/chat/completions" {
+		t.Fatalf("upstream path = %q, want %q", gotPath, "/v1/chat/completions")
+	}
+}
+
+func TestResponsesStreamingGatewayReencodesForDefaultClients(t *testing.T) {
+	upstreamBody := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(upstreamBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	resp := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), []byte(`{"model":"gpt-test","input":"who are you","stream":true}`))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	body := string(payload)
+	if strings.Contains(body, "event: response.output_text.delta") {
+		t.Fatalf("default responses stream unexpectedly preserved raw event frames: %q", body)
+	}
+	if !strings.Contains(body, `data: {"type":"response.output_text.delta","delta":"ok"}`) {
+		t.Fatalf("reencoded responses stream missing delta payload: %q", body)
+	}
+	if !strings.Contains(body, `data: {"type":"response.completed"}`) {
+		t.Fatalf("reencoded responses stream missing completed payload: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("reencoded responses stream missing done sentinel: %q", body)
+	}
+}
+
+func TestResponsesStreamingGatewayPassthroughsForRooClient(t *testing.T) {
+	upstreamBody := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("X-Upstream-Trace", "roo-stream")
+			_, _ = w.Write([]byte(upstreamBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", bytes.NewReader([]byte(`{"model":"gpt-test","input":"who are you","stream":true}`)))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "roo-code/3.18.4")
+	req.Header.Set("Originator", "roo-code")
+	req.Header.Set("X-Stainless-Lang", "js")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := resp.Header.Get("X-Upstream-Trace"); got != "roo-stream" {
+		t.Fatalf("X-Upstream-Trace = %q", got)
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	body := string(payload)
+	if body != upstreamBody {
+		t.Fatalf("passthrough body = %q, want %q", body, upstreamBody)
+	}
+	if strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("passthrough responses stream appended unexpected done sentinel: %q", body)
+	}
+}
+
 func TestChatCompletionsDoesNotLeakLocalMetadataUpstream(t *testing.T) {
 	seen := make(chan http.Header, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +423,48 @@ func TestGatewayUpstreamErrorTriggersCooldown(t *testing.T) {
 	}
 }
 
+func TestResponsesTransientTLSFailureDoesNotCooldownAccount(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			requestCount++
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("response writer is not hijackable")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack() error = %v", err)
+			}
+			_, _ = conn.Write([]byte("\x16\x03\x03\x00\x01\x00"))
+			_ = conn.Close()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServer(t, upstream.URL)
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","input":"who are you","stream":true}`)
+	first := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+	_ = first.Body.Close()
+	if first.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want %d", first.StatusCode, http.StatusServiceUnavailable)
+	}
+	second := doGatewayRequest(t, srv.URL+"/v1/responses", store.GatewayKey(), body)
+	_ = second.Body.Close()
+	if second.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want %d", second.StatusCode, http.StatusServiceUnavailable)
+	}
+	if requestCount != 2 {
+		t.Fatalf("upstream request count = %d, want 2; account was likely cooldowned", requestCount)
+	}
+}
+
 func TestGatewayFailoverRotatesWithinGroupOnConfiguredStatus(t *testing.T) {
 	seen := []string{}
 	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -300,6 +497,51 @@ func TestGatewayFailoverRotatesWithinGroupOnConfiguredStatus(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Simple-Sub2API-Account"); got != "acct_2" {
+		t.Fatalf("selected account = %q, want acct_2", got)
+	}
+	if got := resp.Header.Get("X-Simple-Sub2API-Attempts"); got != "2" {
+		t.Fatalf("attempts = %q, want 2", got)
+	}
+	if strings.Join(seen, ",") != "a,b" {
+		t.Fatalf("upstream call order = %#v", seen)
+	}
+}
+
+func TestGatewayFailoverRotatesWithinGroupWhenDefaultPolicyOmitted(t *testing.T) {
+	seen := []string{}
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+			return
+		}
+		seen = append(seen, "a")
+		http.Error(w, `{"error":{"message":"rate limited"}}`, http.StatusTooManyRequests)
+	}))
+	defer upstreamA.Close()
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+			return
+		}
+		seen = append(seen, "b")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[],"usage":{"total_tokens":1}}`))
+	}))
+	defer upstreamB.Close()
+
+	srv, store := gatewayServerWithAccounts(t, []config.Account{
+		{ID: "acct_1", Type: "openai_api_key", Label: "A", Tier: "simple", Credential: "api_key=sk-a", BaseURL: upstreamA.URL, Enabled: true},
+		{ID: "acct_2", Type: "openai_api_key", Label: "B", Tier: "simple", Credential: "api_key=sk-b", BaseURL: upstreamB.URL, Enabled: true},
+	}, config.GroupRotationPolicy{})
+	defer srv.Close()
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	resp := doGatewayRequest(t, srv.URL+"/v1/chat/completions", store.GatewayKey(), body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
 	}
 	if got := resp.Header.Get("X-Simple-Sub2API-Account"); got != "acct_2" {
 		t.Fatalf("selected account = %q, want acct_2", got)
@@ -475,6 +717,9 @@ func TestOAuthRefreshRequiresRetryAndReenablesDisabledRuntimeAccount(t *testing.
 			if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "rt-test" {
 				t.Fatalf("unexpected refresh form: %#v", r.Form)
 			}
+			if got := r.Form.Get("scope"); got != "" {
+				t.Fatalf("refresh scope should be omitted to preserve granted API scopes, got %q", got)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"access_token":"refreshed-token","refresh_token":"rt-new","expires_in":3600,"token_type":"Bearer"}`))
 		default:
@@ -568,6 +813,208 @@ func TestOpenAIOAuthResponsesUsesCodexInternalEndpointAndHeaders(t *testing.T) {
 	}
 }
 
+func TestOpenAIOAuthResponsesGenericCodexPathUsesEventStreamAcceptAndReencodes(t *testing.T) {
+	requestCount := 0
+	upstreamBody := "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/backend-api/codex/responses":
+			requestCount++
+			if got := r.Header.Get("Accept"); got != "text/event-stream" {
+				t.Fatalf("Accept = %q", got)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll() error = %v", err)
+			}
+			if strings.Contains(string(body), `"max_output_tokens"`) {
+				t.Fatalf("upstream body still contains unsupported max_output_tokens: %s", string(body))
+			}
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			_, _ = w.Write([]byte(upstreamBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", bytes.NewReader([]byte(`{"model":"gpt-test","input":"who are you","stream":true,"max_output_tokens":4096}`)))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("User-Agent", "OpenAI/Python 1.2.3")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	body := string(payload)
+	if strings.Contains(body, "event: response.created") {
+		t.Fatalf("codex path should reencode instead of preserving raw events: %q", body)
+	}
+	if !strings.Contains(body, `data: {"type":"response.created"}`) {
+		t.Fatalf("reencoded body missing response.created payload: %q", body)
+	}
+	if !strings.Contains(body, `data: {"type":"response.completed"}`) {
+		t.Fatalf("reencoded body missing response.completed payload: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("reencoded body missing done sentinel: %q", body)
+	}
+	if requestCount != 1 {
+		t.Fatalf("codex upstream request count = %d, want 1", requestCount)
+	}
+}
+
+func TestOpenAIOAuthResponsesCodexTUIUsesRawResponsesStreamPassthrough(t *testing.T) {
+	requestCount := 0
+	upstreamBody := "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/backend-api/codex/responses":
+			requestCount++
+			if got := r.Header.Get("Accept"); got != "text/event-stream" {
+				t.Fatalf("Accept = %q", got)
+			}
+			if got := r.Header.Get("User-Agent"); !strings.Contains(got, "codex-tui") {
+				t.Fatalf("User-Agent = %q", got)
+			}
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			_, _ = w.Write([]byte(upstreamBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", bytes.NewReader([]byte(`{"model":"gpt-test","input":"who are you","stream":true}`)))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("User-Agent", "codex-tui/0.133.0")
+	req.Header.Set("Originator", "codex-tui")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(payload) != upstreamBody {
+		t.Fatalf("codex tui passthrough body = %q, want %q", string(payload), upstreamBody)
+	}
+	if requestCount != 1 {
+		t.Fatalf("codex upstream request count = %d, want 1", requestCount)
+	}
+}
+
+func TestOpenAIOAuthResponsesRooUsesCodexInternalEndpoint(t *testing.T) {
+	officialRequestCount := 0
+	codexRequestCount := 0
+	upstreamBody := "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/responses":
+			officialRequestCount++
+			http.Error(w, "should not hit official responses endpoint for roo oauth", http.StatusBadRequest)
+		case "/backend-api/codex/responses":
+			codexRequestCount++
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll() error = %v", err)
+			}
+			if strings.Contains(string(body), `"max_output_tokens"`) {
+				t.Fatalf("codex internal body still contains unsupported max_output_tokens: %s", string(body))
+			}
+			if got := r.Header.Get("Accept"); got != "text/event-stream" {
+				t.Fatalf("Accept = %q", got)
+			}
+			if got := r.Header.Get("Originator"); got != "codex_cli_rs" {
+				t.Fatalf("Originator = %q", got)
+			}
+			if got := r.Header.Get("User-Agent"); got != "codex_cli_rs/0.125.0" {
+				t.Fatalf("User-Agent = %q", got)
+			}
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			_, _ = w.Write([]byte(upstreamBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "access_token=oauth-access;refresh_token=rt-test;expires_at=2099-01-01T00:00:00Z"
+	srv, store := gatewayServerWithAccounts(t, []config.Account{{ID: "acct_oauth", Type: "oauth", Label: "OAuth", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "openai"}, Enabled: true}}, config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{401}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1})
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", bytes.NewReader([]byte(`{"model":"gpt-test","input":"who are you","stream":true,"max_output_tokens":4096}`)))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("User-Agent", "roo-code/3.53.0")
+	req.Header.Set("Originator", "roo-code")
+	req.Header.Set("X-Stainless-Lang", "js")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(payload) != upstreamBody {
+		t.Fatalf("passthrough body = %q, want %q", string(payload), upstreamBody)
+	}
+	if officialRequestCount != 0 {
+		t.Fatalf("official upstream request count = %d, want 0", officialRequestCount)
+	}
+	if codexRequestCount != 1 {
+		t.Fatalf("codex upstream request count = %d, want 1", codexRequestCount)
+	}
+}
+
 func TestOpenAIOAuthResponsesUnauthorizedDoesNotAutoDisableOrCooldownAccount(t *testing.T) {
 	requestCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -627,6 +1074,9 @@ func TestOpenAIOAuthResponsesRefreshesAfterUnauthorizedWithoutCooldown(t *testin
 			}
 			if r.Form.Get("refresh_token") != "rt-test" {
 				t.Fatalf("refresh_token = %q", r.Form.Get("refresh_token"))
+			}
+			if got := r.Form.Get("scope"); got != "" {
+				t.Fatalf("refresh scope should be omitted to preserve granted API scopes, got %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"access_token":"refreshed-token","refresh_token":"rt-new","expires_in":3600,"token_type":"Bearer"}`))
