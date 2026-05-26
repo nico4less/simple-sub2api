@@ -37,6 +37,7 @@ func main() {
 	adminPassword := flag.String("admin-password", "", "dashboard admin password; required for LAN bind")
 	corsOrigins := flag.String("cors-origins", "", "comma-separated explicit CORS origins; empty keeps CORS closed")
 	debugDashboard := flag.Bool("debug-dashboard", false, "explicitly enable admin-only sanitized dashboard debug snapshot output")
+	debugAPI := flag.Bool("debug-api", false, "enable sanitized gateway API request debug logs for compatibility diagnosis")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -90,9 +91,10 @@ func main() {
 		slog.Bool("allow_lan", cfg.Server.AllowLAN),
 		slog.Bool("cors_enabled", len(cfg.Server.CORSAllowedOrigins) > 0),
 		slog.Bool("debug_dashboard", debugDashboardEnabled(*debugDashboard)),
+		slog.Bool("debug_api", debugAPIEnabled(*debugAPI)),
 	)
 
-	app := server.NewWithOptions(store, logger, server.Options{DebugDashboard: debugDashboardEnabled(*debugDashboard)})
+	app := server.NewWithOptions(store, logger, server.Options{DebugDashboard: debugDashboardEnabled(*debugDashboard), DebugAPI: debugAPIEnabled(*debugAPI)})
 	httpServer := &http.Server{Addr: cfg.Server.Bind, Handler: app.Handler()}
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
@@ -144,6 +146,14 @@ func debugDashboardEnabled(flagValue bool) bool {
 		return true
 	}
 	value := strings.TrimSpace(strings.ToLower(os.Getenv("SIMPLE_SUB2API_DEBUG_DASHBOARD")))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func debugAPIEnabled(flagValue bool) bool {
+	if flagValue {
+		return true
+	}
+	value := strings.TrimSpace(strings.ToLower(os.Getenv("SIMPLE_SUB2API_DEBUG_API")))
 	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 

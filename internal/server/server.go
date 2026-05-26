@@ -43,6 +43,7 @@ type Server struct {
 	metrics        *metrics.Recorder
 	tunnel         tunnel.Controller
 	debugDashboard bool
+	debugAPI       bool
 }
 
 const (
@@ -59,6 +60,7 @@ var chatGPTCodexResponsesEndpoint = chatGPTCodexResponsesURL
 
 type Options struct {
 	DebugDashboard     bool
+	DebugAPI           bool
 	TunnelManager      tunnel.Controller
 	OpenAICodexBaseURL string
 }
@@ -85,6 +87,7 @@ func NewWithOptions(store *config.Store, logger *slog.Logger, options Options) *
 		metrics:        metrics.NewRecorder(cfg.Metrics.RecentErrorsLimit),
 		tunnel:         tunnelManager,
 		debugDashboard: options.DebugDashboard,
+		debugAPI:       options.DebugAPI,
 	}
 	if strings.TrimSpace(options.OpenAICodexBaseURL) != "" {
 		s.applyOpenAICodexEndpointOverride(options.OpenAICodexBaseURL)
@@ -258,7 +261,7 @@ func (s *Server) v1Gateway(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
 		return
 	}
-	gateway.Handler{Store: s.store, Pool: s.pool, Metrics: s.metrics, Logger: s.logger}.ServeHTTP(w, r)
+	gateway.Handler{Store: s.store, Pool: s.pool, Metrics: s.metrics, Logger: s.logger, DebugAPI: s.debugAPI}.ServeHTTP(w, r)
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {

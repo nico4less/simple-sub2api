@@ -126,37 +126,42 @@ func (s *openAICodexUsageSnapshot) normalize() *normalizedCodexLimits {
 }
 
 type Handler struct {
-	Store   Store
-	Pool    *accountpool.Manager
-	Metrics *metrics.Recorder
-	Logger  *slog.Logger
+	Store    Store
+	Pool     *accountpool.Manager
+	Metrics  *metrics.Recorder
+	Logger   *slog.Logger
+	DebugAPI bool
 }
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	matchedKey, ok := gatewayauth.MatchedGatewayKey(r)
+	if !ok {
+		matchedKey = config.GatewayKey{ID: "legacy", RoutingPolicy: config.KeyRoutingPolicy{Mode: "all_enabled"}}
+	}
 	if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses" {
+		h.logAPIDebugRequest(r, matchedKey, nil, upstreamcompat.ChatCompletionRequest{}, errors.New("gateway route not found"))
 		writeOpenAIError(w, http.StatusNotFound, "gateway route not found", "not_found_error", "route_not_found")
 		return
 	}
 	if r.Method != http.MethodPost {
+		h.logAPIDebugRequest(r, matchedKey, nil, upstreamcompat.ChatCompletionRequest{}, errors.New("method not allowed"))
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "method_not_allowed")
 		return
 	}
 	if h.Pool == nil {
+		h.logAPIDebugRequest(r, matchedKey, nil, upstreamcompat.ChatCompletionRequest{}, errors.New("account pool unavailable"))
 		writeOpenAIError(w, http.StatusServiceUnavailable, "account pool unavailable", "server_error", "account_pool_unavailable")
 		return
 	}
 	requestPath := r.URL.Path
 	parsed, body, err := upstreamcompat.ParseChatCompletionRequest(r.Body, 4<<20)
+	h.logAPIDebugRequest(r, matchedKey, body, parsed, err)
 	if err != nil {
-		h.recordRequest("", config.GatewayKey{}, "", "", http.StatusBadRequest, false, err.Error())
+		h.recordRequest("", matchedKey, "", "", http.StatusBadRequest, false, err.Error())
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_request")
 		return
 	}
 	cfg := h.Store.Snapshot()
-	matchedKey, ok := gatewayauth.MatchedGatewayKey(r)
-	if !ok {
-		matchedKey = config.GatewayKey{ID: "legacy", RoutingPolicy: config.KeyRoutingPolicy{Mode: "all_enabled"}}
-	}
 	taskType := taskTypeFromRequest(r, parsed)
 	decision := routing.Decide(cfg.Routing, routing.Request{TaskType: taskType, Model: parsed.Model, Tags: tagsFromRequest(r)})
 	h.touchKey(matchedKey)

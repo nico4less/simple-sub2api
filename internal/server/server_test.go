@@ -1179,6 +1179,78 @@ func TestOpenAIOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
 	}
 }
 
+func TestAPIDebugLoggingCapturesRequestShapeWithoutLeakingSecrets(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-debug","choices":[],"usage":{"total_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	const upstreamSecret = "sk-upstream-debug-secret"
+	const promptSecret = "super-secret prompt from cline"
+	var logBuffer bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuffer, nil))
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Accounts = []config.Account{{
+		ID:         "acct_debug",
+		Type:       "openai_api_key",
+		Label:      "Debug Account",
+		Tier:       "simple",
+		Credential: "api_key=" + upstreamSecret,
+		BaseURL:    upstream.URL,
+		Enabled:    true,
+	}}
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.NewWithOptions(store, logger, server.Options{DebugAPI: true}).Handler())
+	defer srv.Close()
+
+	body := []byte(`{"model":"gpt-4.1","messages":[{"role":"user","content":"` + promptSecret + `"}],"stream":true,"metadata":{"source":"roo-cline"}}`)
+	resp := doRequest(t, http.MethodPost, srv.URL+"/v1/chat/completions", map[string]string{
+		"Authorization":  "Bearer " + store.GatewayKey(),
+		"User-Agent":     "Cline/3.19.2",
+		"OpenAI-Beta":    "assistants=v2",
+		"X-Cline-Client": "roo-cline",
+	}, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("debug request status = %d", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, `"msg":"gateway_api_debug_request"`) {
+		t.Fatalf("expected debug log event, got %s", logs)
+	}
+	for _, expected := range []string{
+		`"path":"/v1/chat/completions"`,
+		`"authorization_scheme":"Bearer"`,
+		`"json_valid":true`,
+		`"parsed_messages_count":1`,
+		`"json_top_level_keys":["messages","metadata","model","stream"]`,
+		`"X-Cline-Client":"roo-cline"`,
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Fatalf("expected log fragment %q in %s", expected, logs)
+		}
+	}
+	for _, forbidden := range []string{store.GatewayKey(), upstreamSecret, promptSecret} {
+		if strings.Contains(logs, forbidden) {
+			t.Fatalf("debug log leaked secret %q in %s", forbidden, logs)
+		}
+	}
+}
+
 func assertStatus(t *testing.T, method string, url string, headers map[string]string, body []byte, want int) {
 	t.Helper()
 	resp := doRequest(t, method, url, headers, body)

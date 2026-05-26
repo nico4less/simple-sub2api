@@ -35,21 +35,21 @@ func ParseChatCompletionRequest(r io.Reader, maxBytes int64) (ChatCompletionRequ
 		return ChatCompletionRequest{}, nil, err
 	}
 	if int64(len(body)) > maxBytes {
-		return ChatCompletionRequest{}, nil, errors.New("request body too large")
+		return ChatCompletionRequest{}, body, errors.New("request body too large")
 	}
 	var req ChatCompletionRequest
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	if err := decoder.Decode(&req); err != nil {
-		return ChatCompletionRequest{}, nil, fmt.Errorf("invalid JSON request: %w", err)
+		return ChatCompletionRequest{}, body, fmt.Errorf("invalid JSON request: %w", err)
 	}
 	if decoder.Decode(&struct{}{}) != io.EOF {
-		return ChatCompletionRequest{}, nil, errors.New("request must contain a single JSON object")
+		return ChatCompletionRequest{}, body, errors.New("request must contain a single JSON object")
 	}
 	if strings.TrimSpace(req.Model) == "" {
-		return ChatCompletionRequest{}, nil, errors.New("model is required")
+		return ChatCompletionRequest{}, body, errors.New("model is required")
 	}
 	if len(req.Messages) == 0 && len(req.Input) == 0 {
-		return ChatCompletionRequest{}, nil, errors.New("messages or input are required")
+		return ChatCompletionRequest{}, body, errors.New("messages or input are required")
 	}
 	return req, body, nil
 }
