@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -152,6 +154,367 @@ func TestChatCompletionsGatewayNormalizesDuplicatedV1Prefix(t *testing.T) {
 	}
 }
 
+func TestAnthropicMessagesGatewayForClaudeCLIApiKeyAccount(t *testing.T) {
+	var gotPath string
+	var gotQuery string
+	var gotAuth string
+	var gotAPIKey string
+	var gotVersion string
+	var gotBeta string
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			gotPath = r.URL.Path
+			gotQuery = r.URL.RawQuery
+			gotAuth = r.Header.Get("Authorization")
+			gotAPIKey = r.Header.Get("X-Api-Key")
+			gotVersion = r.Header.Get("Anthropic-Version")
+			gotBeta = r.Header.Get("Anthropic-Beta")
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upstream body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":7,"output_tokens":3}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "openai_compatible", Label: "Claude", Tier: "simple", Credential: "api_key=sk-ant-upstream", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", config.GroupRotationPolicy{Strategy: "polling", RetryOnErrors: false})
+	defer srv.Close()
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":false}`)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/v1/messages?beta=true", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Anthropic-Beta", "claude-code-20250219")
+	req.Header.Set("User-Agent", "claude-cli/2.1.126 (external, cli)")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if gotPath != "/v1/messages" || gotQuery != "beta=true" {
+		t.Fatalf("upstream target = %q?%q, want /v1/messages?beta=true", gotPath, gotQuery)
+	}
+	if gotAuth != "" || gotAPIKey != "sk-ant-upstream" {
+		t.Fatalf("upstream auth headers Authorization=%q X-Api-Key=%q", gotAuth, gotAPIKey)
+	}
+	if gotVersion != "2023-06-01" || gotBeta != "claude-code-20250219" {
+		t.Fatalf("anthropic headers version=%q beta=%q", gotVersion, gotBeta)
+	}
+	if string(gotBody) != string(body) {
+		t.Fatalf("upstream body = %q, want %q", string(gotBody), string(body))
+	}
+}
+
+func TestAnthropicMessagesGatewayForClaudeCLIOAuthAccount(t *testing.T) {
+	var gotAuth string
+	var gotAPIKey string
+	var gotBeta string
+	var gotQuery string
+	var gotUserAgent string
+	var gotXApp string
+	var gotStainlessLang string
+	var gotStainlessPackage string
+	var gotClientRequestID string
+	var gotSessionHeader string
+	var gotAcceptEncoding string
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			gotAuth = r.Header.Get("Authorization")
+			gotAPIKey = r.Header.Get("X-Api-Key")
+			gotBeta = r.Header.Get("Anthropic-Beta")
+			gotQuery = r.URL.RawQuery
+			gotUserAgent = r.Header.Get("User-Agent")
+			gotXApp = r.Header.Get("X-App")
+			gotStainlessLang = r.Header.Get("X-Stainless-Lang")
+			gotStainlessPackage = r.Header.Get("X-Stainless-Package-Version")
+			gotClientRequestID = r.Header.Get("X-Client-Request-Id")
+			gotSessionHeader = r.Header.Get("X-Claude-Code-Session-Id")
+			gotAcceptEncoding = r.Header.Get("Accept-Encoding")
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upstream body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":7,"output_tokens":3}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "simple", Credential: "access_token=claude-oauth-access;account_uuid=acct-upstream-uuid", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", config.GroupRotationPolicy{Strategy: "polling", RetryOnErrors: false})
+	defer srv.Close()
+	bodyPayload := map[string]any{
+		"model":      "claude-sonnet-4-6",
+		"max_tokens": 64,
+		"messages":   []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "who are you"}}}},
+		"stream":     false,
+		"metadata":   map[string]any{"user_id": `user_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef_account_old-account_session_11111111-2222-3333-4444-555555555555`},
+	}
+	body, err := json.Marshal(bodyPayload)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages?beta=true", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Anthropic-Beta", "claude-code-20250219")
+	req.Header.Set("User-Agent", "roo-code/3.53.0")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("X-Stainless-Package-Version", "0.81.0")
+	req.Header.Set("X-Claude-Code-Session-Id", "11111111-2222-3333-4444-555555555555")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if gotAuth != "Bearer claude-oauth-access" || gotAPIKey != "" {
+		t.Fatalf("upstream auth headers Authorization=%q X-Api-Key=%q", gotAuth, gotAPIKey)
+	}
+	if gotQuery != "beta=true" {
+		t.Fatalf("upstream query = %q, want beta=true", gotQuery)
+	}
+	if !strings.Contains(gotBeta, "claude-code-20250219") || !strings.Contains(gotBeta, "oauth-2025-04-20") {
+		t.Fatalf("Anthropic-Beta = %q", gotBeta)
+	}
+	for _, token := range []string{"context-1m-2025-08-07", "interleaved-thinking-2025-05-14", "redact-thinking-2026-02-12", "prompt-caching-scope-2026-01-05", "effort-2025-11-24", "context-management-2025-06-27"} {
+		if !strings.Contains(gotBeta, token) {
+			t.Fatalf("Anthropic-Beta missing %q: %q", token, gotBeta)
+		}
+	}
+	if gotUserAgent != "claude-cli/2.1.126 (external, cli)" || gotXApp != "cli" || gotStainlessLang != "js" {
+		t.Fatalf("mimic headers User-Agent=%q X-App=%q X-Stainless-Lang=%q", gotUserAgent, gotXApp, gotStainlessLang)
+	}
+	if gotStainlessPackage != "0.81.0" {
+		t.Fatalf("X-Stainless-Package-Version = %q", gotStainlessPackage)
+	}
+	if strings.Contains(gotAcceptEncoding, "br") || strings.Contains(gotAcceptEncoding, "zstd") || strings.Contains(gotAcceptEncoding, "deflate") {
+		t.Fatalf("client Accept-Encoding leaked upstream: %q", gotAcceptEncoding)
+	}
+	if gotClientRequestID == "" {
+		t.Fatal("X-Client-Request-Id was not set")
+	}
+	var upstreamPayload struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := json.Unmarshal(gotBody, &upstreamPayload); err != nil {
+		t.Fatalf("Unmarshal upstream body: %v body=%s", err, string(gotBody))
+	}
+	gotBodyText := string(gotBody)
+	if !regexp.MustCompile(`x-anthropic-billing-header: cc_version=2\.1\.126\.df2; cc_entrypoint=cli; cch=[0-9a-f]{5};`).MatchString(gotBodyText) {
+		t.Fatalf("mimic body missing signed Claude billing header: %s", gotBodyText)
+	}
+	if strings.Contains(gotBodyText, "cch=00000") {
+		t.Fatalf("mimic body kept unsigned cch placeholder: %s", gotBodyText)
+	}
+	userID, _ := upstreamPayload.Metadata["user_id"].(string)
+	if userID == "" || strings.Contains(userID, "old-account") || strings.Contains(userID, "0123456789abcdef") {
+		t.Fatalf("metadata.user_id was not rewritten safely: %q", userID)
+	}
+	var parsedUID struct {
+		DeviceID    string `json:"device_id"`
+		AccountUUID string `json:"account_uuid"`
+		SessionID   string `json:"session_id"`
+	}
+	if err := json.Unmarshal([]byte(userID), &parsedUID); err != nil {
+		t.Fatalf("metadata.user_id is not JSON new format: %q err=%v", userID, err)
+	}
+	if parsedUID.AccountUUID != "acct-upstream-uuid" || parsedUID.SessionID == "11111111-2222-3333-4444-555555555555" || parsedUID.SessionID == "" {
+		t.Fatalf("rewritten metadata.user_id = %#v", parsedUID)
+	}
+	if gotSessionHeader != parsedUID.SessionID {
+		t.Fatalf("X-Claude-Code-Session-Id = %q, want rewritten session %q", gotSessionHeader, parsedUID.SessionID)
+	}
+}
+
+func TestAnthropicMessagesGatewayForRealClaudeCLIOAuthAccountPreservesClientFingerprintAndSignsCCH(t *testing.T) {
+	var gotBeta string
+	var gotUserAgent string
+	var gotStainlessPackage string
+	var gotStainlessArch string
+	var gotBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			gotBeta = r.Header.Get("Anthropic-Beta")
+			gotUserAgent = r.Header.Get("User-Agent")
+			gotStainlessPackage = r.Header.Get("X-Stainless-Package-Version")
+			gotStainlessArch = r.Header.Get("X-Stainless-Arch")
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upstream body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":7,"output_tokens":3}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "simple", Credential: "access_token=claude-oauth-access;account_uuid=acct-upstream-uuid", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", config.GroupRotationPolicy{Strategy: "polling", RetryOnErrors: false})
+	defer srv.Close()
+	originalUID := `{"device_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","account_uuid":"old-account","session_id":"11111111-2222-3333-4444-555555555555"}`
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":false,"metadata":{"user_id":` + strconv.Quote(originalUID) + `},"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.126.df2; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"5m"}}]}`)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages?beta=true", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Anthropic-Beta", "claude-code-20250219,interleaved-thinking-2025-05-14")
+	req.Header.Set("User-Agent", "claude-cli/2.1.126 (external, cli)")
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Stainless-Package-Version", "0.81.0")
+	req.Header.Set("X-Stainless-Arch", "x64")
+	req.Header.Set("X-Claude-Code-Session-Id", "11111111-2222-3333-4444-555555555555")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if gotUserAgent != "claude-cli/2.1.126 (external, cli)" || gotStainlessPackage != "0.81.0" || gotStainlessArch != "x64" {
+		t.Fatalf("real Claude CLI fingerprint was not preserved: ua=%q package=%q arch=%q", gotUserAgent, gotStainlessPackage, gotStainlessArch)
+	}
+	if gotBeta != "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14" {
+		t.Fatalf("Anthropic-Beta = %q", gotBeta)
+	}
+	got := string(gotBody)
+	if strings.Contains(got, "cc_version=2.1.92") || !strings.Contains(got, "cc_version=2.1.126.df2") {
+		t.Fatalf("billing cc_version should follow real CLI UA while preserving suffix: %s", got)
+	}
+	if strings.Contains(got, "cch=00000") || !regexp.MustCompile(`cch=[0-9a-f]{5};`).MatchString(got) {
+		t.Fatalf("billing cch was not signed: %s", got)
+	}
+}
+
+func TestAnthropicMessagesGatewayRefreshesOAuthAccessToken(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			requestCount++
+			if got := r.Header.Get("Authorization"); got != "Bearer claude-refreshed-access" {
+				t.Fatalf("upstream Authorization = %q", got)
+			}
+			if got := r.Header.Get("X-Api-Key"); got != "" {
+				t.Fatalf("upstream X-Api-Key = %q", got)
+			}
+			if got := r.Header.Get("Anthropic-Beta"); !strings.Contains(got, "oauth-2025-04-20") {
+				t.Fatalf("Anthropic-Beta = %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":7,"output_tokens":3}}`))
+		case "/oauth/token":
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+			if r.Header.Get("Content-Type") != "application/json" || r.Header.Get("User-Agent") != "axios/1.13.6" {
+				t.Fatalf("unexpected refresh headers Content-Type=%q User-Agent=%q", r.Header.Get("Content-Type"), r.Header.Get("User-Agent"))
+			}
+			if payload["grant_type"] != "refresh_token" || payload["refresh_token"] != "claude-refresh-token" || payload["client_id"] == "" {
+				t.Fatalf("unexpected refresh payload: %#v", payload)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"claude-refreshed-access","refresh_token":"claude-refresh-new","expires_in":3600,"token_type":"Bearer","scope":"user:inference"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	credential := "refresh_token=claude-refresh-token;token_url=" + upstream.URL + "/oauth/token"
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "simple", Credential: credential, BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", config.GroupRotationPolicy{Strategy: "polling", RetryOnErrors: false})
+	defer srv.Close()
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":false}`)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages?beta=true", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Anthropic-Beta", "context-1m-2025-08-07")
+	req.Header.Set("User-Agent", "claude-cli/2.1.126 (external, cli)")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if requestCount != 1 {
+		t.Fatalf("upstream request count = %d, want 1", requestCount)
+	}
+	credentialAfterRefresh := store.Snapshot().Accounts[0].Credential
+	if !strings.Contains(credentialAfterRefresh, "access_token=claude-refreshed-access") || !strings.Contains(credentialAfterRefresh, "refresh_token=claude-refresh-new") || !strings.Contains(credentialAfterRefresh, "token_type=Bearer") || !strings.Contains(credentialAfterRefresh, "scope=user:inference") {
+		t.Fatalf("refreshed credential was not persisted: %q", credentialAfterRefresh)
+	}
+}
+
+func TestClaudeCLIModelsDoubleV1ReturnsModels(t *testing.T) {
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "simple", Credential: "access_token=claude-oauth-access", BaseURL: "https://api.anthropic.com", Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", config.GroupRotationPolicy{Strategy: "polling", RetryOnErrors: false})
+	defer srv.Close()
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/v1/models?limit=1000", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+}
+
 func TestResponsesStreamingGatewayReencodesForDefaultClients(t *testing.T) {
 	upstreamBody := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +609,68 @@ func TestResponsesStreamingGatewayPassthroughsForRooClient(t *testing.T) {
 	}
 	if strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("passthrough responses stream appended unexpected done sentinel: %q", body)
+	}
+}
+
+func TestAnthropicMessagesStreamingGatewayPassthroughsRooInternalSSE(t *testing.T) {
+	upstreamBody := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("X-Upstream-Trace", "anthropic-stream")
+			_, _ = w.Write([]byte(upstreamBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	policy := config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{429, 401, 403, 404, 500}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1}
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "advanced", Credential: "access_token=claude-oauth-access;account_uuid=acct-upstream-uuid", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", policy)
+	defer srv.Close()
+
+	body := []byte(`{"model":"claude-opus-4-7","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":true,"metadata":{"user_id":"{\"device_id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"account_uuid\":\"old-account\",\"session_id\":\"11111111-2222-3333-4444-555555555555\"}"},"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.126.df2; cc_entrypoint=cli; cch=00000;"}],"tools":[],"output_config":{"effort":"high"},"thinking":{"type":"enabled"},"context_management":{"edits":[{"type":"clear_tool_uses_20250919","keep":"none"}]}}`)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages?beta=true", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+store.GatewayKey())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "claude-cli/2.1.126 (external, cli)")
+	req.Header.Set("Anthropic-Beta", "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("X-App", "cli")
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Claude-Code-Session-Id", "6f098428-c130-40b7-ab0a-30e95a3b7bb1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream; charset=utf-8" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := resp.Header.Get("X-Upstream-Trace"); got != "anthropic-stream" {
+		t.Fatalf("X-Upstream-Trace = %q", got)
+	}
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	gotBody := string(payload)
+	if gotBody != upstreamBody {
+		t.Fatalf("passthrough body = %q, want %q", gotBody, upstreamBody)
+	}
+	if strings.Contains(gotBody, "data: [DONE]") {
+		t.Fatalf("passthrough anthropic stream appended unexpected done sentinel: %q", gotBody)
 	}
 }
 
@@ -420,6 +845,92 @@ func TestGatewayUpstreamErrorTriggersCooldown(t *testing.T) {
 	}
 	if envelope.Error.Code != "group_exhausted" {
 		t.Fatalf("error envelope = %#v", envelope)
+	}
+}
+
+func TestAnthropicOAuthMessagesRateLimitDoesNotCooldownOrExhaustSingleAccount(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			requestCount++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	policy := config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: true, RotateErrorCodes: []int{429, 401, 403, 404, 500}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1}
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "advanced", Credential: "access_token=claude-oauth-access", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", policy)
+	defer srv.Close()
+
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":false}`)
+	first := doGatewayRequest(t, srv.URL+"/v1/messages", store.GatewayKey(), body)
+	_ = first.Body.Close()
+	if first.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("first status = %d, want %d", first.StatusCode, http.StatusTooManyRequests)
+	}
+	second := doGatewayRequest(t, srv.URL+"/v1/messages", store.GatewayKey(), body)
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusTooManyRequests {
+		payload, _ := io.ReadAll(second.Body)
+		t.Fatalf("second status = %d body=%s, want %d", second.StatusCode, string(payload), http.StatusTooManyRequests)
+	}
+	if requestCount != 2 {
+		t.Fatalf("upstream request count = %d, want 2; account was likely cooldowned", requestCount)
+	}
+}
+
+func TestOAuthLikeRateLimitDoesNotCooldownOrExhaustSingleAccount(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		platform string
+	}{
+		{name: "gemini", platform: "gemini"},
+		{name: "antigravity", platform: "antigravity"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requestCount := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/models":
+					_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+				case "/v1/chat/completions":
+					requestCount++
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			policy := config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: true, RotateErrorCodes: []int{429, 401, 403, 404, 500}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1}
+			srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_" + tt.platform, Type: "oauth", Label: tt.platform, Tier: "advanced", Credential: "access_token=oauth-access", BaseURL: upstream.URL, Metadata: map[string]any{"platform": tt.platform}, Enabled: true}}, tt.platform, policy)
+			defer srv.Close()
+
+			body := []byte(`{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+			first := doGatewayRequest(t, srv.URL+"/v1/chat/completions", store.GatewayKey(), body)
+			_ = first.Body.Close()
+			if first.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("first status = %d, want %d", first.StatusCode, http.StatusTooManyRequests)
+			}
+			second := doGatewayRequest(t, srv.URL+"/v1/chat/completions", store.GatewayKey(), body)
+			defer second.Body.Close()
+			if second.StatusCode != http.StatusTooManyRequests {
+				payload, _ := io.ReadAll(second.Body)
+				t.Fatalf("second status = %d body=%s, want %d", second.StatusCode, string(payload), http.StatusTooManyRequests)
+			}
+			if requestCount != 2 {
+				t.Fatalf("upstream request count = %d, want 2; account was likely cooldowned", requestCount)
+			}
+		})
 	}
 }
 
@@ -1290,6 +1801,65 @@ func TestQueueFGatewayRecordsMetrics(t *testing.T) {
 	}
 }
 
+func TestQueueFGatewayRecordsAnthropicMessagesMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":7,"output_tokens":3}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	policy := config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{429, 401, 403, 404, 500}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1}
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude A", Tier: "advanced", Credential: "api_key=sk-ant-test", BaseURL: upstream.URL, QuotaPolicy: "", Metadata: map[string]any{"platform": "anthropic", "account_uuid": "acct-uuid-test"}, Enabled: true}}, "anthropic", policy)
+	defer srv.Close()
+
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":false}`)
+	resp := doGatewayRequest(t, srv.URL+"/v1/messages?beta=true", store.GatewayKey(), body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gateway status = %d", resp.StatusCode)
+	}
+
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+	metricsReq, err := http.NewRequest(http.MethodGet, srv.URL+"/api/admin/metrics", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	metricsReq.AddCookie(cookie)
+	metricsResp, err := http.DefaultClient.Do(metricsReq)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer metricsResp.Body.Close()
+	var snapshot struct {
+		TotalRequests   uint64 `json:"total_requests"`
+		SuccessRequests uint64 `json:"success_requests"`
+		TopUsage        []struct {
+			AccountID    string `json:"account_id"`
+			GatewayKeyID string `json:"gateway_key_id"`
+			Requests     uint64 `json:"requests"`
+			Successes    uint64 `json:"successes"`
+			Errors       uint64 `json:"errors"`
+		} `json:"top_usage"`
+	}
+	if err := json.NewDecoder(metricsResp.Body).Decode(&snapshot); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	if snapshot.TotalRequests != 1 || snapshot.SuccessRequests != 1 {
+		t.Fatalf("metrics counters = %#v", snapshot)
+	}
+	if len(snapshot.TopUsage) != 1 || snapshot.TopUsage[0].AccountID != "acct_claude" || snapshot.TopUsage[0].GatewayKeyID != "default" || snapshot.TopUsage[0].Requests != 1 || snapshot.TopUsage[0].Successes != 1 || snapshot.TopUsage[0].Errors != 0 {
+		t.Fatalf("top usage metrics = %#v", snapshot.TopUsage)
+	}
+}
+
 func TestQueueFGatewayRecordsRuntimeQuotaSwitch(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1370,6 +1940,34 @@ func gatewayServerWithAccounts(t *testing.T, accounts []config.Account, policy c
 	return gatewayServerWithOptions(t, accounts, policy, true)
 }
 
+func gatewayServerWithAccountsAndPlatform(t *testing.T, accounts []config.Account, platform string, policy config.GroupRotationPolicy) (*httptest.Server, *config.Store) {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Accounts = accounts
+	cfg.Quota.Policies = []config.QuotaPolicy{{ID: "daily", DailyLimitTokens: 1000, Source: "local"}}
+	accountIDs := make([]string, 0, len(cfg.Accounts))
+	for i := range cfg.Accounts {
+		if strings.TrimSpace(cfg.Accounts[i].QuotaPolicy) == "" {
+			cfg.Accounts[i].QuotaPolicy = "daily"
+		}
+		accountIDs = append(accountIDs, cfg.Accounts[i].ID)
+	}
+	if platform == "anthropic" {
+		cfg.Routing.PreferTiers = []string{"advanced", "simple"}
+		cfg.Routing.FallbackTiers = []string{"simple", "advanced"}
+	}
+	cfg.Groups = []config.Group{{ID: platform, Name: platform, Platform: platform, Status: "active", AccountIDs: accountIDs, CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z", RotationPolicy: policy}}
+	cfg.GatewayKeys = []config.GatewayKey{{ID: "default", Name: "Default", KeyHash: config.HashGatewayKey("s2a_test_gateway_key_value"), Preview: config.KeyPreview("s2a_test_gateway_key_value"), Status: "enabled", RoutingPolicy: config.KeyRoutingPolicy{Mode: "groups", GroupIDs: []string{platform}}, CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"}}
+	cfg.GatewayAuth.GatewayKey = "s2a_test_gateway_key_value"
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	handler := server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	return httptest.NewServer(handler), store
+}
+
 func gatewayServerWithOptions(t *testing.T, accounts []config.Account, policy config.GroupRotationPolicy, addGroupTag bool) (*httptest.Server, *config.Store) {
 	t.Helper()
 	cfg := config.DefaultConfig()
@@ -1378,7 +1976,9 @@ func gatewayServerWithOptions(t *testing.T, accounts []config.Account, policy co
 	cfg.Quota.Policies = []config.QuotaPolicy{{ID: "daily", DailyLimitTokens: 1000, Source: "local"}}
 	accountIDs := make([]string, 0, len(cfg.Accounts))
 	for i := range cfg.Accounts {
-		cfg.Accounts[i].QuotaPolicy = "daily"
+		if strings.TrimSpace(cfg.Accounts[i].QuotaPolicy) == "" {
+			cfg.Accounts[i].QuotaPolicy = "daily"
+		}
 		if addGroupTag {
 			cfg.Accounts[i].Tags = append(cfg.Accounts[i].Tags, "openai")
 		}

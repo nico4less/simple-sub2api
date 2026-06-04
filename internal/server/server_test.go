@@ -40,6 +40,7 @@ func TestM0SecurityBoundaries(t *testing.T) {
 	assertStatus(t, http.MethodGet, srv.URL+"/healthz", nil, nil, http.StatusOK)
 	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", nil, nil, http.StatusUnauthorized)
 	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer " + store.GatewayKey()}, nil, http.StatusOK)
+	assertStatus(t, http.MethodGet, srv.URL+"/v1/models", map[string]string{"X-Api-Key": store.GatewayKey()}, nil, http.StatusOK)
 	assertStatus(t, http.MethodGet, srv.URL+"/api/admin/me", map[string]string{"Authorization": "Bearer " + store.GatewayKey()}, nil, http.StatusUnauthorized)
 
 	loginResp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/login", nil, []byte(`{"password":"admin-secret"}`))
@@ -1179,6 +1180,65 @@ func TestOpenAIOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
 	}
 }
 
+func TestClaudeOAuthExchangeCodeReturnsTokenBundle(t *testing.T) {
+	var gotPayload map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			if r.Header.Get("Content-Type") != "application/json" {
+				t.Fatalf("Content-Type = %q", r.Header.Get("Content-Type"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+				t.Fatalf("decode token payload: %v", err)
+			}
+			writeFixtureJSON(t, w, map[string]any{
+				"access_token":  "claude-access-from-code",
+				"refresh_token": "claude-refresh-from-code",
+				"expires_in":    3600,
+				"token_type":    "Bearer",
+				"scope":         "user:inference",
+				"organization":  map[string]any{"uuid": "org-uuid-1"},
+				"account":       map[string]any{"uuid": "acct-uuid-1", "email_address": "claude@example.test"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.NewWithOptions(store, slog.New(slog.NewTextHandler(io.Discard, nil)), server.Options{}).Handler())
+	defer srv.Close()
+	cookie := loginCookie(t, srv.URL, "admin-secret")
+	body := []byte(`{"code":"auth-code-value#state-from-code","code_verifier":"verifier-value","token_url":"` + upstream.URL + `/oauth/token","is_setup_token":true}`)
+	resp := doRequest(t, http.MethodPost, srv.URL+"/api/admin/claude/oauth/exchange-code", map[string]string{"Cookie": cookie.String()}, body)
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("exchange status = %d body=%s", resp.StatusCode, string(payload))
+	}
+	var decoded struct {
+		Credentials map[string]string `json:"credentials"`
+		ExpiresAt   string            `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode exchange response: %v", err)
+	}
+	if decoded.Credentials["refresh_token"] != "claude-refresh-from-code" || decoded.Credentials["access_token"] != "claude-access-from-code" || decoded.Credentials["expires_at"] == "" {
+		t.Fatalf("unexpected token bundle: %#v", decoded)
+	}
+	if decoded.Credentials["token_type"] != "Bearer" || decoded.Credentials["scope"] != "user:inference" || decoded.Credentials["org_uuid"] != "org-uuid-1" || decoded.Credentials["account_uuid"] != "acct-uuid-1" || decoded.Credentials["email_address"] != "claude@example.test" {
+		t.Fatalf("missing Claude token metadata: %#v", decoded.Credentials)
+	}
+	if gotPayload["grant_type"] != "authorization_code" || gotPayload["code"] != "auth-code-value" || gotPayload["state"] != "state-from-code" || gotPayload["code_verifier"] != "verifier-value" || gotPayload["client_id"] == "" || gotPayload["redirect_uri"] == "" || gotPayload["expires_in"] != float64(31536000) {
+		t.Fatalf("unexpected exchange payload: %#v", gotPayload)
+	}
+}
+
 func TestAPIDebugLoggingCapturesRequestShapeWithoutLeakingSecrets(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1232,8 +1292,15 @@ func TestAPIDebugLoggingCapturesRequestShapeWithoutLeakingSecrets(t *testing.T) 
 	if !strings.Contains(logs, `"msg":"gateway_api_debug_request"`) {
 		t.Fatalf("expected debug log event, got %s", logs)
 	}
+	if !strings.Contains(logs, `"msg":"gateway_api_debug_upstream_request"`) {
+		t.Fatalf("expected upstream debug log event, got %s", logs)
+	}
 	for _, expected := range []string{
 		`"path":"/v1/chat/completions"`,
+		`"gateway_path":"/v1/chat/completions"`,
+		`"upstream_path":"/v1/chat/completions"`,
+		`"account_id":"acct_debug"`,
+		`"upstream_body_sha256"`,
 		`"authorization_scheme":"Bearer"`,
 		`"json_valid":true`,
 		`"parsed_messages_count":1`,

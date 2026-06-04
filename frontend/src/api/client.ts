@@ -222,10 +222,24 @@ export interface OpenAIOAuthExchangeRequest {
   proxy_ref?: string
 }
 
+export interface ClaudeOAuthExchangeRequest {
+  code: string
+  state?: string
+  code_verifier: string
+  redirect_uri?: string
+  client_id?: string
+  token_url?: string
+  proxy_ref?: string
+  account_id?: string
+  is_setup_token?: boolean
+}
+
 export interface OpenAIOAuthExchangeResponse {
   credentials: Record<string, string>
   expires_at: string
 }
+
+export type ClaudeOAuthExchangeResponse = OpenAIOAuthExchangeResponse
 
 export interface RuntimeAccount {
   account_id: string
@@ -485,6 +499,13 @@ export function refreshAccount(accountID: string) {
 
 export function exchangeOpenAIOAuthCode(payload: OpenAIOAuthExchangeRequest) {
   return api<OpenAIOAuthExchangeResponse>('/api/admin/openai/oauth/exchange-code', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+}
+
+export function exchangeClaudeOAuthCode(payload: ClaudeOAuthExchangeRequest) {
+  return api<ClaudeOAuthExchangeResponse>('/api/admin/claude/oauth/exchange-code', {
     method: 'POST',
     body: JSON.stringify(payload)
   })

@@ -427,6 +427,14 @@ type OpenAIAccessTokenUpdate struct {
 	ExpiresAt    string
 }
 
+type AnthropicAccessTokenUpdate struct {
+	AccessToken  string
+	RefreshToken string
+	TokenType    string
+	Scope        string
+	ExpiresAt    string
+}
+
 type AccountMetadataUpdate struct {
 	Metadata map[string]any
 }
@@ -454,6 +462,50 @@ func (s *Store) UpdateOpenAIAccessToken(accountID string, token OpenAIAccessToke
 		}
 		if strings.TrimSpace(token.IDToken) != "" {
 			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"id_token": token.IDToken})
+		}
+		candidate.Accounts[i].Enabled = true
+		candidate.ConfigVersion = s.cfg.ConfigVersion + 1
+		if err := EnsureDefaultsAndSecrets(&candidate); err != nil {
+			return Account{}, false, err
+		}
+		if err := Validate(candidate); err != nil {
+			return Account{}, false, err
+		}
+		if err := s.saveConfigLocked(candidate); err != nil {
+			return Account{}, false, err
+		}
+		s.cfg = candidate
+		return cloneAccounts([]Account{candidate.Accounts[i]})[0], true, nil
+	}
+	return Account{}, false, nil
+}
+
+func (s *Store) UpdateAnthropicAccessToken(accountID string, token AnthropicAccessTokenUpdate) (Account, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if strings.TrimSpace(accountID) == "" || strings.TrimSpace(token.AccessToken) == "" {
+		return Account{}, false, nil
+	}
+	if err := s.reloadLocked(); err != nil {
+		return Account{}, false, err
+	}
+	candidate := cloneConfig(s.cfg)
+	for i := range candidate.Accounts {
+		if candidate.Accounts[i].ID != accountID {
+			continue
+		}
+		candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{
+			"access_token": token.AccessToken,
+			"expires_at":   token.ExpiresAt,
+		})
+		if strings.TrimSpace(token.RefreshToken) != "" {
+			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"refresh_token": token.RefreshToken})
+		}
+		if strings.TrimSpace(token.TokenType) != "" {
+			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"token_type": token.TokenType})
+		}
+		if strings.TrimSpace(token.Scope) != "" {
+			candidate.Accounts[i].Credential = mergeCredential(candidate.Accounts[i].Credential, map[string]string{"scope": token.Scope})
 		}
 		candidate.Accounts[i].Enabled = true
 		candidate.ConfigVersion = s.cfg.ConfigVersion + 1

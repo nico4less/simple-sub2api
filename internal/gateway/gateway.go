@@ -31,12 +31,15 @@ type Store interface {
 	TouchGatewayKeyLastUsed(id string, usedAt string) error
 	DisableAccount(accountID string) (bool, error)
 	UpdateOpenAIAccessToken(accountID string, token config.OpenAIAccessTokenUpdate) (config.Account, bool, error)
+	UpdateAnthropicAccessToken(accountID string, token config.AnthropicAccessTokenUpdate) (config.Account, bool, error)
 	UpdateAccountMetadata(accountID string, update config.AccountMetadataUpdate) (config.Account, bool, error)
 }
 
 const permanentFailureStrikeLimit = 3
 const openAIClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const openAITokenURL = "https://auth.openai.com/oauth/token"
+const anthropicClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+const anthropicTokenURL = "https://platform.claude.com/v1/oauth/token"
 
 var cooldownCountdownPattern = regexp.MustCompile(`(?i)(?:try again|retry|available|reset)[^\n\r]{0,80}\b(?:in|after)\s+(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:ute)?s?)?)?\s*(?:(\d+)\s*s(?:ec(?:ond)?s?)?)?`)
 
@@ -44,6 +47,14 @@ type openAITokenRefreshResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	IDToken      string `json:"id_token,omitempty"`
+	TokenType    string `json:"token_type,omitempty"`
+	ExpiresIn    int64  `json:"expires_in"`
+	Scope        string `json:"scope,omitempty"`
+}
+
+type anthropicTokenRefreshResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 	TokenType    string `json:"token_type,omitempty"`
 	ExpiresIn    int64  `json:"expires_in"`
 	Scope        string `json:"scope,omitempty"`
@@ -138,7 +149,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		matchedKey = config.GatewayKey{ID: "legacy", RoutingPolicy: config.KeyRoutingPolicy{Mode: "all_enabled"}}
 	}
 	normalizeGatewayRequestPath(r)
-	if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses" {
+	if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses" && r.URL.Path != "/v1/messages" {
 		h.logAPIDebugRequest(r, matchedKey, nil, upstreamcompat.ChatCompletionRequest{}, errors.New("gateway route not found"))
 		writeOpenAIError(w, http.StatusNotFound, "gateway route not found", "not_found_error", "route_not_found")
 		return
@@ -236,12 +247,13 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if rotateOnStatus {
 			cooldownOverride := retryAfterDuration(resp.Header)
 			var replayBody []byte
+			replayBody, bodyCooldown := readCooldownBody(resp.Body)
+			resp.Body = io.NopCloser(bytes.NewReader(replayBody))
 			if cooldownOverride <= 0 {
-				replayBody, cooldownOverride = readCooldownBody(resp.Body)
-				resp.Body = io.NopCloser(bytes.NewReader(replayBody))
+				cooldownOverride = bodyCooldown
 			}
 			excluded[account.ID] = true
-			h.logUpstreamError(requestPath, parsed.Model, taskType, matchedKey, group, account.ID, resp.StatusCode, attempt, maxAttempts, true)
+			h.logUpstreamError(requestPath, parsed.Model, taskType, matchedKey, group, account.ID, resp.StatusCode, attempt, maxAttempts, true, replayBody, resp.Header)
 			h.cooldownWithGroupReason(account.ID, group, cooldownOverride, "rotate_on_status", resp.StatusCode)
 			h.recordRequest(account.ID, matchedKey, parsed.Model, taskType, resp.StatusCode, false, "upstream returned HTTP "+http.StatusText(resp.StatusCode))
 			lastErr = errors.New("upstream returned HTTP " + http.StatusText(resp.StatusCode))
@@ -256,8 +268,13 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !rotateOnStatus && upstreamcompat.IsOpenAIErrorStatus(resp.StatusCode) {
-			h.logUpstreamError(requestPath, parsed.Model, taskType, matchedKey, group, account.ID, resp.StatusCode, attempt, maxAttempts, false)
-			if !isPermanentCredentialFailure(resp.StatusCode) && shouldCooldownStatus(requestPath, resp.StatusCode) {
+			var replayBody []byte
+			if h.DebugAPI {
+				replayBody, _ = readCooldownBody(resp.Body)
+				resp.Body = io.NopCloser(bytes.NewReader(replayBody))
+			}
+			h.logUpstreamError(requestPath, parsed.Model, taskType, matchedKey, group, account.ID, resp.StatusCode, attempt, maxAttempts, false, replayBody, resp.Header)
+			if !isPermanentCredentialFailure(resp.StatusCode) && shouldCooldownStatus(requestPath, account, resp.StatusCode) {
 				h.cooldownWithGroupReason(account.ID, group, retryAfterDuration(resp.Header), "upstream_error_status", resp.StatusCode)
 			}
 		}
@@ -315,10 +332,15 @@ func (h Handler) forwardAttempt(r *http.Request, cfg config.Config, account conf
 	if err != nil {
 		return nil, err
 	}
+	account, err = h.accountWithFreshAnthropicAccessToken(r.Context(), cfg, account, client)
+	if err != nil {
+		return nil, err
+	}
 	upstreamReq, err := upstreamcompat.BuildUpstreamRequest(r, account, body)
 	if err != nil {
 		return nil, err
 	}
+	h.logAPIDebugUpstreamRequest(r, upstreamReq, account)
 	return client.Do(upstreamReq)
 }
 
@@ -397,6 +419,11 @@ func openAIOAuthCanRefresh(account config.Account) bool {
 	return config.AccountPlatform(account) == "openai" && strings.TrimSpace(account.Type) == "oauth" && credentialValue(account.Credential, "refresh_token") != ""
 }
 
+func anthropicOAuthCanRefresh(account config.Account) bool {
+	accountType := strings.TrimSpace(account.Type)
+	return config.AccountPlatform(account) == "anthropic" && (accountType == "oauth" || accountType == "setup-token") && credentialValue(account.Credential, "refresh_token") != ""
+}
+
 func (h Handler) reEnableRefreshedAccount(account config.Account) {
 	if h.Pool == nil || strings.TrimSpace(account.ID) == "" {
 		return
@@ -422,6 +449,91 @@ func (h Handler) accountWithFreshOpenAIAccessToken(ctx context.Context, cfg conf
 		return account, nil
 	}
 	return h.refreshOpenAIAccessTokenForAccount(ctx, cfg, account, client)
+}
+
+func (h Handler) accountWithFreshAnthropicAccessToken(ctx context.Context, cfg config.Config, account config.Account, client *http.Client) (config.Account, error) {
+	if !anthropicOAuthCanRefresh(account) {
+		return account, nil
+	}
+	if token := credentialValue(account.Credential, "access_token"); token != "" && tokenNotExpired(account.Credential, 2*time.Minute) {
+		return account, nil
+	}
+	return h.refreshAnthropicAccessTokenForAccount(ctx, cfg, account, client)
+}
+
+func (h Handler) refreshAnthropicAccessTokenForAccount(ctx context.Context, cfg config.Config, account config.Account, client *http.Client) (config.Account, error) {
+	if !anthropicOAuthCanRefresh(account) {
+		return account, nil
+	}
+	refreshToken := credentialValue(account.Credential, "refresh_token")
+	if refreshToken == "" {
+		return account, nil
+	}
+	if client == nil {
+		var err error
+		client, err = clientForAccount(cfg, account)
+		if err != nil {
+			return account, err
+		}
+	}
+	clientID := credentialValue(account.Credential, "client_id")
+	if clientID == "" {
+		clientID = anthropicClientID
+	}
+	tokenURL := credentialValue(account.Credential, "token_url")
+	if tokenURL == "" {
+		tokenURL = anthropicTokenURL
+	}
+	if h.Logger != nil {
+		h.Logger.Info("anthropic_oauth_refresh_start", "account_id", account.ID, "has_access_token", credentialValue(account.Credential, "access_token") != "", "client_id_configured", credentialValue(account.Credential, "client_id") != "")
+	}
+	token, err := refreshAnthropicAccessToken(ctx, client, tokenURL, refreshToken, clientID)
+	if err != nil {
+		if h.Logger != nil {
+			h.Logger.Warn("anthropic_oauth_refresh_failed", "account_id", account.ID, "error", sanitizeCredentialError(err))
+		}
+		return account, err
+	}
+	updated := config.AnthropicAccessTokenUpdate{
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		TokenType:    token.TokenType,
+		Scope:        token.Scope,
+		ExpiresAt:    time.Now().UTC().Add(time.Duration(token.ExpiresIn) * time.Second).Format(time.RFC3339),
+	}
+	if updated.ExpiresAt == "" || token.ExpiresIn <= 0 {
+		updated.ExpiresAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	}
+	credentialUpdates := map[string]string{
+		"access_token": updated.AccessToken,
+		"expires_at":   updated.ExpiresAt,
+	}
+	if updated.RefreshToken != "" {
+		credentialUpdates["refresh_token"] = updated.RefreshToken
+	}
+	if updated.TokenType != "" {
+		credentialUpdates["token_type"] = updated.TokenType
+	}
+	if updated.Scope != "" {
+		credentialUpdates["scope"] = updated.Scope
+	}
+	account.Credential = mergeCredential(account.Credential, credentialUpdates)
+	if h.Store != nil {
+		if persisted, ok, persistErr := h.Store.UpdateAnthropicAccessToken(account.ID, updated); persistErr != nil {
+			if h.Logger != nil {
+				h.Logger.Warn("anthropic_oauth_refresh_persist_failed", "account_id", account.ID, "error", persistErr.Error())
+			}
+		} else if ok {
+			account = persisted
+		}
+	}
+	if h.Pool != nil {
+		h.Pool.UpdateAccount(account)
+	}
+	if h.Logger != nil {
+		h.Logger.Info("anthropic_oauth_refresh_success", "account_id", account.ID, "expires_at", updated.ExpiresAt, "rotated_refresh_token", updated.RefreshToken != "")
+	}
+	return account, nil
 }
 
 func (h Handler) refreshOpenAIAccessTokenForAccount(ctx context.Context, cfg config.Config, account config.Account, client *http.Client) (config.Account, error) {
@@ -560,6 +672,50 @@ func refreshOpenAIAccessToken(ctx context.Context, client *http.Client, tokenURL
 	return token, nil
 }
 
+func refreshAnthropicAccessToken(ctx context.Context, client *http.Client, tokenURL string, refreshToken string, clientID string) (anthropicTokenRefreshResponse, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if strings.TrimSpace(tokenURL) == "" {
+		tokenURL = anthropicTokenURL
+	}
+	payload, err := json.Marshal(map[string]string{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+		"client_id":     clientID,
+	})
+	if err != nil {
+		return anthropicTokenRefreshResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, bytes.NewReader(payload))
+	if err != nil {
+		return anthropicTokenRefreshResponse{}, err
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "axios/1.13.6")
+	resp, err := client.Do(req)
+	if err != nil {
+		return anthropicTokenRefreshResponse{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return anthropicTokenRefreshResponse{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return anthropicTokenRefreshResponse{}, errors.New("token refresh failed: status " + strconv.Itoa(resp.StatusCode) + ", body: " + sanitizeCredentialText(string(body)))
+	}
+	var token anthropicTokenRefreshResponse
+	if err := json.Unmarshal(body, &token); err != nil {
+		return anthropicTokenRefreshResponse{}, err
+	}
+	if strings.TrimSpace(token.AccessToken) == "" {
+		return anthropicTokenRefreshResponse{}, errors.New("token refresh response missing access_token")
+	}
+	return token, nil
+}
+
 func (h Handler) resolveGroup(cfg config.Config, policy config.KeyRoutingPolicy) *config.Group {
 	if policy.Mode == "groups" && len(policy.GroupIDs) > 0 {
 		for _, groupID := range policy.GroupIDs {
@@ -613,6 +769,9 @@ func shouldRotateOnStatusCode(status int, group *config.Group) bool {
 
 func shouldRotateAttemptStatus(requestPath string, account config.Account, status int, group *config.Group) bool {
 	if upstreamcompat.IsOpenAIOAuthAccount(account) && requestPath == "/v1/responses" && isPermanentCredentialFailure(status) {
+		return false
+	}
+	if upstreamcompat.IsOAuthLikeAccount(account) && status == http.StatusTooManyRequests {
 		return false
 	}
 	return shouldRotateOnStatusCode(status, group)
@@ -752,8 +911,12 @@ func (h Handler) writeNonStream(w http.ResponseWriter, resp *http.Response, acco
 }
 
 func (h Handler) writeStream(w http.ResponseWriter, r *http.Request, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
+	if shouldPassthroughAnthropicMessagesSSE(r) {
+		h.writeSSEStreamPassthrough(w, resp, accountID, key, model, taskType)
+		return
+	}
 	if shouldPassthroughResponsesSSE(r) {
-		h.writeResponsesStreamPassthrough(w, resp, accountID, key, model, taskType)
+		h.writeSSEStreamPassthrough(w, resp, accountID, key, model, taskType)
 		return
 	}
 	h.writeReencodedStream(w, resp, accountID, key, model, taskType)
@@ -786,7 +949,7 @@ func (h Handler) writeReencodedStream(w http.ResponseWriter, resp *http.Response
 	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, true, "")
 }
 
-func (h Handler) writeResponsesStreamPassthrough(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
+func (h Handler) writeSSEStreamPassthrough(w http.ResponseWriter, resp *http.Response, accountID string, key config.GatewayKey, model string, taskType string) {
 	copySafeHeaders(w.Header(), resp.Header)
 	w.Header().Set("Content-Type", contentType(resp.Header.Get("Content-Type"), "text/event-stream"))
 	if strings.TrimSpace(w.Header().Get("Cache-Control")) == "" {
@@ -805,6 +968,13 @@ func (h Handler) writeResponsesStreamPassthrough(w http.ResponseWriter, resp *ht
 		return
 	}
 	h.recordRequest(accountID, key, model, taskType, resp.StatusCode, true, "")
+}
+
+func shouldPassthroughAnthropicMessagesSSE(r *http.Request) bool {
+	if r == nil || r.URL == nil || r.URL.Path != "/v1/messages" {
+		return false
+	}
+	return true
 }
 
 func shouldPassthroughResponsesSSE(r *http.Request) bool {
@@ -1083,7 +1253,7 @@ func (h Handler) logGroupExhausted(requestPath string, model string, taskType st
 	h.Logger.Warn("gateway group exhausted", attrs...)
 }
 
-func (h Handler) logUpstreamError(requestPath string, model string, taskType string, key config.GatewayKey, group *config.Group, accountID string, statusCode int, attempt int, maxAttempts int, rotateOnStatus bool) {
+func (h Handler) logUpstreamError(requestPath string, model string, taskType string, key config.GatewayKey, group *config.Group, accountID string, statusCode int, attempt int, maxAttempts int, rotateOnStatus bool, upstreamBody []byte, upstreamHeader http.Header) {
 	if h.Logger == nil {
 		return
 	}
@@ -1101,6 +1271,16 @@ func (h Handler) logUpstreamError(requestPath string, model string, taskType str
 	}
 	if group != nil {
 		attrs = append(attrs, "group_id", group.ID, "group_account_ids", append([]string(nil), group.AccountIDs...), "retry_on_errors", group.RotationPolicy.RetryOnErrors)
+	}
+	if h.DebugAPI {
+		attrs = append(attrs, "upstream_response_header_keys", sortedHeaderKeys(upstreamHeader))
+		if len(upstreamBody) > 0 {
+			attrs = append(attrs,
+				"upstream_response_body_bytes", len(upstreamBody),
+				"upstream_response_body_sha256", sha256Hex(upstreamBody),
+				"upstream_response_body_preview", scrubBodyPreview(upstreamBody),
+			)
+		}
 	}
 	h.Logger.Warn("gateway upstream error status", attrs...)
 }
@@ -1219,8 +1399,11 @@ func shouldAutoDisable(requestPath string, account config.Account, statusCode in
 	return true
 }
 
-func shouldCooldownStatus(requestPath string, statusCode int) bool {
+func shouldCooldownStatus(requestPath string, account config.Account, statusCode int) bool {
 	if requestPath == "/v1/responses" && statusCode == http.StatusNotFound {
+		return false
+	}
+	if upstreamcompat.IsOAuthLikeAccount(account) && statusCode == http.StatusTooManyRequests {
 		return false
 	}
 	return true
@@ -1380,10 +1563,14 @@ func normalizeGatewayRequestPath(r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
+	case "/v1/v1/models":
+		r.URL.Path = "/v1/models"
 	case "/v1/v1/chat/completions":
 		r.URL.Path = "/v1/chat/completions"
 	case "/v1/v1/responses":
 		r.URL.Path = "/v1/responses"
+	case "/v1/v1/messages":
+		r.URL.Path = "/v1/messages"
 	}
 }
 

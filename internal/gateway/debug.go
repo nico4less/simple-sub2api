@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -45,6 +48,107 @@ func (h Handler) logAPIDebugRequest(r *http.Request, key config.GatewayKey, body
 	}
 	attrs = append(attrs, summarizeParsedRequest(body, parsed)...)
 	h.Logger.Info("gateway_api_debug_request", attrs...)
+}
+
+func (h Handler) logAPIDebugUpstreamRequest(base *http.Request, upstream *http.Request, account config.Account) {
+	if !h.DebugAPI || h.Logger == nil || upstream == nil {
+		return
+	}
+	body, bodyErr := readAndRestoreRequestBody(upstream)
+	attrs := []any{
+		"gateway_path", requestPathForDebug(base),
+		"upstream_method", upstream.Method,
+		"upstream_scheme", urlPartForDebug(upstream.URL, "scheme"),
+		"upstream_host", urlPartForDebug(upstream.URL, "host"),
+		"upstream_path", urlPartForDebug(upstream.URL, "path"),
+		"upstream_query", sanitizeDebugQuery(queryValuesForDebug(upstream.URL)),
+		"upstream_content_length", upstream.ContentLength,
+		"upstream_header_keys", sortedHeaderKeys(upstream.Header),
+		"upstream_headers", sanitizeDebugHeaders(upstream.Header),
+		"account_id", account.ID,
+		"account_type", strings.TrimSpace(account.Type),
+		"account_platform", config.AccountPlatform(account),
+		"account_tier", strings.TrimSpace(account.Tier),
+		"upstream_body_bytes", len(body),
+	}
+	if bodyErr != nil {
+		attrs = append(attrs, "upstream_body_read_error", bodyErr.Error())
+	}
+	if len(body) > 0 {
+		attrs = append(attrs, "upstream_body_sha256", sha256Hex(body))
+		parsed, _, parseErr := upstreamcompat.ParseChatCompletionRequest(bytes.NewReader(body), 4<<20)
+		if parseErr != nil {
+			attrs = append(attrs, "upstream_parse_error", parseErr.Error())
+		}
+		attrs = append(attrs, summarizeParsedRequest(body, parsed)...)
+	}
+	h.Logger.Info("gateway_api_debug_upstream_request", attrs...)
+}
+
+func readAndRestoreRequestBody(request *http.Request) ([]byte, error) {
+	if request == nil || request.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(request.Body)
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	request.ContentLength = int64(len(body))
+	return body, err
+}
+
+func requestPathForDebug(request *http.Request) string {
+	if request == nil || request.URL == nil {
+		return ""
+	}
+	return request.URL.Path
+}
+
+func urlPartForDebug(value *url.URL, part string) string {
+	if value == nil {
+		return ""
+	}
+	switch part {
+	case "scheme":
+		return value.Scheme
+	case "host":
+		return value.Host
+	case "path":
+		return value.Path
+	default:
+		return ""
+	}
+}
+
+func queryValuesForDebug(value *url.URL) url.Values {
+	if value == nil {
+		return nil
+	}
+	return value.Query()
+}
+
+func sanitizeDebugQuery(values url.Values) map[string]any {
+	out := make(map[string]any, len(values))
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		items := values[key]
+		if isSensitiveHeader(key) {
+			out[key] = redactHeaderValues(key, items)
+			continue
+		}
+		if len(items) == 1 {
+			out[key] = truncateDebugValue(items[0], 240)
+			continue
+		}
+		safeValues := make([]string, 0, len(items))
+		for _, item := range items {
+			safeValues = append(safeValues, truncateDebugValue(item, 240))
+		}
+		out[key] = safeValues
+	}
+	return out
 }
 
 func summarizeParsedRequest(body []byte, parsed upstreamcompat.ChatCompletionRequest) []any {

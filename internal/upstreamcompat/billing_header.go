@@ -2,18 +2,58 @@ package upstreamcompat
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math/bits"
 	"regexp"
+	"strings"
 )
 
 var (
 	claudeCodeUAVersionPattern = regexp.MustCompile(`(?i)^claude-cli/(\d+\.\d+\.\d+)`)
-	ccVersionInBillingRe      = regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bcc_version=)\d+\.\d+\.\d+`)
-	cchPlaceholderRe          = regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bcch=)(00000)(;)`)
+	ccVersionInBillingRe       = regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bcc_version=)\d+\.\d+\.\d+`)
+	cchPlaceholderRe           = regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bcch=)(00000)(;)`)
 )
 
 const cchSeed uint64 = 0x6E52736AC806831E
+
+const anthropicBillingHeaderPrefix = "x-anthropic-billing-header:"
+
+func ensureAnthropicBillingHeader(body []byte, userAgent string) []byte {
+	if len(body) == 0 || strings.Contains(string(body), anthropicBillingHeaderPrefix) {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	version := extractClaudeCodeVersion(userAgent)
+	if version == "" {
+		version = extractClaudeCodeVersion(claudeDefaultUserAgent)
+	}
+	if version == "" {
+		return body
+	}
+	billingBlock := map[string]any{
+		"type": "text",
+		"text": anthropicBillingHeaderPrefix + " cc_version=" + version + ".df2; cc_entrypoint=cli; cch=00000;",
+	}
+	switch system := payload["system"].(type) {
+	case []any:
+		payload["system"] = append([]any{billingBlock}, system...)
+	case string:
+		payload["system"] = []any{billingBlock, map[string]any{"type": "text", "text": system}}
+	case nil:
+		payload["system"] = []any{billingBlock}
+	default:
+		return body
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return normalized
+}
 
 func normalizeAnthropicBillingHeader(body []byte, userAgent string) []byte {
 	body = syncBillingHeaderVersion(body, userAgent)

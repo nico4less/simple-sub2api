@@ -171,17 +171,31 @@ function accountPlatformValue(account: AccountConfig) {
 const accountsForSelectedPlatform = computed(() => accounts.value.filter((account) => accountPlatformValue(account) === form.platform))
 
 function groupAccentClass(platform: string) {
-  if (platform === 'anthropic') return 'ring-orange-400/50 dark:ring-orange-500/40 border-orange-300 dark:border-orange-700'
-  if (platform === 'gemini' || platform === 'antigravity') return 'ring-purple-400/50 dark:ring-purple-500/40 border-purple-300 dark:border-purple-700'
-  return 'ring-emerald-400/50 dark:ring-emerald-500/40 border-emerald-300 dark:border-emerald-700'
+  if (platform === 'anthropic') return 'border-orange-300 bg-orange-50/55 shadow-[inset_4px_0_0_0_rgb(251_146_60)] ring-1 ring-orange-300/70 dark:border-orange-700 dark:bg-orange-950/18 dark:shadow-[inset_4px_0_0_0_rgb(249_115_22)] dark:ring-orange-500/40'
+  if (platform === 'gemini' || platform === 'antigravity') return 'border-purple-300 bg-purple-50/55 shadow-[inset_4px_0_0_0_rgb(168_85_247)] ring-1 ring-purple-300/70 dark:border-purple-700 dark:bg-purple-950/18 dark:shadow-[inset_4px_0_0_0_rgb(147_51_234)] dark:ring-purple-500/40'
+  return 'border-emerald-300 bg-emerald-50/55 shadow-[inset_4px_0_0_0_rgb(16_185_129)] ring-1 ring-emerald-300/70 dark:border-emerald-700 dark:bg-emerald-950/18 dark:shadow-[inset_4px_0_0_0_rgb(5_150_105)] dark:ring-emerald-500/40'
+}
+
+function groupPlatformBadgeClass(platform: string) {
+  if (platform === 'anthropic') return 'border-orange-200/80 bg-orange-100 text-orange-700 shadow-sm dark:border-orange-900/50 dark:bg-orange-950/40 dark:text-orange-300'
+  if (platform === 'gemini' || platform === 'antigravity') return 'border-purple-200/80 bg-purple-100 text-purple-700 shadow-sm dark:border-purple-900/50 dark:bg-purple-950/40 dark:text-purple-300'
+  return 'border-emerald-200/80 bg-emerald-100 text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300'
+}
+
+function groupPlatformLabel(platform: string) {
+  if (platform === 'anthropic') return 'Claude'
+  if (platform === 'openai') return 'OpenAI'
+  if (platform === 'gemini') return 'Gemini'
+  if (platform === 'antigravity') return 'Antigravity'
+  return platform || 'OpenAI'
 }
 
 function groupRowClass(row: GroupRow) {
   const accent = groupAccentClass(row.platform)
   return [
-    'border-l-4 bg-white/70 dark:bg-dark-800/70',
+    'border-l-4 transition-colors',
     accent,
-    'md:shadow-[0_0_0_1px_rgba(255,255,255,0.03)_inset]'
+    'hover:bg-opacity-75 dark:hover:bg-opacity-25'
   ].join(' ')
 }
 
@@ -293,7 +307,11 @@ onMounted(() => {
               <p v-if="row.summary.config.description" class="text-xs text-gray-500 dark:text-gray-400">{{ row.summary.config.description }}</p>
             </div>
           </template>
-          <template #cell-platform="{ row }"><span class="badge badge-primary">{{ row.platform }}</span></template>
+          <template #cell-platform="{ row }">
+            <span :class="['inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide', groupPlatformBadgeClass(String(row.platform))]">
+              {{ groupPlatformLabel(String(row.platform)) }}
+            </span>
+          </template>
           <template #cell-accounts="{ row }">
             <div class="max-w-md space-y-1 text-xs">
               <p>{{ $t('groups.linkedAccounts', { count: row.accountCount }) }}</p>

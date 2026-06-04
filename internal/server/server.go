@@ -50,13 +50,18 @@ const (
 	openAIOAuthClientID          = "app_EMoamEEZ73f0CkXaXp7hrann"
 	openAIOAuthRedirectURI       = "http://localhost:1455/auth/callback"
 	openAIOAuthTokenURL          = "https://auth.openai.com/oauth/token"
+	claudeOAuthClientID          = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	claudeOAuthRedirectURI       = "https://platform.claude.com/oauth/code/callback"
+	claudeOAuthTokenURL          = "https://platform.claude.com/v1/oauth/token"
 	chatGPTAccountsCheckURL      = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 	chatGPTCodexResponsesURL     = "https://chatgpt.com/backend-api/codex/responses"
+	claudeOAuthUsageURL          = "https://api.anthropic.com/api/oauth/usage"
 	openAICodexDefaultProbeModel = "gpt-5.4"
 )
 
 var chatGPTAccountsCheckEndpoint = chatGPTAccountsCheckURL
 var chatGPTCodexResponsesEndpoint = chatGPTCodexResponsesURL
+var claudeOAuthUsageEndpoint = claudeOAuthUsageURL
 
 type Options struct {
 	DebugDashboard     bool
@@ -157,6 +162,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/admin/metrics", s.adminOnly(http.HandlerFunc(s.metricsSnapshot)))
 	mux.Handle("/api/admin/metrics/recent-usage", s.adminOnly(http.HandlerFunc(s.recentUsage)))
 	mux.Handle("/api/admin/openai/oauth/exchange-code", s.adminOnly(http.HandlerFunc(s.openAIOAuthExchangeCode)))
+	mux.Handle("/api/admin/claude/oauth/exchange-code", s.adminOnly(http.HandlerFunc(s.claudeOAuthExchangeCode)))
 	mux.Handle("/api/admin/debug/snapshot", s.adminOnly(http.HandlerFunc(s.debugSnapshot)))
 	return s.cors(mux)
 }
@@ -257,6 +263,9 @@ func isDashboardRoute(path string) bool {
 }
 
 func (s *Server) v1Gateway(w http.ResponseWriter, r *http.Request) {
+	if r != nil && r.URL != nil && r.URL.Path == "/v1/v1/models" {
+		r.URL.Path = "/v1/models"
+	}
 	if r.URL.Path == "/v1/models" {
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []any{}})
 		return
@@ -856,7 +865,9 @@ func (s *Server) accountRefresh(w http.ResponseWriter, r *http.Request, id strin
 					slog.String("message", displaySync.Message),
 					slog.String("credential_source", displaySync.CredentialSource),
 					slog.String("subscription_tier", displaySync.Tier),
+					slog.String("subscription_tier_source", displaySync.TierSource),
 					slog.Any("usage_info_keys", displaySync.UsageInfoKeys),
+					slog.Any("usage_payload_keys", displaySync.UsagePayloadKeys),
 					slog.String("subscription_error", displaySync.SubscriptionErr),
 					slog.String("usage_error", displaySync.UsageErr),
 				)
@@ -1002,7 +1013,80 @@ func (s *Server) openAIOAuthExchangeCode(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, openAIOAuthExchangeResponse{Credentials: credentials, ExpiresAt: credentials["expires_at"]})
 }
 
+func (s *Server) claudeOAuthExchangeCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req claudeOAuthExchangeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Code) == "" {
+		http.Error(w, "authorization code is required", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.CodeVerifier) == "" {
+		http.Error(w, "code verifier is required; regenerate the authorization URL and retry", http.StatusBadRequest)
+		return
+	}
+	clientID := strings.TrimSpace(req.ClientID)
+	if clientID == "" {
+		clientID = claudeOAuthClientID
+	}
+	redirectURI := strings.TrimSpace(req.RedirectURI)
+	if redirectURI == "" {
+		redirectURI = claudeOAuthRedirectURI
+	}
+	tokenURL := strings.TrimSpace(req.TokenURL)
+	if tokenURL == "" {
+		tokenURL = claudeOAuthTokenURL
+	}
+	client, err := s.oauthExchangeHTTPClient(r.Context(), req.ProxyRef)
+	if err != nil {
+		http.Error(w, sanitizeClaudeOAuthExchangeError(err), http.StatusBadGateway)
+		return
+	}
+	token, err := exchangeClaudeOAuthCode(r.Context(), client, claudeOAuthExchangeInput{
+		Code:         strings.TrimSpace(req.Code),
+		CodeVerifier: strings.TrimSpace(req.CodeVerifier),
+		RedirectURI:  redirectURI,
+		ClientID:     clientID,
+		TokenURL:     tokenURL,
+		IsSetupToken: req.IsSetupToken,
+	})
+	if err != nil {
+		http.Error(w, sanitizeClaudeOAuthExchangeError(err), http.StatusBadGateway)
+		return
+	}
+	credentials := claudeOAuthCredentialsFromToken(token, clientID)
+	if strings.TrimSpace(req.AccountID) != "" {
+		if updated, ok, err := s.store.UpdateAnthropicAccessToken(strings.TrimSpace(req.AccountID), config.AnthropicAccessTokenUpdate{
+			AccessToken:  credentials["access_token"],
+			RefreshToken: credentials["refresh_token"],
+			TokenType:    credentials["token_type"],
+			Scope:        credentials["scope"],
+			ExpiresAt:    credentials["expires_at"],
+		}); err != nil {
+			http.Error(w, sanitizeClaudeOAuthExchangeError(err), http.StatusBadGateway)
+			return
+		} else if ok {
+			credentials = credentialsWithStoredAccountCredential(credentials, updated.Credential)
+			if s.pool != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.store.Snapshot().Probe.TimeoutSeconds)*time.Second)
+				defer cancel()
+				_ = s.pool.ApplyConfig(ctx, s.store.Snapshot())
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, claudeOAuthExchangeResponse{Credentials: credentials, ExpiresAt: credentials["expires_at"]})
+}
+
 func (s *Server) openAIOAuthHTTPClient(ctx context.Context, proxyRef string) (*http.Client, error) {
+	return s.oauthExchangeHTTPClient(ctx, proxyRef)
+}
+
+func (s *Server) oauthExchangeHTTPClient(ctx context.Context, proxyRef string) (*http.Client, error) {
 	cfg := s.store.Snapshot()
 	timeout := time.Duration(cfg.Probe.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -1464,7 +1548,9 @@ func (s *Server) checkAccountForAdminWithChecker(ctx context.Context, cfg config
 }
 
 func shouldPersistAccountCheckDisplaySync(account config.Account) bool {
-	return config.AccountPlatform(account) == "openai" && strings.TrimSpace(account.Type) == "oauth"
+	platform := config.AccountPlatform(account)
+	accountType := strings.TrimSpace(account.Type)
+	return (platform == "openai" && accountType == "oauth") || (platform == "anthropic" && (accountType == "oauth" || accountType == "setup-token"))
 }
 
 func (s *Server) persistAccountDisplayMetadata(account config.Account) (config.Account, bool, error) {
@@ -2053,7 +2139,24 @@ type openAIOAuthExchangeRequest struct {
 	ProxyRef     string `json:"proxy_ref,omitempty"`
 }
 
+type claudeOAuthExchangeRequest struct {
+	Code         string `json:"code"`
+	State        string `json:"state,omitempty"`
+	CodeVerifier string `json:"code_verifier"`
+	RedirectURI  string `json:"redirect_uri,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	TokenURL     string `json:"token_url,omitempty"`
+	ProxyRef     string `json:"proxy_ref,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
+	IsSetupToken bool   `json:"is_setup_token,omitempty"`
+}
+
 type openAIOAuthExchangeResponse struct {
+	Credentials map[string]string `json:"credentials"`
+	ExpiresAt   string            `json:"expires_at"`
+}
+
+type claudeOAuthExchangeResponse struct {
 	Credentials map[string]string `json:"credentials"`
 	ExpiresAt   string            `json:"expires_at"`
 }
@@ -2087,6 +2190,15 @@ type openAIOAuthExchangeInput struct {
 	TokenURL     string
 }
 
+type claudeOAuthExchangeInput struct {
+	Code         string
+	CodeVerifier string
+	RedirectURI  string
+	ClientID     string
+	TokenURL     string
+	IsSetupToken bool
+}
+
 type openAIOAuthTokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
@@ -2096,11 +2208,40 @@ type openAIOAuthTokenResponse struct {
 	Scope        string `json:"scope,omitempty"`
 }
 
+type claudeOAuthTokenResponse struct {
+	AccessToken  string                  `json:"access_token"`
+	RefreshToken string                  `json:"refresh_token,omitempty"`
+	TokenType    string                  `json:"token_type,omitempty"`
+	ExpiresIn    int64                   `json:"expires_in"`
+	Scope        string                  `json:"scope,omitempty"`
+	Organization *claudeOAuthOrgInfo     `json:"organization,omitempty"`
+	Account      *claudeOAuthAccountInfo `json:"account,omitempty"`
+}
+
+type claudeOAuthOrgInfo struct {
+	UUID             string         `json:"uuid"`
+	PlanType         string         `json:"plan_type,omitempty"`
+	SubscriptionTier string         `json:"subscription_tier,omitempty"`
+	Subscription     map[string]any `json:"subscription,omitempty"`
+	Plan             map[string]any `json:"plan,omitempty"`
+}
+
+type claudeOAuthAccountInfo struct {
+	UUID             string         `json:"uuid"`
+	EmailAddress     string         `json:"email_address"`
+	PlanType         string         `json:"plan_type,omitempty"`
+	SubscriptionTier string         `json:"subscription_tier,omitempty"`
+	Subscription     map[string]any `json:"subscription,omitempty"`
+	Plan             map[string]any `json:"plan,omitempty"`
+}
+
 type accountDisplaySyncResult struct {
 	Message          string
 	Synced           bool
 	Tier             string
+	TierSource       string
 	UsageInfoKeys    []string
+	UsagePayloadKeys []string
 	SubscriptionErr  string
 	UsageErr         string
 	CredentialSource string
@@ -2189,7 +2330,7 @@ func accountWithDisplayMetadata(redacted config.Account, original config.Account
 	if metadata == nil {
 		metadata = map[string]any{}
 	}
-	applyOpenAIDisplayCredentialMetadata(metadata, original.Credential)
+	applyDisplayCredentialMetadata(config.AccountPlatform(original), metadata, original.Credential)
 	redacted.Metadata = metadata
 	return redacted
 }
@@ -2200,7 +2341,13 @@ func applyDisplayState(summary *accountSummary, account config.Account) {
 	if len(usageInfo) > 0 {
 		summary.UsageInfo = cloneDisplayMap(usageInfo)
 	}
-	summary.SubscriptionTier = normalizeSubscriptionTier(firstMetadataString(metadata, []string{"subscription_tier", "subscriptionTier", "paid_tier", "current_tier", "plan_type", "tier"}, account.Tier))
+	rawSubscriptionTier := firstMetadataString(metadata, []string{"subscription_tier", "subscriptionTier", "paid_tier", "current_tier", "plan_type", "tier"}, "")
+	if rawSubscriptionTier == "" && shouldUseRoutingTierAsSubscriptionFallback(account) {
+		rawSubscriptionTier = account.Tier
+	}
+	if rawSubscriptionTier != "" {
+		summary.SubscriptionTier = normalizeSubscriptionTier(rawSubscriptionTier)
+	}
 	summary.PrivacyMode = firstMetadataString(metadata, []string{"privacy_mode", "privacyMode", "openai_privacy_mode", "training_mode"}, "")
 	if summary.PrivacyMode == "" && metadataBool(metadata, "openai_passthrough") {
 		summary.PrivacyMode = "private"
@@ -2229,6 +2376,15 @@ func applyDisplayState(summary *accountSummary, account config.Account) {
 	}
 }
 
+func shouldUseRoutingTierAsSubscriptionFallback(account config.Account) bool {
+	platform := config.AccountPlatform(account)
+	accountType := strings.TrimSpace(account.Type)
+	if (platform == "anthropic" || platform == "openai") && (accountType == "oauth" || accountType == "setup-token") {
+		return false
+	}
+	return strings.TrimSpace(account.Tier) != ""
+}
+
 func replaceAccountInConfig(cfg config.Config, account config.Account) config.Config {
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].ID == account.ID {
@@ -2240,7 +2396,13 @@ func replaceAccountInConfig(cfg config.Config, account config.Account) config.Co
 }
 
 func (s *Server) syncAccountDisplayState(ctx context.Context, cfg config.Config, account *config.Account) accountDisplaySyncResult {
-	if account == nil || config.AccountPlatform(*account) != "openai" {
+	if account == nil {
+		return accountDisplaySyncResult{}
+	}
+	if config.AccountPlatform(*account) == "anthropic" {
+		return s.syncClaudeAccountDisplayState(ctx, cfg, account)
+	}
+	if config.AccountPlatform(*account) != "openai" {
 		return accountDisplaySyncResult{}
 	}
 	accessToken := credentialValue(account.Credential, "access_token")
@@ -2305,6 +2467,57 @@ func (s *Server) syncAccountDisplayState(ctx context.Context, cfg config.Config,
 	} else if err != nil {
 		result.UsageErr = sanitizeDisplaySyncError(err)
 		metadata["display_sync_usage_error"] = result.UsageErr
+	}
+	account.Metadata = metadata
+	return result
+}
+
+func (s *Server) syncClaudeAccountDisplayState(ctx context.Context, cfg config.Config, account *config.Account) accountDisplaySyncResult {
+	if account == nil {
+		return accountDisplaySyncResult{}
+	}
+	accountType := strings.TrimSpace(account.Type)
+	if accountType != "oauth" && accountType != "setup-token" {
+		return accountDisplaySyncResult{Message: "display sync skipped: Claude OAuth or setup token account is required"}
+	}
+	accessToken := credentialValue(account.Credential, "access_token")
+	if accessToken == "" {
+		return accountDisplaySyncResult{Message: "display sync skipped: Claude access token is required"}
+	}
+	client, err := displaySyncHTTPClient(cfg, *account)
+	if err != nil {
+		return accountDisplaySyncResult{Message: "display sync skipped: " + err.Error(), CredentialSource: "access_token"}
+	}
+	metadata := cloneDisplayMap(account.Metadata)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	applyDisplayCredentialMetadata("anthropic", metadata, account.Credential)
+	credentialTier := firstMetadataString(metadata, []string{"subscription_tier", "subscriptionTier", "plan_type", "planType", "paid_tier", "current_tier"}, "")
+	result := accountDisplaySyncResult{Message: "display sync completed", Synced: true, CredentialSource: "access_token"}
+	usageInfo, subscriptionTier, usageKeys, err := fetchClaudeAccountUsageInfo(ctx, client, accessToken)
+	result.UsagePayloadKeys = usageKeys
+	if err != nil {
+		result.UsageErr = sanitizeDisplaySyncError(err)
+		metadata["display_sync_usage_error"] = result.UsageErr
+	} else {
+		metadata["claude_usage_updated_at"] = time.Now().UTC().Format(time.RFC3339)
+		if len(usageInfo) > 0 {
+			metadata["usage_info"] = usageInfo
+			result.UsageInfoKeys = sortedMapKeys(usageInfo)
+		}
+		if strings.TrimSpace(subscriptionTier) != "" {
+			metadata["subscription_tier"] = strings.TrimSpace(subscriptionTier)
+			metadata["plan_type"] = strings.TrimSpace(subscriptionTier)
+			result.Tier = strings.TrimSpace(subscriptionTier)
+			result.TierSource = "usage_payload"
+		}
+	}
+	if result.Tier == "" && strings.TrimSpace(credentialTier) != "" {
+		metadata["subscription_tier"] = strings.TrimSpace(credentialTier)
+		metadata["plan_type"] = strings.TrimSpace(credentialTier)
+		result.Tier = strings.TrimSpace(credentialTier)
+		result.TierSource = "credential_or_metadata"
 	}
 	account.Metadata = metadata
 	return result
@@ -2472,6 +2685,38 @@ func fetchOpenAIUsageInfo(ctx context.Context, client *http.Client, accessToken 
 		return nil, err
 	}
 	return usageInfoFromQuotaModels(payload), nil
+}
+
+func fetchClaudeAccountUsageInfo(ctx context.Context, client *http.Client, accessToken string) (map[string]any, string, []string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, claudeOAuthUsageEndpoint, nil)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("Accept", "application/json, text/plain, */*")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	request.Header.Set("User-Agent", "claude-code/2.1.7")
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return nil, "", nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, "", nil, fmt.Errorf("HTTP %d", response.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return nil, "", nil, err
+	}
+	return usageInfoFromClaudeUsagePayload(payload), claudeSubscriptionTierFromPayload(payload), sortedMapKeys(payload), nil
 }
 
 func fetchOpenAICodexUsageInfo(ctx context.Context, client *http.Client, accessToken string, accountID string, model string) (map[string]any, error) {
@@ -2901,6 +3146,132 @@ func usageInfoFromQuotaModels(payload map[string]any) map[string]any {
 	return usageInfo
 }
 
+func usageInfoFromClaudeUsagePayload(payload map[string]any) map[string]any {
+	if len(payload) == 0 {
+		return nil
+	}
+	usageInfo := map[string]any{}
+	for _, item := range []struct {
+		key   string
+		label string
+	}{
+		{key: "five_hour", label: "5h"},
+		{key: "seven_day", label: "7d"},
+		{key: "seven_day_sonnet", label: "7d S"},
+	} {
+		if window := claudeUsageWindowFromPayload(payload[item.key], item.label); len(window) > 0 {
+			usageInfo[item.key] = window
+		}
+	}
+	return usageInfo
+}
+
+func claudeUsageWindowFromPayload(raw any, label string) map[string]any {
+	window, ok := raw.(map[string]any)
+	if !ok || len(window) == 0 {
+		return nil
+	}
+	utilization := firstFloatFromMaps([]map[string]any{window}, []string{"utilization", "used_percent", "percentage"})
+	if !hasAnyMetadataKey(window, "utilization", "used_percent", "percentage") {
+		if hasAnyMetadataKey(window, "remaining_percent", "remainingPercentage") {
+			utilization = 100 - firstFloatFromMaps([]map[string]any{window}, []string{"remaining_percent", "remainingPercentage"})
+		} else if hasAnyMetadataKey(window, "remaining_fraction", "remainingFraction") {
+			utilization = 100 - firstFloatFromMaps([]map[string]any{window}, []string{"remaining_fraction", "remainingFraction"})*100
+		} else {
+			return nil
+		}
+	}
+	if utilization < 0 {
+		utilization = 0
+	}
+	if utilization > 100 {
+		utilization = 100
+	}
+	result := map[string]any{
+		"label":        label,
+		"utilization":  utilization,
+		"used_percent": utilization,
+	}
+	if resetAt := firstMetadataString(window, []string{"resets_at", "reset_at", "reset_time"}, ""); resetAt != "" {
+		result["reset_at"] = resetAt
+		result["reset_time"] = resetAt
+		result["resets_at"] = resetAt
+	}
+	if resetAfterSeconds := firstFloatFromMaps([]map[string]any{window}, []string{"remaining_seconds", "reset_after_seconds"}); resetAfterSeconds > 0 {
+		result["remaining_seconds"] = resetAfterSeconds
+		result["reset_after_seconds"] = resetAfterSeconds
+	}
+	if stats := nestedDisplayMap(window, "window_stats"); len(stats) > 0 {
+		result["window_stats"] = stats
+	}
+	return result
+}
+
+func claudeSubscriptionTierFromPayload(payload map[string]any) string {
+	if tier := claudeSubscriptionTierFromCredentialUserInfo(payload); tier != "" {
+		return tier
+	}
+	if tier := tierName(payload["paidTier"]); tier != "" {
+		return tier
+	}
+	if tier := tierName(payload["currentTier"]); tier != "" {
+		return tier
+	}
+	if tier := firstMetadataString(payload, []string{"subscription_tier", "subscriptionTier", "plan_type", "planType", "account_tier", "accountTier", "paid_tier", "current_tier", "tier"}, ""); tier != "" {
+		return tier
+	}
+	for _, key := range []string{"account", "subscription", "plan", "entitlement"} {
+		if nested := nestedDisplayMap(payload, key); len(nested) > 0 {
+			if tier := tierName(nested); tier != "" {
+				return tier
+			}
+			if tier := firstMetadataString(nested, []string{"subscription_tier", "subscriptionTier", "plan_type", "planType", "subscription_plan", "subscriptionPlan", "account_tier", "accountTier", "paid_tier", "current_tier", "tier"}, ""); tier != "" {
+				return tier
+			}
+		}
+	}
+	return ""
+}
+
+func claudeSubscriptionTierFromCredentialUserInfo(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	for _, key := range []string{"organization", "organization_info", "organizationInfo", "workspace", "account_info", "accountInfo", "user", "profile"} {
+		if tier := claudeSubscriptionTierFromNestedMap(nestedDisplayMap(payload, key)); tier != "" {
+			return tier
+		}
+	}
+	if organizations, ok := payload["organizations"].([]any); ok {
+		for _, raw := range organizations {
+			if item, ok := raw.(map[string]any); ok {
+				if tier := claudeSubscriptionTierFromNestedMap(item); tier != "" {
+					return tier
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func claudeSubscriptionTierFromNestedMap(values map[string]any) string {
+	if len(values) == 0 {
+		return ""
+	}
+	if tier := firstMetadataString(values, []string{"subscription_tier", "subscriptionTier", "plan_type", "planType", "subscription_plan", "subscriptionPlan", "account_tier", "accountTier", "paid_tier", "current_tier", "tier"}, ""); tier != "" {
+		return tier
+	}
+	for _, key := range []string{"paidTier", "currentTier", "subscription", "plan", "entitlement"} {
+		if tier := tierName(values[key]); tier != "" {
+			return tier
+		}
+		if tier := claudeSubscriptionTierFromNestedMap(nestedDisplayMap(values, key)); tier != "" {
+			return tier
+		}
+	}
+	return ""
+}
+
 func remainingWindow(label string, remainingPercent float64, resetAt string) map[string]any {
 	usedPercent := 100 - remainingPercent
 	if usedPercent < 0 {
@@ -2966,6 +3337,143 @@ func exchangeOpenAIOAuthCode(ctx context.Context, client *http.Client, input ope
 	return token, nil
 }
 
+func exchangeClaudeOAuthCode(ctx context.Context, client *http.Client, input claudeOAuthExchangeInput) (claudeOAuthTokenResponse, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	authCode := input.Code
+	codeState := ""
+	if before, after, ok := strings.Cut(input.Code, "#"); ok {
+		authCode = before
+		codeState = after
+	}
+	payload := map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     input.ClientID,
+		"code":          authCode,
+		"redirect_uri":  input.RedirectURI,
+		"code_verifier": input.CodeVerifier,
+	}
+	if strings.TrimSpace(codeState) != "" {
+		payload["state"] = strings.TrimSpace(codeState)
+	}
+	if input.IsSetupToken {
+		payload["expires_in"] = 31536000
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return claudeOAuthTokenResponse{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, input.TokenURL, bytes.NewReader(body))
+	if err != nil {
+		return claudeOAuthTokenResponse{}, err
+	}
+	request.Header.Set("Accept", "application/json, text/plain, */*")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("User-Agent", "axios/1.13.6")
+	response, err := client.Do(request)
+	if err != nil {
+		return claudeOAuthTokenResponse{}, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if err != nil {
+		return claudeOAuthTokenResponse{}, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return claudeOAuthTokenResponse{}, fmt.Errorf("token exchange failed: status %d, body: %s", response.StatusCode, sanitizeCredentialText(string(responseBody)))
+	}
+	var token claudeOAuthTokenResponse
+	if err := json.Unmarshal(responseBody, &token); err != nil {
+		return claudeOAuthTokenResponse{}, err
+	}
+	if strings.TrimSpace(token.AccessToken) == "" {
+		return claudeOAuthTokenResponse{}, errors.New("token exchange response missing access_token")
+	}
+	if strings.TrimSpace(token.RefreshToken) == "" {
+		return claudeOAuthTokenResponse{}, errors.New("token exchange response missing refresh_token")
+	}
+	return token, nil
+}
+
+func claudeOAuthCredentialsFromToken(token claudeOAuthTokenResponse, clientID string) map[string]string {
+	expiresAt := time.Now().UTC().Add(time.Duration(token.ExpiresIn) * time.Second).Format(time.RFC3339)
+	if token.ExpiresIn <= 0 {
+		expiresAt = time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	}
+	credentials := map[string]string{
+		"access_token":  strings.TrimSpace(token.AccessToken),
+		"refresh_token": strings.TrimSpace(token.RefreshToken),
+		"expires_at":    expiresAt,
+		"client_id":     strings.TrimSpace(clientID),
+	}
+	if tier := claudeSubscriptionTierFromTokenResponse(token); tier != "" {
+		credentials["subscription_tier"] = tier
+		credentials["plan_type"] = tier
+	}
+	if strings.TrimSpace(token.TokenType) != "" {
+		credentials["token_type"] = strings.TrimSpace(token.TokenType)
+	}
+	if strings.TrimSpace(token.Scope) != "" {
+		credentials["scope"] = strings.TrimSpace(token.Scope)
+	}
+	if token.Organization != nil && strings.TrimSpace(token.Organization.UUID) != "" {
+		credentials["org_uuid"] = strings.TrimSpace(token.Organization.UUID)
+	}
+	if token.Account != nil {
+		if strings.TrimSpace(token.Account.UUID) != "" {
+			credentials["account_uuid"] = strings.TrimSpace(token.Account.UUID)
+		}
+		if strings.TrimSpace(token.Account.EmailAddress) != "" {
+			credentials["email_address"] = strings.TrimSpace(token.Account.EmailAddress)
+		}
+	}
+	return credentials
+}
+
+func claudeSubscriptionTierFromTokenResponse(token claudeOAuthTokenResponse) string {
+	candidates := []map[string]any{}
+	if token.Account != nil {
+		candidates = append(candidates, structToDisplayMap(token.Account))
+	}
+	if token.Organization != nil {
+		candidates = append(candidates, structToDisplayMap(token.Organization))
+	}
+	for _, candidate := range candidates {
+		if tier := claudeSubscriptionTierFromNestedMap(candidate); tier != "" {
+			return tier
+		}
+	}
+	return ""
+}
+
+func structToDisplayMap(value any) map[string]any {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func credentialsWithStoredAccountCredential(credentials map[string]string, credential string) map[string]string {
+	merged := map[string]string{}
+	for key, value := range credentials {
+		if strings.TrimSpace(value) != "" {
+			merged[key] = value
+		}
+	}
+	for _, key := range []string{"access_token", "refresh_token", "expires_at", "token_type", "scope", "client_id", "org_uuid", "account_uuid", "email_address", "subscription_tier", "plan_type"} {
+		if value := credentialValue(credential, key); value != "" {
+			merged[key] = value
+		}
+	}
+	return merged
+}
+
 func sanitizeCredentialText(text string) string {
 	for _, marker := range []string{"Bearer ", "sk-", "access_token=", "refresh_token=", "id_token=", "code=", "code_verifier="} {
 		if strings.Contains(text, marker) {
@@ -2983,6 +3491,19 @@ func sanitizeOpenAIOAuthExchangeError(err error) string {
 	for _, marker := range []string{"Bearer ", "sk-", "access_token=", "refresh_token=", "id_token=", "code=", "code_verifier="} {
 		if strings.Contains(message, marker) {
 			return "OpenAI OAuth token exchange failed"
+		}
+	}
+	return message
+}
+
+func sanitizeClaudeOAuthExchangeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	for _, marker := range []string{"Bearer ", "sk-", "access_token=", "refresh_token=", "id_token=", "code=", "code_verifier="} {
+		if strings.Contains(message, marker) {
+			return "Claude OAuth token exchange failed"
 		}
 	}
 	return message
@@ -3061,8 +3582,59 @@ func applyOpenAIDisplayCredentialMetadata(metadata map[string]any, credential st
 	}
 }
 
+func applyDisplayCredentialMetadata(platform string, metadata map[string]any, credential string) {
+	if platform == "openai" {
+		applyOpenAIDisplayCredentialMetadata(metadata, credential)
+		return
+	}
+	if platform == "anthropic" {
+		applyClaudeDisplayCredentialMetadata(metadata, credential)
+	}
+}
+
+func applyClaudeDisplayCredentialMetadata(metadata map[string]any, credential string) {
+	if metadata == nil || strings.TrimSpace(credential) == "" {
+		return
+	}
+	for _, key := range []string{
+		"plan_type",
+		"subscription_tier",
+		"subscription_expires_at",
+		"claude_usage_updated_at",
+		"claude_5h_used_percent",
+		"claude_5h_reset_after_seconds",
+		"claude_5h_reset_at",
+		"claude_7d_used_percent",
+		"claude_7d_reset_after_seconds",
+		"claude_7d_reset_at",
+		"claude_7d_sonnet_used_percent",
+		"claude_7d_sonnet_reset_after_seconds",
+		"claude_7d_sonnet_reset_at",
+	} {
+		value := credentialValue(credential, key)
+		if value == "" {
+			continue
+		}
+		if strings.Contains(key, "percent") || strings.Contains(key, "seconds") {
+			if parsed, err := json.Number(value).Float64(); err == nil {
+				metadata[key] = parsed
+				continue
+			}
+		}
+		metadata[key] = value
+	}
+	if _, ok := metadata["usage_info"].(map[string]any); !ok {
+		if usageInfo := usageInfoFromClaudeMetadata(metadata); len(usageInfo) > 0 {
+			metadata["usage_info"] = usageInfo
+		}
+	}
+}
+
 func usageInfoFromQuotaAndMetadata(quotaState map[string]any, metadata map[string]any) map[string]any {
 	if usageInfo := usageInfoFromCodexMetadata(metadata); len(usageInfo) > 0 {
+		return usageInfo
+	}
+	if usageInfo := usageInfoFromClaudeMetadata(metadata); len(usageInfo) > 0 {
 		return usageInfo
 	}
 	fiveHourUsed := firstFloatFromMaps([]map[string]any{metadata, quotaState}, []string{"window_cost_used", "session_window_cost_used"})
@@ -3089,6 +3661,23 @@ func usageInfoFromCodexMetadata(metadata map[string]any) map[string]any {
 	}
 	if usedPercent := firstFloatFromMaps([]map[string]any{metadata}, []string{"codex_7d_used_percent"}); usedPercent > 0 || hasAnyMetadataKey(metadata, "codex_7d_used_percent", "codex_7d_reset_at", "codex_7d_reset_after_seconds") {
 		usageInfo["seven_day"] = codexUsageWindow("7d", usedPercent, firstMetadataString(metadata, []string{"codex_7d_reset_at"}, ""), firstFloatFromMaps([]map[string]any{metadata}, []string{"codex_7d_reset_after_seconds"}))
+	}
+	return usageInfo
+}
+
+func usageInfoFromClaudeMetadata(metadata map[string]any) map[string]any {
+	if metadata == nil {
+		return nil
+	}
+	usageInfo := map[string]any{}
+	if usedPercent := firstFloatFromMaps([]map[string]any{metadata}, []string{"claude_5h_used_percent"}); usedPercent > 0 || hasAnyMetadataKey(metadata, "claude_5h_used_percent", "claude_5h_reset_at", "claude_5h_reset_after_seconds") {
+		usageInfo["five_hour"] = codexUsageWindow("5h", usedPercent, firstMetadataString(metadata, []string{"claude_5h_reset_at"}, ""), firstFloatFromMaps([]map[string]any{metadata}, []string{"claude_5h_reset_after_seconds"}))
+	}
+	if usedPercent := firstFloatFromMaps([]map[string]any{metadata}, []string{"claude_7d_used_percent"}); usedPercent > 0 || hasAnyMetadataKey(metadata, "claude_7d_used_percent", "claude_7d_reset_at", "claude_7d_reset_after_seconds") {
+		usageInfo["seven_day"] = codexUsageWindow("7d", usedPercent, firstMetadataString(metadata, []string{"claude_7d_reset_at"}, ""), firstFloatFromMaps([]map[string]any{metadata}, []string{"claude_7d_reset_after_seconds"}))
+	}
+	if usedPercent := firstFloatFromMaps([]map[string]any{metadata}, []string{"claude_7d_sonnet_used_percent"}); usedPercent > 0 || hasAnyMetadataKey(metadata, "claude_7d_sonnet_used_percent", "claude_7d_sonnet_reset_at", "claude_7d_sonnet_reset_after_seconds") {
+		usageInfo["seven_day_sonnet"] = codexUsageWindow("7d S", usedPercent, firstMetadataString(metadata, []string{"claude_7d_sonnet_reset_at"}, ""), firstFloatFromMaps([]map[string]any{metadata}, []string{"claude_7d_sonnet_reset_after_seconds"}))
 	}
 	return usageInfo
 }
@@ -3162,6 +3751,16 @@ func mapFromMetadata(metadata map[string]any, keys ...string) map[string]any {
 	return nil
 }
 
+func nestedDisplayMap(record map[string]any, key string) map[string]any {
+	if record == nil {
+		return nil
+	}
+	if value, ok := record[key].(map[string]any); ok {
+		return cloneDisplayMap(value)
+	}
+	return nil
+}
+
 func cloneDisplayMap(values map[string]any) map[string]any {
 	if values == nil {
 		return nil
@@ -3230,6 +3829,8 @@ func normalizeSubscriptionTier(raw string) string {
 	switch {
 	case strings.Contains(lower, "ultra"):
 		return "ultra"
+	case strings.Contains(lower, "max"):
+		return "max"
 	case strings.Contains(lower, "team"):
 		return "team"
 	case strings.Contains(lower, "enterprise"):

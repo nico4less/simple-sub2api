@@ -8,6 +8,7 @@ import {
   createAccountFromUpstream,
   createGroup,
   deleteAccount,
+  exchangeClaudeOAuthCode,
   exchangeOpenAIOAuthCode,
   exportAccounts,
   loadAccounts,
@@ -153,6 +154,7 @@ const activeOAuthTab = ref('manual')
 const authCodeInput = ref('')
 const accountNameInput = ref<HTMLInputElement | null>(null)
 const openAIOAuthSession = ref<{ state: string; codeVerifier: string; redirectURI: string; clientID: string } | null>(null)
+const claudeOAuthSession = ref<{ state: string; codeVerifier: string; redirectURI: string; clientID: string; isSetupToken: boolean } | null>(null)
 const oauthCallbackStateInput = ref('')
 
 const OAUTH_CALLBACK_URL = 'http://localhost:1455/auth/callback'
@@ -830,15 +832,47 @@ function makeBadgeChip(key: string, label: string, className: string, icon: Badg
   return { key, label, className, icon, title }
 }
 
+function platformBadgeClass(platform: string): string {
+  if (platform === 'anthropic') {
+    return 'inline-flex items-center gap-1 rounded-md border border-orange-200/70 bg-orange-100 px-2 py-0.5 text-[10px] font-bold text-orange-700 shadow-sm dark:border-orange-900/50 dark:bg-orange-950/40 dark:text-orange-300'
+  }
+  if (platform === 'gemini') {
+    return 'inline-flex items-center gap-1 rounded-md border border-purple-200/70 bg-purple-100 px-2 py-0.5 text-[10px] font-bold text-purple-700 shadow-sm dark:border-purple-900/50 dark:bg-purple-950/40 dark:text-purple-300'
+  }
+  if (platform === 'antigravity') {
+    return 'inline-flex items-center gap-1 rounded-md border border-purple-200/70 bg-purple-100 px-2 py-0.5 text-[10px] font-bold text-purple-700 shadow-sm dark:border-purple-900/50 dark:bg-purple-950/40 dark:text-purple-300'
+  }
+  return 'inline-flex items-center gap-1 rounded-md border border-emerald-200/70 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300'
+}
+
+function platformToneBadgeClass(platform: string): string {
+  if (platform === 'anthropic') {
+    return 'inline-flex items-center gap-1 rounded-md border border-orange-200/70 bg-orange-100 px-2 py-0.5 text-[10px] font-bold text-orange-700 shadow-sm dark:border-orange-900/50 dark:bg-orange-950/40 dark:text-orange-300'
+  }
+  if (platform === 'gemini' || platform === 'antigravity') {
+    return 'inline-flex items-center gap-1 rounded-md border border-purple-200/70 bg-purple-100 px-2 py-0.5 text-[10px] font-bold text-purple-700 shadow-sm dark:border-purple-900/50 dark:bg-purple-950/40 dark:text-purple-300'
+  }
+  return 'inline-flex items-center gap-1 rounded-md border border-emerald-200/70 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300'
+}
+
 function subscriptionTierBadge(tier: string): BadgeChip {
   const normalized = tier.toLowerCase()
-  if (tier === 'ultra') {
+  if (normalized === 'ultra') {
     return makeBadgeChip(
       'subscription:ultra',
       'Ultra',
       'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105',
       'gem',
       'Subscription tier: Ultra'
+    )
+  }
+  if (normalized === 'max') {
+    return makeBadgeChip(
+      'subscription:max',
+      'Max',
+      'inline-flex items-center gap-1 rounded-md bg-gradient-to-r from-orange-500 to-rose-500 px-2 py-0.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-105',
+      'gem',
+      'Subscription tier: Max'
     )
   }
   if (['plus', 'team', 'enterprise', 'pro'].includes(normalized)) {
@@ -917,14 +951,14 @@ function buildAccountBadges(account: AccountConfig, summary: AccountSummary, met
     makeBadgeChip(
       'platform',
       platformDisplayName(platform),
-      'inline-flex items-center gap-1 rounded-md border border-emerald-200/70 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300',
+      platformBadgeClass(platform),
       'circle',
       `Platform: ${platformDisplayName(platform)}`
     ),
     makeBadgeChip(
       'type',
       accountTypeDisplayName(account.type || 'openai_api_key'),
-      'inline-flex items-center gap-1 rounded-md border border-emerald-200/70 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 shadow-sm dark:border-emerald-900/50 dark:bg-emerald-950/40 dark:text-emerald-300',
+      platformToneBadgeClass(platform),
       'circle',
       `Type: ${accountTypeDisplayName(account.type || 'openai_api_key')}`
     )
@@ -940,19 +974,29 @@ function buildAccountBadges(account: AccountConfig, summary: AccountSummary, met
     return badges
   }
 
-  badges.push(subscriptionTierBadge(normalizedSubscriptionTier({ tier: account.tier, tierLabel: formatTierLabel(summary), summary })))
+  const tier = normalizedSubscriptionTier({ tier: account.tier, tierLabel: formatTierLabel(summary), summary, platform, accountType: account.type })
+  if (tier) badges.push(subscriptionTierBadge(tier))
   return badges
 }
 
-function normalizedSubscriptionTier(row: { tier?: string; tierLabel?: string; summary?: AccountSummary }): string {
-  const raw = row.summary?.subscription_tier || stringRecordValue(row.summary?.quota, 'subscription_tier', `${row.tierLabel || row.tier || ''}`)
+function normalizedSubscriptionTier(row: { tier?: string; tierLabel?: string; summary?: AccountSummary; platform?: string; accountType?: string }): string {
+  const raw = row.summary?.subscription_tier || stringRecordValue(row.summary?.quota, 'subscription_tier', '') || fallbackRoutingTierForSubscription(row)
   const lower = raw.toLowerCase()
+  if (!lower) return ''
   if (lower.includes('ultra')) return 'ultra'
+  if (lower.includes('max')) return 'max'
   if (lower.includes('team')) return 'team'
   if (lower.includes('enterprise')) return 'enterprise'
   if (lower.includes('plus')) return 'plus'
   if (lower.includes('pro') || lower.includes('paid') || lower.includes('standard')) return 'pro'
   return 'free'
+}
+
+function fallbackRoutingTierForSubscription(row: { tier?: string; tierLabel?: string; platform?: string; accountType?: string }): string {
+  const platform = (row.platform || '').toLowerCase()
+  const accountType = (row.accountType || '').trim()
+  if ((platform === 'anthropic' || platform === 'openai') && (accountType === 'oauth' || accountType === 'setup-token')) return ''
+  return `${row.tierLabel || row.tier || ''}`
 }
 
 function formatValidationBlockedLabel(summary: AccountSummary, metadata: Record<string, unknown>): string {
@@ -1440,7 +1484,7 @@ function defaultGroupID(platform: PlatformOption) {
   return platform === 'anthropic' ? 'claude' : platform
 }
 
-function buildDefaultGroup(platform: PlatformOption): Partial<GroupConfig> {
+function buildDefaultGroup(platform: PlatformOption, accountID = ''): Partial<GroupConfig> {
   return {
     id: defaultGroupID(platform),
     name: defaultGroupName(platform),
@@ -1448,7 +1492,7 @@ function buildDefaultGroup(platform: PlatformOption): Partial<GroupConfig> {
     description: `Default ${defaultGroupName(platform)} routing group`,
     status: 'active',
     tags: [defaultGroupID(platform)],
-    account_ids: []
+    account_ids: accountID ? [accountID] : []
   }
 }
 
@@ -1464,7 +1508,7 @@ async function ensureDefaultGroupForAccount(accountID: string): Promise<string[]
     form.group_ids = existing.id
     return [existing.id]
   }
-  const created = await createGroup(groups.config_version, buildDefaultGroup(form.platform))
+  const created = await createGroup(groups.config_version, buildDefaultGroup(form.platform, accountID))
   const nextGroups = await loadGroups()
   groupsState.value = nextGroups
   const groupID = created.groups?.find((group) => group.platform === form.platform && group.account_ids?.includes(accountID))?.id || defaultGroupID(form.platform)
@@ -2088,6 +2132,21 @@ function applyOpenAIOAuthCredentials(credentials: Record<string, string>) {
   }
 }
 
+function applyClaudeOAuthCredentials(credentials: Record<string, string>) {
+  form.access_token = credentials.access_token || ''
+  form.refresh_token = credentials.refresh_token || ''
+  const credentialExtras: Record<string, string> = {
+    expires_at: credentials.expires_at,
+    token_type: credentials.token_type,
+    scope: credentials.scope,
+    client_id: credentials.client_id,
+    org_uuid: credentials.org_uuid,
+    account_uuid: credentials.account_uuid,
+    email_address: credentials.email_address
+  }
+  form.credential = buildCredentialWithExtras(credentialExtras)
+}
+
 function buildCredentialWithExtras(extras: Record<string, string>): string {
   const parts: string[] = []
   const add = (key: string, value: string | undefined) => {
@@ -2112,11 +2171,13 @@ watch(authCodeInput, (newVal: string) => {
   if (code && authCodeInput.value !== code) {
     authCodeInput.value = code
   }
-  if (form.add_method === 'setup-token') {
-    form.setup_token = captured
-  } else {
-    form.refresh_token = captured
-  }
+    if (form.add_method === 'setup-token') {
+      form.setup_token = captured
+    } else if (form.platform === 'anthropic') {
+      form.refresh_token = captured
+    } else {
+      form.refresh_token = captured
+    }
 })
 
 async function handleGenerateAuthLink() {
@@ -2144,6 +2205,7 @@ async function handleGenerateAuthLink() {
       const codeChallenge = await buildCodeChallenge(codeVerifier)
       const scope = form.add_method === 'setup-token' ? CLAUDE_SETUP_TOKEN_SCOPE : CLAUDE_OAUTH_SCOPE
       computedAuthUrl.value = buildClaudeAuthorizationURL(state, codeChallenge, scope)
+      claudeOAuthSession.value = { state, codeVerifier, redirectURI: CLAUDE_OAUTH_REDIRECT_URI, clientID: CLAUDE_OAUTH_CLIENT_ID, isSetupToken: form.add_method === 'setup-token' }
     } else if (form.platform === 'gemini') {
       const state = randomOAuthToken(32)
       const codeVerifier = randomOAuthToken(32)
@@ -2277,6 +2339,7 @@ function buildCredential(): string {
   if (showOAuthCredential.value) {
     if (form.add_method === 'setup-token') {
       add('setup_token', form.setup_token)
+      if (form.platform === 'anthropic') add('refresh_token', form.refresh_token)
     } else {
       add('refresh_token', form.refresh_token)
       add('setup_token', form.setup_token)
@@ -2542,6 +2605,32 @@ async function completeOAuthAccount() {
         account_id: form.id || '(pending)',
         credential_keys: safeCredentialKeys(buildCredential())
       })
+    } else if (form.platform === 'anthropic') {
+      const callbackState = extractOAuthCallbackParam(rawInput, 'state') || oauthCallbackStateInput.value
+      const session = claudeOAuthSession.value
+      if (!session?.codeVerifier) {
+        error.value = 'Claude OAuth session missing. Regenerate the authorization URL, sign in again, then paste the callback URL.'
+        return
+      }
+      if (callbackState && callbackState !== session.state) {
+        error.value = 'Claude OAuth state mismatch. Regenerate the authorization URL and retry.'
+        return
+      }
+      const exchanged = await exchangeClaudeOAuthCode({
+        code: capturedCode,
+        state: callbackState || session.state,
+        code_verifier: session.codeVerifier,
+        redirect_uri: session.redirectURI,
+        client_id: session.clientID,
+        proxy_ref: form.proxy_ref.trim() || undefined,
+        is_setup_token: session.isSetupToken
+      })
+      applyClaudeOAuthCredentials(exchanged.credentials)
+      claudeOAuthSession.value = null
+      oauthCompleteLog('info', 'claude_code_exchanged', {
+        account_id: form.id || '(pending)',
+        credential_keys: safeCredentialKeys(buildCredential())
+      })
     } else if (form.add_method === 'setup-token') {
       form.setup_token = capturedCode
     } else {
@@ -2580,7 +2669,6 @@ async function completeOAuthAccount() {
       notice.value = t('accounts.updated', { id: account.id })
       oauthCompleteLog('info', 'update_success', { account_id: account.id })
     }
-    await ensureSelectedAccountGroups(account.id)
     closeEditor()
     await nextTick()
     oauthCompleteLog('info', 'closed_editor_after_save', {
@@ -2588,6 +2676,24 @@ async function completeOAuthAccount() {
       editor_open: editorOpen.value,
       modal_removed: !document.querySelector('[data-account-editor-modal="true"]')
     })
+    try {
+      oauthCompleteLog('info', 'post_close_group_sync_start', {
+        account_id: account.id,
+        selected_group_ids: selectedGroupIDs.value
+      })
+      await ensureSelectedAccountGroups(account.id)
+      oauthCompleteLog('info', 'post_close_group_sync_finished', {
+        account_id: account.id,
+        selected_group_ids: selectedGroupIDs.value
+      })
+    } catch (groupErr) {
+      const groupSyncError = groupErr instanceof Error ? groupErr.message : String(groupErr)
+      oauthCompleteLog('warn', 'post_close_group_sync_failed', {
+        account_id: account.id,
+        error: groupSyncError
+      })
+      notice.value = `${notice.value} Group sync warning: ${groupSyncError}`
+    }
     if (!editorOpen.value) {
       setTimeout(() => {
         oauthCompleteLog('info', 'close_editor_deferred_check', {
@@ -2702,7 +2808,7 @@ async function runAccountTest(accountID?: string) {
     refreshingAccountIds.value = new Set([...refreshingAccountIds.value, accountID])
     try {
       testResult.value = await refreshAccount(accountID)
-      operationOutput.value = JSON.stringify(testResult.value, null, 2)
+      operationOutput.value = JSON.stringify(summarizeAccountRefreshResponse(testResult.value), null, 2)
       if (testResult.value.accounts) accountsState.value = testResult.value.accounts
     } finally {
       const next = new Set(refreshingAccountIds.value)
@@ -2712,6 +2818,22 @@ async function runAccountTest(accountID?: string) {
   } else {
     operationOutput.value = JSON.stringify(await testAllAccounts(), null, 2)
     await loadAll()
+  }
+}
+
+function summarizeAccountRefreshResponse(response: AccountRefreshResponse) {
+  const account = response.account
+  return {
+    account_id: response.account_id,
+    status: response.status,
+    message: response.message,
+    checked_at: response.checked_at,
+    proxy_id: response.proxy_id,
+    subscription_tier: account?.subscription_tier || stringRecordValue(account?.quota, 'subscription_tier', ''),
+    usage_info_keys: account?.usage_info ? Object.keys(account.usage_info).sort() : [],
+    runtime_status: account?.runtime_status,
+    health: response.health,
+    note: 'Full refreshed account snapshot is applied to the table. Detailed refresh diagnostics are written to backend logs.'
   }
 }
 

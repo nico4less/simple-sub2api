@@ -2,12 +2,16 @@ package upstreamcompat
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/0xForce-Network/simple-sub2api/internal/config"
@@ -16,6 +20,33 @@ import (
 const defaultUserAgent = "simple-sub2api-gateway/1.0"
 const codexCLIUserAgent = "codex_cli_rs/0.125.0"
 const chatGPTCodexResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
+
+const claudeOAuthBeta = "oauth-2025-04-20"
+const claudeCodeBeta = "claude-code-20250219"
+const claudeInterleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+const claudePromptCachingScopeBeta = "prompt-caching-scope-2026-01-05"
+const claudeEffortBeta = "effort-2025-11-24"
+const claudeContextManagementBeta = "context-management-2025-06-27"
+const claudeContext1MBeta = "context-1m-2025-08-07"
+const claudeRedactThinkingBeta = "redact-thinking-2026-02-12"
+const claudeDefaultUserAgent = "claude-cli/2.1.126 (external, cli)"
+const claudeNewMetadataFormatMinVersion = "2.1.78"
+
+var metadataUserIDLegacyPattern = regexp.MustCompile(`^user_([a-fA-F0-9]{64})_account_([a-fA-F0-9-]*)_session_([a-fA-F0-9-]{36})$`)
+
+var claudeCodeDefaultHeaders = map[string]string{
+	"User-Agent":                                claudeDefaultUserAgent,
+	"X-Stainless-Lang":                          "js",
+	"X-Stainless-Package-Version":               "0.81.0",
+	"X-Stainless-OS":                            "Linux",
+	"X-Stainless-Arch":                          "x64",
+	"X-Stainless-Runtime":                       "node",
+	"X-Stainless-Runtime-Version":               "v24.3.0",
+	"X-Stainless-Retry-Count":                   "0",
+	"X-Stainless-Timeout":                       "600",
+	"X-App":                                     "cli",
+	"Anthropic-Dangerous-Direct-Browser-Access": "true",
+}
 
 var openAIChatGPTInternalUnsupportedFields = []string{
 	"user",
@@ -60,6 +91,10 @@ var upstreamHeaderAllowlist = map[string]struct{}{
 	"X-Stainless-Retry-Count":                   {},
 	"X-Stainless-Runtime":                       {},
 	"X-Stainless-Runtime-Version":               {},
+	"X-Stainless-Timeout":                       {},
+	"X-App":                                     {},
+	"X-Client-Request-Id":                       {},
+	"X-Claude-Code-Session-Id":                  {},
 }
 
 func BuildUpstreamRequest(base *http.Request, account config.Account, body []byte) (*http.Request, error) {
@@ -68,7 +103,21 @@ func BuildUpstreamRequest(base *http.Request, account config.Account, body []byt
 	if err != nil {
 		return nil, err
 	}
-	body = normalizeAnthropicBillingHeader(body, base.Header.Get("User-Agent"))
+	mimicClaudeCode := false
+	if isAnthropicMessagesRequest(base, account) && IsAnthropicOAuthAccount(account) {
+		mimicClaudeCode = !isClaudeCodeClientRequest(base.Header, body)
+		billingUserAgent := strings.TrimSpace(base.Header.Get("User-Agent"))
+		if mimicClaudeCode || extractClaudeCodeVersion(billingUserAgent) == "" {
+			billingUserAgent = claudeDefaultUserAgent
+		}
+		body = normalizeAnthropicOAuthMessagesBody(body, account, base.Header, billingUserAgent)
+		if mimicClaudeCode {
+			body = ensureAnthropicBillingHeader(body, billingUserAgent)
+		}
+		body = normalizeAnthropicBillingHeader(body, billingUserAgent)
+	} else {
+		body = normalizeAnthropicBillingHeader(body, base.Header.Get("User-Agent"))
+	}
 	if IsOpenAIOAuthAccount(account) && !useOfficialResponsesAPI {
 		body = normalizeOpenAIOAuthResponsesBody(base, body)
 	}
@@ -87,7 +136,14 @@ func BuildUpstreamRequest(base *http.Request, account config.Account, body []byt
 		request.Header.Set("User-Agent", defaultUserAgent)
 	}
 	if key := APIKeyFromCredential(account.Credential); key != "" {
-		request.Header.Set("Authorization", "Bearer "+key)
+		if IsAnthropicAccount(account) && strings.TrimSpace(base.URL.Path) == "/v1/messages" {
+			applyAnthropicMessagesAuth(request, account, key)
+		} else {
+			request.Header.Set("Authorization", "Bearer "+key)
+		}
+	}
+	if isAnthropicMessagesRequest(base, account) {
+		applyAnthropicMessagesHeaders(request, account, body, mimicClaudeCode)
 	}
 	if IsOpenAIOAuthAccount(account) && !useOfficialResponsesAPI {
 		request.Body = io.NopCloser(bytes.NewReader(body))
@@ -97,6 +153,10 @@ func BuildUpstreamRequest(base *http.Request, account config.Account, body []byt
 	return request, nil
 }
 
+func isAnthropicMessagesRequest(base *http.Request, account config.Account) bool {
+	return IsAnthropicAccount(account) && base != nil && base.URL != nil && strings.TrimSpace(base.URL.Path) == "/v1/messages"
+}
+
 func AccountUpstreamURL(account config.Account, endpointPath string, useOfficialResponsesAPI bool) (string, error) {
 	if IsOpenAIOAuthAccount(account) {
 		if useOfficialResponsesAPI {
@@ -104,7 +164,30 @@ func AccountUpstreamURL(account config.Account, endpointPath string, useOfficial
 		}
 		return OpenAIOAuthCodexURL(account.BaseURL, endpointPath)
 	}
+	if IsAnthropicAccount(account) && strings.TrimSpace(endpointPath) == "/v1/messages" {
+		return AnthropicMessagesAPIURL(account.BaseURL)
+	}
 	return OpenAIAPIURL(account.BaseURL, endpointPath)
+}
+
+func AnthropicMessagesAPIURL(baseURL string) (string, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	upstreamURL, err := OpenAIAPIURL(baseURL, "/v1/messages")
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(upstreamURL)
+	if err != nil {
+		return "", err
+	}
+	query := parsed.Query()
+	if strings.TrimSpace(query.Get("beta")) == "" {
+		query.Set("beta", "true")
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
 
 func OpenAIOAuthCodexURL(baseURL string, endpointPath string) (string, error) {
@@ -131,6 +214,358 @@ func OpenAIOAuthCodexURL(baseURL string, endpointPath string) (string, error) {
 
 func IsOpenAIOAuthAccount(account config.Account) bool {
 	return config.AccountPlatform(account) == "openai" && strings.TrimSpace(account.Type) == "oauth"
+}
+
+func IsAnthropicAccount(account config.Account) bool {
+	return config.AccountPlatform(account) == "anthropic"
+}
+
+func IsAnthropicOAuthAccount(account config.Account) bool {
+	accountType := strings.TrimSpace(account.Type)
+	return IsAnthropicAccount(account) && (accountType == "oauth" || accountType == "setup-token")
+}
+
+func IsGeminiOAuthAccount(account config.Account) bool {
+	accountType := strings.TrimSpace(account.Type)
+	return config.AccountPlatform(account) == "gemini" && (accountType == "oauth" || accountType == "setup-token")
+}
+
+func IsAntigravityOAuthAccount(account config.Account) bool {
+	accountType := strings.TrimSpace(account.Type)
+	return config.AccountPlatform(account) == "antigravity" && (accountType == "oauth" || accountType == "setup-token")
+}
+
+func IsOAuthLikeAccount(account config.Account) bool {
+	return IsOpenAIOAuthAccount(account) || IsAnthropicOAuthAccount(account) || IsGeminiOAuthAccount(account) || IsAntigravityOAuthAccount(account)
+}
+
+func applyAnthropicMessagesAuth(request *http.Request, account config.Account, key string) {
+	request.Header.Del("Authorization")
+	request.Header.Del("X-Api-Key")
+	if IsAnthropicOAuthAccount(account) {
+		request.Header.Set("Authorization", "Bearer "+key)
+		return
+	}
+	request.Header.Set("X-Api-Key", key)
+}
+
+func applyAnthropicMessagesHeaders(request *http.Request, account config.Account, body []byte, mimicClaudeCode bool) {
+	if !IsAnthropicOAuthAccount(account) {
+		return
+	}
+	clientBeta := request.Header.Get("Anthropic-Beta")
+	if !mimicClaudeCode {
+		applyClaudeOAuthHeaderDefaults(request)
+		request.Header.Set("Anthropic-Beta", claudeOAuthBetaForClient(modelFromBody(body), clientBeta))
+		syncClaudeCodeSessionHeader(request, body)
+		return
+	}
+	request.Header = http.Header{}
+	request.Header.Set("Content-Type", "application/json")
+	applyClaudeCodeMimicHeaders(request, bodyRequestsStream(body))
+	request.Header.Set("Anthropic-Version", "2023-06-01")
+	request.Header.Set("Anthropic-Beta", mergeAnthropicBeta("", requiredClaudeOAuthBetas(modelFromBody(body), clientBeta)...))
+	if key := APIKeyFromCredential(account.Credential); key != "" {
+		request.Header.Set("Authorization", "Bearer "+key)
+	}
+	syncClaudeCodeSessionHeader(request, body)
+}
+
+func claudeOAuthBetaForClient(model string, clientBeta string) string {
+	clientBeta = strings.TrimSpace(clientBeta)
+	if clientBeta != "" {
+		if strings.Contains(clientBeta, claudeOAuthBeta) {
+			return clientBeta
+		}
+		parts := strings.Split(clientBeta, ",")
+		for i, part := range parts {
+			if strings.TrimSpace(part) == claudeCodeBeta {
+				out := make([]string, 0, len(parts)+1)
+				out = append(out, parts[:i+1]...)
+				out = append(out, claudeOAuthBeta)
+				out = append(out, parts[i+1:]...)
+				return strings.Join(out, ",")
+			}
+		}
+		return claudeOAuthBeta + "," + clientBeta
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "haiku") {
+		return claudeOAuthBeta + "," + claudeInterleavedThinkingBeta
+	}
+	return claudeCodeBeta + "," + claudeOAuthBeta + "," + claudeInterleavedThinkingBeta
+}
+
+func applyClaudeOAuthHeaderDefaults(request *http.Request) {
+	if strings.TrimSpace(request.Header.Get("Accept")) == "" {
+		request.Header.Set("Accept", "application/json")
+	}
+	if strings.TrimSpace(request.Header.Get("Anthropic-Version")) == "" {
+		request.Header.Set("Anthropic-Version", "2023-06-01")
+	}
+	for key, value := range claudeCodeDefaultHeaders {
+		if strings.TrimSpace(value) != "" && strings.TrimSpace(request.Header.Get(key)) == "" {
+			request.Header.Set(key, value)
+		}
+	}
+}
+
+func applyClaudeCodeMimicHeaders(request *http.Request, stream bool) {
+	for key, value := range claudeCodeDefaultHeaders {
+		if strings.TrimSpace(value) != "" {
+			request.Header.Set(key, value)
+		}
+	}
+	request.Header.Set("Accept", "application/json")
+	if stream {
+		request.Header.Set("X-Stainless-Helper-Method", "stream")
+	}
+	if strings.TrimSpace(request.Header.Get("X-Client-Request-Id")) == "" {
+		request.Header.Set("X-Client-Request-Id", randomUUID())
+	}
+}
+
+func requiredClaudeOAuthBetas(model string, incoming string) []string {
+	out := []string{}
+	add := func(token string) {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == "" {
+			return
+		}
+		for _, existing := range out {
+			if strings.EqualFold(existing, trimmed) {
+				return
+			}
+		}
+		out = append(out, trimmed)
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "haiku") {
+		add(claudeOAuthBeta)
+		add(claudeInterleavedThinkingBeta)
+	} else {
+		for _, token := range []string{
+			claudeCodeBeta,
+			claudeOAuthBeta,
+			claudeContext1MBeta,
+			claudeInterleavedThinkingBeta,
+			claudeRedactThinkingBeta,
+			claudePromptCachingScopeBeta,
+			claudeEffortBeta,
+			claudeContextManagementBeta,
+		} {
+			add(token)
+		}
+	}
+	for _, token := range strings.Split(incoming, ",") {
+		add(token)
+	}
+	return out
+}
+
+func mergeAnthropicBeta(existing string, required ...string) string {
+	seen := map[string]bool{}
+	out := make([]string, 0)
+	for _, token := range append(strings.Split(existing, ","), required...) {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, trimmed)
+	}
+	return strings.Join(out, ",")
+}
+
+func normalizeAnthropicOAuthMessagesBody(body []byte, account config.Account, headers http.Header, userAgent string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	metadata, _ := payload["metadata"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+		payload["metadata"] = metadata
+	}
+	originalUserID, _ := metadata["user_id"].(string)
+	parsed := parseMetadataUserID(originalUserID)
+	accountUUID := firstNonEmpty(credentialValue(account.Credential, "account_uuid"), credentialValue(account.Credential, "org_uuid"), metadataString(account.Metadata, "account_uuid"), metadataString(account.Metadata, "org_uuid"))
+	if accountUUID == "" && parsed != nil {
+		accountUUID = parsed.AccountUUID
+	}
+	sessionID := ""
+	if parsed != nil {
+		sessionID = parsed.SessionID
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(headers.Get("X-Claude-Code-Session-Id"))
+	}
+	if sessionID == "" {
+		sessionID = deterministicUUID(account.ID + "::" + string(body))
+	}
+	deviceID := deterministicDeviceID(account.ID, accountUUID)
+	if parsed != nil && len(parsed.DeviceID) == 64 {
+		deviceID = deterministicDeviceID(account.ID, parsed.DeviceID)
+	}
+	newSession := deterministicUUID(account.ID + "::" + sessionID)
+	metadata["user_id"] = formatMetadataUserID(deviceID, accountUUID, newSession, extractClaudeCodeVersion(userAgent))
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return normalized
+}
+
+func isClaudeCodeClientRequest(headers http.Header, body []byte) bool {
+	if headers == nil || extractClaudeCodeVersion(headers.Get("User-Agent")) == "" {
+		return false
+	}
+	return parseMetadataUserID(metadataUserIDFromBody(body)) != nil
+}
+
+type parsedMetadataUserID struct {
+	DeviceID    string
+	AccountUUID string
+	SessionID   string
+}
+
+func parseMetadataUserID(raw string) *parsedMetadataUserID {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "{") {
+		var payload struct {
+			DeviceID    string `json:"device_id"`
+			AccountUUID string `json:"account_uuid"`
+			SessionID   string `json:"session_id"`
+		}
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil || strings.TrimSpace(payload.DeviceID) == "" || strings.TrimSpace(payload.SessionID) == "" {
+			return nil
+		}
+		return &parsedMetadataUserID{DeviceID: payload.DeviceID, AccountUUID: payload.AccountUUID, SessionID: payload.SessionID}
+	}
+	matches := metadataUserIDLegacyPattern.FindStringSubmatch(raw)
+	if matches == nil {
+		return nil
+	}
+	return &parsedMetadataUserID{DeviceID: matches[1], AccountUUID: matches[2], SessionID: matches[3]}
+}
+
+func formatMetadataUserID(deviceID, accountUUID, sessionID, version string) string {
+	if compareVersions(version, claudeNewMetadataFormatMinVersion) >= 0 {
+		payload := struct {
+			DeviceID    string `json:"device_id"`
+			AccountUUID string `json:"account_uuid"`
+			SessionID   string `json:"session_id"`
+		}{DeviceID: deviceID, AccountUUID: accountUUID, SessionID: sessionID}
+		encoded, _ := json.Marshal(payload)
+		return string(encoded)
+	}
+	return "user_" + deviceID + "_account_" + accountUUID + "_session_" + sessionID
+}
+
+func compareVersions(a, b string) int {
+	ap := parseSemver(a)
+	bp := parseSemver(b)
+	for i := 0; i < 3; i++ {
+		if ap[i] < bp[i] {
+			return -1
+		}
+		if ap[i] > bp[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func parseSemver(value string) [3]int {
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(value), "v"), ".")
+	out := [3]int{}
+	for i := 0; i < len(parts) && i < 3; i++ {
+		if parsed, err := strconv.Atoi(parts[i]); err == nil {
+			out[i] = parsed
+		}
+	}
+	return out
+}
+
+func syncClaudeCodeSessionHeader(request *http.Request, body []byte) {
+	uid := metadataUserIDFromBody(body)
+	if uid == "" {
+		return
+	}
+	parsed := parseMetadataUserID(uid)
+	if parsed == nil || parsed.SessionID == "" {
+		return
+	}
+	request.Header.Set("X-Claude-Code-Session-Id", parsed.SessionID)
+}
+
+func metadataUserIDFromBody(body []byte) string {
+	var payload struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Metadata == nil {
+		return ""
+	}
+	uid, _ := payload.Metadata["user_id"].(string)
+	return strings.TrimSpace(uid)
+}
+
+func modelFromBody(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Model)
+}
+
+func deterministicDeviceID(accountID string, extra string) string {
+	sum := sha256.Sum256([]byte("simple-sub2api::claude-device::" + strings.TrimSpace(accountID) + "::" + strings.TrimSpace(extra)))
+	return hex.EncodeToString(sum[:])
+}
+
+func deterministicUUID(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	buf := append([]byte(nil), sum[:16]...)
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+func randomUUID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return deterministicUUID(err.Error())
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func applyOpenAIOAuthCodexHeaders(request *http.Request, base *http.Request, account config.Account, body []byte) {

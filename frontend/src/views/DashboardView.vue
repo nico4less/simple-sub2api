@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 
 import { createKey, deleteKey, loadKeys, loadRecentUsage } from '@/api/client'
@@ -27,6 +27,8 @@ const recentUsageLoading = ref(false)
 const recentUsageError = ref('')
 const usageModalKey = ref<GatewayKey | null>(null)
 const copiedKeyID = ref('')
+const telemetryRefreshTimer = ref<number | null>(null)
+const telemetryRefreshing = ref(false)
 
 const metricCards = computed(() => {
   const snapshot = metrics.value
@@ -40,6 +42,62 @@ const metricCards = computed(() => {
   ]
 })
 
+const gatewayFlowSteps = [
+  {
+    index: '01',
+    title: 'API Unified Entry',
+    eyebrow: 'CLIENT EDGE',
+    tip: 'One local gateway endpoint accepts OpenAI-compatible, Claude, Gemini, and Antigravity traffic.',
+    accent: 'cyan',
+    icon: 'key'
+  },
+  {
+    index: '02',
+    title: 'Group Router',
+    eyebrow: 'ROUTE CORE',
+    tip: 'Gateway keys bind to active groups, then route by platform, policy, priority, and failover state.',
+    accent: 'emerald',
+    icon: 'accounts'
+  },
+  {
+    index: '03',
+    title: 'Subscription Pool',
+    eyebrow: 'MULTI ACCOUNT',
+    tip: 'Each group can combine multiple accounts with cooldown, quota guard, sticky sessions, and rotation.',
+    accent: 'purple',
+    icon: 'refresh'
+  },
+  {
+    index: '04',
+    title: 'Proxy Optional',
+    eyebrow: 'EXIT LAYER',
+    tip: 'Accounts may use a proxy profile for regional routing or upstream network isolation when needed.',
+    accent: 'amber',
+    icon: 'toggle-right'
+  }
+] as const
+
+function gatewayFlowAccentClass(accent: string) {
+  if (accent === 'emerald') return 'border-emerald-300/70 bg-emerald-50/55 text-emerald-700 shadow-[0_0_24px_rgba(16,185,129,0.12)] dark:border-emerald-500/30 dark:bg-emerald-950/18 dark:text-emerald-300'
+  if (accent === 'purple') return 'border-purple-300/70 bg-purple-50/55 text-purple-700 shadow-[0_0_24px_rgba(168,85,247,0.12)] dark:border-purple-500/30 dark:bg-purple-950/18 dark:text-purple-300'
+  if (accent === 'amber') return 'border-amber-300/70 bg-amber-50/55 text-amber-700 shadow-[0_0_24px_rgba(245,158,11,0.12)] dark:border-amber-500/30 dark:bg-amber-950/18 dark:text-amber-300'
+  return 'border-cyan-300/70 bg-cyan-50/55 text-cyan-700 shadow-[0_0_24px_rgba(6,182,212,0.12)] dark:border-cyan-500/30 dark:bg-cyan-950/18 dark:text-cyan-300'
+}
+
+function gatewayFlowIconClass(accent: string) {
+  if (accent === 'emerald') return 'border-emerald-300/70 bg-emerald-500 text-white shadow-[0_0_18px_rgba(16,185,129,0.35)] dark:border-emerald-400/40'
+  if (accent === 'purple') return 'border-purple-300/70 bg-purple-500 text-white shadow-[0_0_18px_rgba(168,85,247,0.35)] dark:border-purple-400/40'
+  if (accent === 'amber') return 'border-amber-300/70 bg-amber-500 text-white shadow-[0_0_18px_rgba(245,158,11,0.35)] dark:border-amber-400/40'
+  return 'border-cyan-300/70 bg-cyan-500 text-white shadow-[0_0_18px_rgba(6,182,212,0.35)] dark:border-cyan-400/40'
+}
+
+function gatewayFlowBadgeClass(accent: string) {
+  if (accent === 'emerald') return 'border-emerald-200/80 bg-emerald-100/80 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-300'
+  if (accent === 'purple') return 'border-purple-200/80 bg-purple-100/80 text-purple-700 dark:border-purple-900/60 dark:bg-purple-950/40 dark:text-purple-300'
+  if (accent === 'amber') return 'border-amber-200/80 bg-amber-100/80 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300'
+  return 'border-cyan-200/80 bg-cyan-100/80 text-cyan-700 dark:border-cyan-900/60 dark:bg-cyan-950/40 dark:text-cyan-300'
+}
+
 async function refreshKeys() {
   const result = await loadKeys()
   keysConfigVersion.value = result.config_version
@@ -49,8 +107,8 @@ async function refreshKeys() {
   syncSelectedGroup()
 }
 
-async function refreshRecentUsage() {
-  recentUsageLoading.value = true
+async function refreshRecentUsage(options: { silent?: boolean } = {}) {
+  if (!options.silent) recentUsageLoading.value = true
   recentUsageError.value = ''
   try {
     const result = await loadRecentUsage()
@@ -58,7 +116,20 @@ async function refreshRecentUsage() {
   } catch (err) {
     recentUsageError.value = err instanceof Error ? err.message : String(err)
   } finally {
-    recentUsageLoading.value = false
+    if (!options.silent) recentUsageLoading.value = false
+  }
+}
+
+async function refreshDashboardTelemetry(options: { silent?: boolean } = {}) {
+  if (telemetryRefreshing.value) return
+  telemetryRefreshing.value = true
+  try {
+    await Promise.all([
+      refresh(),
+      refreshRecentUsage({ silent: options.silent })
+    ])
+  } finally {
+    telemetryRefreshing.value = false
   }
 }
 
@@ -174,9 +245,18 @@ watch(() => keyDraft.value.mode, syncSelectedGroup)
 watch(groupOptions, syncSelectedGroup)
 
 onMounted(() => {
-  refresh().catch(() => undefined)
+  refreshDashboardTelemetry().catch(() => undefined)
   refreshKeys().catch(() => undefined)
-  refreshRecentUsage().catch(() => undefined)
+  telemetryRefreshTimer.value = window.setInterval(() => {
+    refreshDashboardTelemetry({ silent: true }).catch(() => undefined)
+  }, 5000)
+})
+
+onBeforeUnmount(() => {
+  if (telemetryRefreshTimer.value !== null) {
+    window.clearInterval(telemetryRefreshTimer.value)
+    telemetryRefreshTimer.value = null
+  }
 })
 </script>
 
@@ -184,17 +264,50 @@ onMounted(() => {
   <AppShell>
     <main class="grid gap-4">
       <section class="grid gap-4 lg:grid-cols-3">
-        <article class="card lg:col-span-2">
-          <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-            <div>
-              <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.gatewayEndpoint') }}</h2>
-              <p class="mt-2 font-mono text-sm text-gray-700 dark:text-gray-200">{{ $t('dashboard.baseUrlSameOrigin') }}</p>
-              <p class="mt-1 font-mono text-sm text-gray-700 dark:text-gray-200">{{ $t('dashboard.authorizationBearer') }}</p>
+        <article class="card !overflow-visible lg:col-span-2">
+          <div class="relative">
+            <div class="pointer-events-none absolute inset-0 opacity-70">
+              <div class="absolute -left-16 -top-16 h-40 w-40 rounded-full bg-cyan-400/10 blur-3xl"></div>
+              <div class="absolute -right-16 top-10 h-44 w-44 rounded-full bg-purple-500/10 blur-3xl"></div>
+              <div class="absolute bottom-0 left-1/3 h-28 w-28 rounded-full bg-emerald-400/10 blur-3xl"></div>
             </div>
-            <button class="btn btn-secondary" type="button" :disabled="loading" @click="refresh">
-              <Icon name="refresh" />
-              <span class="ml-2">{{ $t('dashboard.refreshState') }}</span>
-            </button>
+
+            <div class="relative flex flex-col justify-between gap-4 xl:flex-row xl:items-start">
+              <div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <h2 class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{{ $t('dashboard.gatewayEndpoint') }}</h2>
+                  <span class="rounded-full border border-cyan-200/80 bg-cyan-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.22em] text-cyan-700 dark:border-cyan-900/50 dark:bg-cyan-950/30 dark:text-cyan-300">Unified Flow</span>
+                </div>
+                <p class="mt-2 max-w-2xl text-sm text-gray-600 dark:text-gray-300">One endpoint fans requests into platform groups, rotates across multiple subscriptions, and optionally exits through account-level proxies.</p>
+              </div>
+            </div>
+
+            <div class="relative mt-5 grid gap-3 xl:grid-cols-[1fr_auto_1fr_auto_1fr_auto_1fr] xl:items-stretch">
+              <template v-for="(step, index) in gatewayFlowSteps" :key="step.index">
+                <section :class="['group relative min-h-[116px] overflow-visible rounded-2xl border p-4 transition duration-200 hover:z-30 hover:-translate-y-0.5', gatewayFlowAccentClass(step.accent)]">
+                  <div class="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/80 to-transparent opacity-70 dark:via-white/25"></div>
+                  <div class="flex items-start justify-between gap-3">
+                    <div :class="['grid h-10 w-10 place-items-center rounded-xl border', gatewayFlowIconClass(step.accent)]">
+                      <Icon :name="step.icon" />
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <span class="font-mono text-[11px] font-black tracking-[0.24em] opacity-70">{{ step.index }}</span>
+                      <span class="relative inline-flex">
+                        <span :class="['grid h-6 w-6 cursor-help place-items-center rounded-full border text-[10px] font-black', gatewayFlowBadgeClass(step.accent)]">?</span>
+                        <span :class="['pointer-events-none absolute right-0 top-8 z-50 hidden w-64 rounded-xl border p-3 text-left text-xs leading-relaxed text-gray-700 shadow-2xl backdrop-blur-xl group-hover:block dark:text-gray-200', gatewayFlowAccentClass(step.accent)]">{{ step.tip }}</span>
+                      </span>
+                    </div>
+                  </div>
+                  <p class="mt-4 text-[10px] font-black uppercase tracking-[0.24em] opacity-70">{{ step.eyebrow }}</p>
+                  <h3 class="mt-1 text-base font-black text-gray-950 dark:text-white">{{ step.title }}</h3>
+                </section>
+                <div v-if="index < gatewayFlowSteps.length - 1" class="hidden items-center justify-center xl:flex">
+                  <div class="relative h-px w-8 bg-gradient-to-r from-cyan-400/60 via-emerald-400/60 to-purple-400/60 shadow-[0_0_14px_rgba(34,211,238,0.35)]">
+                    <span class="absolute -right-1.5 -top-2 text-sm font-black text-cyan-500 dark:text-cyan-300">›</span>
+                  </div>
+                </div>
+              </template>
+            </div>
           </div>
         </article>
         <article class="card">

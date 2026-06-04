@@ -120,6 +120,21 @@ make windows-amd64
     - `X-Simple-Task-Type`: 设为 `document`, `code`, 或 `default` 智能匹配组路由规则。
     - `X-Simple-Tags`: 英文逗号分隔的 Tag 标签列表，用于显式圈定账号路由边界。
 
+### 本地 API 兼容性调试
+当需要对比 Claude CLI、Roo、Cline 等客户端的请求差异时，可在本地启动时显式打开安全调试日志：
+
+```bash
+SIMPLE_SUB2API_DEBUG_API=1 go run ./cmd/simple-sub2api --config simple_sub2api.config.json
+```
+
+或使用等价参数：
+
+```bash
+go run ./cmd/simple-sub2api --config simple_sub2api.config.json --debug-api
+```
+
+开启后，每次网关入口请求会输出 `gateway_api_debug_request`，每次最终提交给上游前会输出 `gateway_api_debug_upstream_request`。两类日志会记录路径、Header 键、脱敏 Header、账号路由目标、上游 URL 形状、请求体 SHA-256、JSON 顶层键与结构摘要，用于比较客户端差异；日志不会打印 Authorization、Cookie、API Key、Token、密码或 prompt/message 明文。该开关仅用于本地兼容性诊断，默认关闭。
+
 ---
 
 ## 🚫 安全非目标与绝对边界
