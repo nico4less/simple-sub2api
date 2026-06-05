@@ -5,6 +5,11 @@
     "allow_lan": false,
     "cors_allowed_origins": []
   },
+  "gateway": {
+    "timeout_seconds": 600,
+    "tls_handshake_timeout_seconds": 30,
+    "network_retry_attempts": 2
+  },
   "gateway_auth": {
     "gateway_key": ""
   },

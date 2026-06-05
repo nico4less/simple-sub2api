@@ -971,8 +971,94 @@ func TestResponsesTransientTLSFailureDoesNotCooldownAccount(t *testing.T) {
 	if second.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("second status = %d, want %d", second.StatusCode, http.StatusServiceUnavailable)
 	}
+	if requestCount != 4 {
+		t.Fatalf("upstream request count = %d, want 4; account was likely cooldowned or not internally retried", requestCount)
+	}
+}
+
+func TestAnthropicMessagesTransientNetworkFailureRetriesAndDoesNotCooldown(t *testing.T) {
+	requestCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/messages":
+			requestCount++
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("response writer is not hijackable")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack() error = %v", err)
+			}
+			_, _ = conn.Write([]byte("not-http"))
+			_ = conn.Close()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	policy := config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: true, RotateErrorCodes: []int{429, 401, 403, 404, 500}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1}
+	srv, store := gatewayServerWithAccountsAndPlatform(t, []config.Account{{ID: "acct_claude", Type: "oauth", Label: "Claude", Tier: "advanced", Credential: "access_token=claude-oauth-access", BaseURL: upstream.URL, Metadata: map[string]any{"platform": "anthropic"}, Enabled: true}}, "anthropic", policy)
+	defer srv.Close()
+
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"who are you"}]}],"stream":false}`)
+	first := doGatewayRequest(t, srv.URL+"/v1/messages", store.GatewayKey(), body)
+	_ = first.Body.Close()
+	if first.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("first status = %d, want %d", first.StatusCode, http.StatusServiceUnavailable)
+	}
 	if requestCount != 2 {
-		t.Fatalf("upstream request count = %d, want 2; account was likely cooldowned", requestCount)
+		t.Fatalf("request count after first gateway request = %d, want 2 internal retries", requestCount)
+	}
+	second := doGatewayRequest(t, srv.URL+"/v1/messages", store.GatewayKey(), body)
+	_ = second.Body.Close()
+	if second.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want %d", second.StatusCode, http.StatusServiceUnavailable)
+	}
+	if requestCount != 4 {
+		t.Fatalf("request count after second gateway request = %d, want 4; account was likely cooldowned", requestCount)
+	}
+}
+
+func TestGatewayForwardTimeoutUsesGatewayTimeoutNotProbeTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+		case "/v1/chat/completions":
+			time.Sleep(80 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-test","choices":[],"usage":{"total_tokens":1}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Dashboard.AdminPassword = "admin-secret"
+	cfg.Probe.TimeoutSeconds = 1
+	cfg.Gateway.TimeoutSeconds = 2
+	cfg.Accounts = []config.Account{{ID: "acct_1", Type: "openai_api_key", Label: "A", Tier: "simple", Credential: "api_key=sk-upstream", BaseURL: upstream.URL, Enabled: true, QuotaPolicy: "daily", Tags: []string{"openai"}}}
+	cfg.Quota.Policies = []config.QuotaPolicy{{ID: "daily", DailyLimitTokens: 1000, Source: "local"}}
+	cfg.Groups = []config.Group{{ID: "openai", Name: "OpenAI", Platform: "openai", Status: "active", AccountIDs: []string{"acct_1"}, CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z", RotationPolicy: config.GroupRotationPolicy{Strategy: "polling", StickyHeader: "X-Session-ID", RetryOnErrors: false, RotateErrorCodes: []int{429, 401, 403, 404, 500}, CooldownDurationSeconds: 60, MinQuotaThresholdPercent: 0.1}}}
+	cfg.GatewayKeys = []config.GatewayKey{{ID: "default", Name: "Default", KeyHash: config.HashGatewayKey("s2a_test_gateway_key_value"), Preview: config.KeyPreview("s2a_test_gateway_key_value"), Status: "enabled", RoutingPolicy: config.KeyRoutingPolicy{Mode: "groups", GroupIDs: []string{"openai"}}, CreatedAt: "1970-01-01T00:00:00Z", UpdatedAt: "1970-01-01T00:00:00Z"}}
+	cfg.GatewayAuth.GatewayKey = "s2a_test_gateway_key_value"
+	store, err := config.NewMemoryStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMemoryStore() error = %v", err)
+	}
+	srv := httptest.NewServer(server.New(store, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	defer srv.Close()
+
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}`)
+	resp := doGatewayRequest(t, srv.URL+"/v1/chat/completions", store.GatewayKey(), body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 }
 

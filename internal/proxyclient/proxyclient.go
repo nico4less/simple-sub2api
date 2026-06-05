@@ -21,6 +21,11 @@ type Spec struct {
 	URL string `json:"url"`
 }
 
+type ClientOptions struct {
+	Timeout             time.Duration
+	TLSHandshakeTimeout time.Duration
+}
+
 func SpecsFromConfig(cfg config.Config) map[string]Spec {
 	out := make(map[string]Spec, len(cfg.Proxies))
 	for _, proxy := range cfg.Proxies {
@@ -55,10 +60,17 @@ func ValidateURL(raw string) error {
 }
 
 func HTTPClient(spec Spec, timeout time.Duration) (*http.Client, error) {
-	if timeout <= 0 {
-		timeout = 15 * time.Second
+	return HTTPClientWithOptions(spec, ClientOptions{Timeout: timeout})
+}
+
+func HTTPClientWithOptions(spec Spec, opts ClientOptions) (*http.Client, error) {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 15 * time.Second
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if opts.TLSHandshakeTimeout > 0 {
+		transport.TLSHandshakeTimeout = opts.TLSHandshakeTimeout
+	}
 	if strings.TrimSpace(spec.URL) != "" {
 		parsed, err := url.Parse(config.NormalizeProxyURL(spec.URL))
 		if err != nil {
@@ -74,7 +86,7 @@ func HTTPClient(spec Spec, timeout time.Duration) (*http.Client, error) {
 			return nil, fmt.Errorf("proxy scheme %q is not supported", parsed.Scheme)
 		}
 	}
-	return &http.Client{Timeout: timeout, Transport: transport}, nil
+	return &http.Client{Timeout: opts.Timeout, Transport: transport}, nil
 }
 
 func socks5HDialContext(proxyURL *url.URL) func(context.Context, string, string) (net.Conn, error) {

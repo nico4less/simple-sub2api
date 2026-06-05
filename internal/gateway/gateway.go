@@ -205,7 +205,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				h.Pool.DecrementActiveConn(activeAccountID)
 			}
 		}()
-		resp, err := h.forwardAttempt(r, cfg, account, body)
+		resp, err := h.forwardAttemptWithNetworkRetries(r, cfg, account, body)
 		if err != nil {
 			h.Pool.DecrementActiveConn(activeAccountID)
 			active = false
@@ -227,7 +227,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				activeAccountID = account.ID
 				h.Pool.IncrementActiveConn(activeAccountID)
 				active = true
-				resp, err = h.forwardAttempt(r, cfg, account, body)
+				resp, err = h.forwardAttemptWithNetworkRetries(r, cfg, account, body)
 				if err != nil {
 					h.Pool.DecrementActiveConn(activeAccountID)
 					active = false
@@ -313,11 +313,53 @@ func clientForAccount(cfg config.Config, account config.Account) (*http.Client, 
 	if err != nil {
 		return nil, err
 	}
-	timeout := time.Duration(cfg.Probe.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+	return proxyclient.HTTPClientWithOptions(spec, proxyclient.ClientOptions{Timeout: gatewayTimeout(cfg), TLSHandshakeTimeout: gatewayTLSHandshakeTimeout(cfg)})
+}
+
+func gatewayTimeout(cfg config.Config) time.Duration {
+	seconds := cfg.Gateway.TimeoutSeconds
+	if seconds <= 0 {
+		seconds = 600
 	}
-	return proxyclient.HTTPClient(spec, timeout)
+	return time.Duration(seconds) * time.Second
+}
+
+func gatewayTLSHandshakeTimeout(cfg config.Config) time.Duration {
+	seconds := cfg.Gateway.TLSHandshakeTimeoutSeconds
+	if seconds <= 0 {
+		seconds = 30
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func gatewayNetworkRetryAttempts(cfg config.Config) int {
+	attempts := cfg.Gateway.NetworkRetryAttempts
+	if attempts <= 0 {
+		attempts = 2
+	}
+	if attempts > 5 {
+		attempts = 5
+	}
+	return attempts
+}
+
+func (h Handler) forwardAttemptWithNetworkRetries(r *http.Request, cfg config.Config, account config.Account, body []byte) (*http.Response, error) {
+	attempts := gatewayNetworkRetryAttempts(cfg)
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resp, err := h.forwardAttempt(r, cfg, account, body)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !isRetryableNetworkFailure(err) || attempt == attempts {
+			break
+		}
+		if h.Logger != nil {
+			h.Logger.Warn("gateway transient upstream retry", "account_id", account.ID, "attempt", attempt, "max_attempts", attempts, "error", sanitizeCredentialError(err))
+		}
+	}
+	return nil, lastErr
 }
 
 func (h Handler) forwardAttempt(r *http.Request, cfg config.Config, account config.Account, body []byte) (*http.Response, error) {
@@ -782,18 +824,22 @@ func shouldRefreshOpenAIOAuthAfterAuthFailure(requestPath string, account config
 }
 
 func shouldCooldownUpstreamFailure(requestPath string, err error) bool {
-	if requestPath == "/v1/responses" && isTransientTLSFailure(err) {
+	if isRetryableNetworkFailure(err) {
 		return false
 	}
 	return true
 }
 
 func isTransientTLSFailure(err error) bool {
+	return isRetryableNetworkFailure(err)
+}
+
+func isRetryableNetworkFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "tls: bad record mac") || strings.Contains(message, "tls: record header error") || strings.Contains(message, "tls: unexpected message") || strings.Contains(message, "malformed http") || strings.Contains(message, "unexpected eof")
+	return strings.Contains(message, "tls handshake timeout") || strings.Contains(message, "i/o timeout") || strings.Contains(message, "context deadline exceeded") || strings.Contains(message, "client.timeout exceeded") || strings.Contains(message, "connection reset by peer") || strings.Contains(message, "connection refused") || strings.Contains(message, "tls: bad record mac") || strings.Contains(message, "tls: record header error") || strings.Contains(message, "tls: unexpected message") || strings.Contains(message, "malformed http") || strings.Contains(message, "unexpected eof")
 }
 
 func extractSessionID(r *http.Request, group *config.Group) string {

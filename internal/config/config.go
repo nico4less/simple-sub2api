@@ -31,6 +31,7 @@ var (
 type Config struct {
 	ConfigVersion       int                  `json:"config_version"`
 	Server              ServerConfig         `json:"server"`
+	Gateway             GatewayConfig        `json:"gateway,omitempty"`
 	GatewayAuth         GatewayAuthConfig    `json:"gateway_auth"`
 	GatewayKeys         []GatewayKey         `json:"gateway_keys"`
 	Groups              []Group              `json:"groups"`
@@ -51,6 +52,12 @@ type ServerConfig struct {
 	Bind               string   `json:"bind"`
 	AllowLAN           bool     `json:"allow_lan"`
 	CORSAllowedOrigins []string `json:"cors_allowed_origins"`
+}
+
+type GatewayConfig struct {
+	TimeoutSeconds             int `json:"timeout_seconds"`
+	TLSHandshakeTimeoutSeconds int `json:"tls_handshake_timeout_seconds"`
+	NetworkRetryAttempts       int `json:"network_retry_attempts"`
 }
 
 type GatewayAuthConfig struct {
@@ -246,6 +253,7 @@ func DefaultConfig() Config {
 			AllowLAN:           false,
 			CORSAllowedOrigins: nil,
 		},
+		Gateway:   GatewayConfig{TimeoutSeconds: 600, TLSHandshakeTimeoutSeconds: 30, NetworkRetryAttempts: 2},
 		Dashboard: DashboardConfig{SessionTTLSeconds: 8 * 60 * 60},
 		Groups: []Group{
 			defaultOpenAIGroup(),
@@ -662,6 +670,15 @@ func EnsureDefaultsAndSecrets(cfg *Config) error {
 	if strings.TrimSpace(cfg.Server.Bind) == "" {
 		cfg.Server.Bind = "127.0.0.1:8080"
 	}
+	if cfg.Gateway.TimeoutSeconds <= 0 {
+		cfg.Gateway.TimeoutSeconds = 600
+	}
+	if cfg.Gateway.TLSHandshakeTimeoutSeconds <= 0 {
+		cfg.Gateway.TLSHandshakeTimeoutSeconds = 30
+	}
+	if cfg.Gateway.NetworkRetryAttempts <= 0 {
+		cfg.Gateway.NetworkRetryAttempts = 2
+	}
 	if cfg.Dashboard.SessionTTLSeconds <= 0 {
 		cfg.Dashboard.SessionTTLSeconds = 8 * 60 * 60
 	}
@@ -797,6 +814,15 @@ func Validate(cfg Config) error {
 	}
 	if cfg.Dashboard.AdminPassword != "" && cfg.Dashboard.AdminPassword == cfg.GatewayAuth.GatewayKey {
 		return errors.New("dashboard admin password must not equal gateway key")
+	}
+	if cfg.Gateway.TimeoutSeconds < 1 || cfg.Gateway.TimeoutSeconds > 3600 {
+		return errors.New("gateway.timeout_seconds must be in range 1..3600")
+	}
+	if cfg.Gateway.TLSHandshakeTimeoutSeconds < 1 || cfg.Gateway.TLSHandshakeTimeoutSeconds > 300 {
+		return errors.New("gateway.tls_handshake_timeout_seconds must be in range 1..300")
+	}
+	if cfg.Gateway.NetworkRetryAttempts < 1 || cfg.Gateway.NetworkRetryAttempts > 5 {
+		return errors.New("gateway.network_retry_attempts must be in range 1..5")
 	}
 	for _, origin := range cfg.Server.CORSAllowedOrigins {
 		if origin == "*" {

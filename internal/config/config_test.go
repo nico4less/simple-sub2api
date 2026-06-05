@@ -77,6 +77,75 @@ func TestConfigM1DefaultsCoverQueueBModules(t *testing.T) {
 	if cfg.Probe.TimeoutSeconds == 0 || cfg.Metrics.RecentErrorsLimit == 0 {
 		t.Fatal("probe and metrics defaults must be populated")
 	}
+	if cfg.Gateway.TimeoutSeconds == 0 {
+		t.Fatal("gateway timeout default must be populated")
+	}
+	if cfg.Gateway.TLSHandshakeTimeoutSeconds == 0 || cfg.Gateway.NetworkRetryAttempts == 0 {
+		t.Fatal("gateway network resilience defaults must be populated")
+	}
+}
+
+func TestGatewayTimeoutDefaultsAndValidation(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Gateway = GatewayConfig{}
+	if err := EnsureDefaultsAndSecrets(&cfg); err != nil {
+		t.Fatalf("EnsureDefaultsAndSecrets() error = %v", err)
+	}
+	if cfg.Gateway.TimeoutSeconds != 600 {
+		t.Fatalf("gateway timeout default = %d, want 600", cfg.Gateway.TimeoutSeconds)
+	}
+	if cfg.Gateway.TLSHandshakeTimeoutSeconds != 30 {
+		t.Fatalf("gateway TLS handshake timeout default = %d, want 30", cfg.Gateway.TLSHandshakeTimeoutSeconds)
+	}
+	if cfg.Gateway.NetworkRetryAttempts != 2 {
+		t.Fatalf("gateway network retry attempts default = %d, want 2", cfg.Gateway.NetworkRetryAttempts)
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("Validate() rejected default gateway timeout: %v", err)
+	}
+
+	for _, timeout := range []int{1, 3600} {
+		candidate := cfg
+		candidate.Gateway.TimeoutSeconds = timeout
+		if err := Validate(candidate); err != nil {
+			t.Fatalf("Validate() rejected gateway timeout boundary %d: %v", timeout, err)
+		}
+	}
+	for _, timeout := range []int{0, 3601} {
+		candidate := cfg
+		candidate.Gateway.TimeoutSeconds = timeout
+		if err := Validate(candidate); err == nil || !strings.Contains(err.Error(), "gateway.timeout_seconds") {
+			t.Fatalf("Validate() error = %v, want gateway.timeout_seconds rejection", err)
+		}
+	}
+	for _, timeout := range []int{1, 300} {
+		candidate := cfg
+		candidate.Gateway.TLSHandshakeTimeoutSeconds = timeout
+		if err := Validate(candidate); err != nil {
+			t.Fatalf("Validate() rejected TLS handshake timeout boundary %d: %v", timeout, err)
+		}
+	}
+	for _, timeout := range []int{0, 301} {
+		candidate := cfg
+		candidate.Gateway.TLSHandshakeTimeoutSeconds = timeout
+		if err := Validate(candidate); err == nil || !strings.Contains(err.Error(), "gateway.tls_handshake_timeout_seconds") {
+			t.Fatalf("Validate() error = %v, want gateway.tls_handshake_timeout_seconds rejection", err)
+		}
+	}
+	for _, attempts := range []int{1, 5} {
+		candidate := cfg
+		candidate.Gateway.NetworkRetryAttempts = attempts
+		if err := Validate(candidate); err != nil {
+			t.Fatalf("Validate() rejected network retry attempts boundary %d: %v", attempts, err)
+		}
+	}
+	for _, attempts := range []int{0, 6} {
+		candidate := cfg
+		candidate.Gateway.NetworkRetryAttempts = attempts
+		if err := Validate(candidate); err == nil || !strings.Contains(err.Error(), "gateway.network_retry_attempts") {
+			t.Fatalf("Validate() error = %v, want gateway.network_retry_attempts rejection", err)
+		}
+	}
 }
 
 func TestValidateRejectsInvalidAccountSchema(t *testing.T) {
